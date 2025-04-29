@@ -11,7 +11,7 @@ print(tf_build_info.cuda_version_number)
 print(tf_build_info.cudnn_version_number)
 # import os
 # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or '3' to suppress everything
- 
+  
 #1080 rows
 #1920 cols
 #3 channels
