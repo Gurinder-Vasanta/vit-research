@@ -5,10 +5,10 @@ import tensorflow as tf, tf_keras
 import skvideo.io
 import cv2
 layers = tf_keras.layers
-print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
-from tensorflow.python.platform import build_info as tf_build_info
-print(tf_build_info.cuda_version_number)
-print(tf_build_info.cudnn_version_number)
+# print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
+# from tensorflow.python.platform import build_info as tf_build_info
+# print(tf_build_info.cuda_version_number)
+# print(tf_build_info.cudnn_version_number)
 # import os
 # os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or '3' to suppress everything
   
@@ -18,14 +18,14 @@ print(tf_build_info.cudnn_version_number)
 inputparameters = {}
 outputparameters = {}
 
-output_path = 'hoop_ball_finding.mp4'
+output_path = 'data/hoop_ball_finding.mp4'
 # reader = skvideo.io.FFmpegReader(output_path,
 #                                  inputdict=inputparameters,
 #                                  outputdict=outputparameters)
 
 model = vit.VisionTransformer(
     # image_size = 224,
-    input_specs=layers.InputSpec(shape=[None,1080,1920,3]),
+    input_specs=layers.InputSpec(shape=[None,224,224,3]),
     patch_size=16,
     num_layers=12,
     num_heads=12,
