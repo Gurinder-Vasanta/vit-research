@@ -25,7 +25,7 @@ output_path = 'data/hoop_ball_finding.mp4'
 
 model = vit.VisionTransformer(
     # image_size = 224,
-    input_specs=layers.InputSpec(shape=[None,224,224,3]),
+    input_specs=layers.InputSpec(shape=[None,432,768,3]),
     patch_size=16,
     num_layers=12,
     num_heads=12,
@@ -43,13 +43,15 @@ while True:
     if not ret: break
     if(cur_count == batch_cap):
         aux = np.array(aux)
-        print(aux.shape)
+        input(aux.shape)
+    
         output = model.predict(aux, batch_size = 32, verbose=1)
         aux = []
         cur_count = 1
         input(output)
     else:
         cur_count += 1
-        temp_frame = np.array(frame)
+        target_size = (768,432)
+        temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
         aux.append(temp_frame)
 
