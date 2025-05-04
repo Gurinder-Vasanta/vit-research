@@ -6,6 +6,7 @@ import skvideo.io
 import cv2
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.cluster import KMeans
 
 layers = tf_keras.layers
 # print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
@@ -66,11 +67,28 @@ while True:
         aux.append(temp_frame)
 
 X_train,X_test = train_test_split(embeddings,train_size=0.8,random_state=0)
+
+X_train = np.array(X_train)
+X_test = np.array(X_test)
+
 print(np.array(X_train).shape)
 print(np.array(X_test).shape)
 
-K = np.arange(100)+1
-grid = {'n_neighbors':K}
+X_train = X_train.reshape(X_train.shape[0],768)
+X_test = X_test.reshape(X_test.shape[0],768)
 
-knnCV = GridSearchCV(knn, param_grid = grid, return_train_score = True)
-knnCV.fit(X_train, y_train)
+kmeans = KMeans(n_clusters = 5, random_state = 0)
+kmeans.fit(X_train)
+
+labels = kmeans.labels_
+centroids = kmeans.cluster_centers_
+
+print(labels)
+print(centroids)
+
+print(kmeans.predict(X_test))
+# K = np.arange(100)+1
+# grid = {'n_neighbors':K}
+
+# knnCV = GridSearchCV(knn, param_grid = grid, return_train_score = True)
+# knnCV.fit(X_train, y_train)
