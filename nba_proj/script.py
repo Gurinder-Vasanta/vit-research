@@ -4,6 +4,9 @@ import numpy as np
 import tensorflow as tf, tf_keras
 import skvideo.io
 import cv2
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.neighbors import KNeighborsClassifier
+
 layers = tf_keras.layers
 # print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
 # from tensorflow.python.platform import build_info as tf_build_info
@@ -39,19 +42,35 @@ cur_count = 0
 embeddings = []
 aux = []
 while True:
+    if(len(embeddings) == 256): break #10240
     ret, frame = cap.read()
     if not ret: break
     if(cur_count == batch_cap):
         aux = np.array(aux)
-        input(aux.shape)
+        # input(aux.shape)
     
         output = model.predict(aux, batch_size = 32, verbose=1)
         aux = []
-        cur_count = 1
-        input(output)
+        cur_count = 0
+        # print(output)
+        print(output['pre_logits'].shape) # generates a 768 length vector for each frame, so the shape is 256,1,1,768
+        temp = np.array(output['pre_logits'])
+        temp = temp.reshape(batch_cap,1,768)
+        for embd in temp:
+            embeddings.append(embd)
+        print(np.array(embeddings).shape)
     else:
         cur_count += 1
         target_size = (768,432)
         temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
         aux.append(temp_frame)
 
+X_train,X_test = train_test_split(embeddings,train_size=0.8,random_state=0)
+print(np.array(X_train).shape)
+print(np.array(X_test).shape)
+
+K = np.arange(100)+1
+grid = {'n_neighbors':K}
+
+knnCV = GridSearchCV(knn, param_grid = grid, return_train_score = True)
+knnCV.fit(X_train, y_train)
