@@ -7,6 +7,7 @@ import cv2
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
 
 layers = tf_keras.layers
 # print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
@@ -27,6 +28,8 @@ output_path = 'data/hoop_ball_finding.mp4'
 #                                  inputdict=inputparameters,
 #                                  outputdict=outputparameters)
 
+
+
 model = vit.VisionTransformer(
     # image_size = 224,
     input_specs=layers.InputSpec(shape=[None,432,768,3]),
@@ -42,10 +45,16 @@ batch_cap = 256
 cur_count = 0
 embeddings = []
 aux = []
+frames = []
+
+max_frames = 10240
+train_ind,test_ind = train_test_split([i for i in range(max_frames)],train_size=0.8,random_state=0)
+
 while True:
-    if(len(embeddings) == 256): break #10240
+    if(len(embeddings) == max_frames): break #10240
     ret, frame = cap.read()
     if not ret: break
+    frames.append(frame)
     if(cur_count == batch_cap):
         aux = np.array(aux)
         # input(aux.shape)
@@ -66,11 +75,14 @@ while True:
         temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
         aux.append(temp_frame)
 
+
+
+
 X_train,X_test = train_test_split(embeddings,train_size=0.8,random_state=0)
 
 X_train = np.array(X_train)
 X_test = np.array(X_test)
-
+print('--------------')
 print(np.array(X_train).shape)
 print(np.array(X_test).shape)
 
@@ -86,7 +98,24 @@ centroids = kmeans.cluster_centers_
 print(labels)
 print(centroids)
 
-print(kmeans.predict(X_test))
+for i in range(10):
+    temp = frames[train_ind[i]]
+    temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
+    plt.imshow(temp_rgb)
+    plt.savefig(f'test_images/train_ind_{[train_ind[i]]}_labelled{[labels[0]]}.png')
+
+# temp = frames[train_ind[1]]
+# temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
+# plt.imshow(temp_rgb)
+# plt.savefig(f'train_ind_{[train_ind[1]]}_labelled{[labels[1]]}.png')
+
+# plt.show()
+
+# print(kmeans.predict(X_test))
+
+
+
+
 # K = np.arange(100)+1
 # grid = {'n_neighbors':K}
 
