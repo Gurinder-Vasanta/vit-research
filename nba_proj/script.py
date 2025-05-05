@@ -29,15 +29,15 @@ output_path = 'data/hoop_ball_finding.mp4'
 #                                  outputdict=outputparameters)
 
 
-
+hidden_size = 896 #768
 model = vit.VisionTransformer(
     # image_size = 224,
-    input_specs=layers.InputSpec(shape=[None,432,768,3]),
-    patch_size=16,
-    num_layers=12,
-    num_heads=12,
-    hidden_size=768,
-    mlp_dim=3072
+    input_specs=layers.InputSpec(shape=[None,504,896,3]),  #432,768   648,1152   504,896
+    patch_size=64, #16 128 had more variance
+    num_layers=14, #12
+    num_heads=14, #12
+    hidden_size=hidden_size,
+    mlp_dim=3584 #3072
 )
 
 cap = cv2.VideoCapture(output_path)
@@ -65,13 +65,13 @@ while True:
         # print(output)
         print(output['pre_logits'].shape) # generates a 768 length vector for each frame, so the shape is 256,1,1,768
         temp = np.array(output['pre_logits'])
-        temp = temp.reshape(batch_cap,1,768)
+        temp = temp.reshape(batch_cap,1,hidden_size)
         for embd in temp:
             embeddings.append(embd)
         print(np.array(embeddings).shape)
     else:
         cur_count += 1
-        target_size = (768,432)
+        target_size = (hidden_size,504)
         temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
         aux.append(temp_frame)
 
@@ -86,8 +86,8 @@ print('--------------')
 print(np.array(X_train).shape)
 print(np.array(X_test).shape)
 
-X_train = X_train.reshape(X_train.shape[0],768)
-X_test = X_test.reshape(X_test.shape[0],768)
+X_train = X_train.reshape(X_train.shape[0],hidden_size)
+X_test = X_test.reshape(X_test.shape[0],hidden_size)
 
 kmeans = KMeans(n_clusters = 5, random_state = 0)
 kmeans.fit(X_train)
@@ -98,11 +98,11 @@ centroids = kmeans.cluster_centers_
 print(labels)
 print(centroids)
 
-for i in range(10):
+for i in range(30):
     temp = frames[train_ind[i]]
     temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
     plt.imshow(temp_rgb)
-    plt.savefig(f'test_images/train_ind_{[train_ind[i]]}_labelled{[labels[0]]}.png')
+    plt.savefig(f'test_images/train_ind_{[train_ind[i]]}_labelled{[labels[i]]}.png')
 
 # temp = frames[train_ind[1]]
 # temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
