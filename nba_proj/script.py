@@ -28,7 +28,8 @@ output_path = 'data/hoop_ball_finding.mp4'
 #                                  inputdict=inputparameters,
 #                                  outputdict=outputparameters)
 
-
+ 
+ 
 hidden_size = 896 #768
 model = vit.VisionTransformer(
     # image_size = 224,
