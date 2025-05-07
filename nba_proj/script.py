@@ -81,6 +81,11 @@ while True:
 
 X_train,X_test = train_test_split(embeddings,train_size=0.8,random_state=0)
 
+# pick some frames that represents a hardcoded centroid
+# do these steps: 
+# pick a frame (or a few frames) that represents lhs, rhs, non
+# generate embeddings for these which will become the new hardcoded centroids
+# do the kmeans on that
 X_train = np.array(X_train)
 X_test = np.array(X_test)
 print('--------------')
