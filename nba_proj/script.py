@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import normalize
 
 layers = tf_keras.layers
 # print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
@@ -48,7 +49,7 @@ embeddings = []
 aux = []
 frames = []
 
-max_frames = 10240
+max_frames = 10240 
 train_ind,test_ind = train_test_split([i for i in range(max_frames)],train_size=0.8,random_state=0)
 
 while True:
@@ -95,6 +96,10 @@ print(np.array(X_test).shape)
 X_train = X_train.reshape(X_train.shape[0],hidden_size)
 X_test = X_test.reshape(X_test.shape[0],hidden_size)
 
+X_train = normalize(X_train,norm='l2')
+X_test = normalize(X_test,norm='l2')
+
+print(X_train)
 custom_centroids = np.array([
     X_train[185],
     X_train[6419],
