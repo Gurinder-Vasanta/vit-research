@@ -95,7 +95,15 @@ print(np.array(X_test).shape)
 X_train = X_train.reshape(X_train.shape[0],hidden_size)
 X_test = X_test.reshape(X_test.shape[0],hidden_size)
 
-kmeans = KMeans(n_clusters = 5, random_state = 0)
+custom_centroids = np.array([
+    X_train[185],
+    X_train[6419],
+    X_train[4066]
+]) #train_ind 185 (for left); 6419 (for right); 4066 (for neither)
+kmeans = KMeans(n_clusters = 3, 
+                init = custom_centroids,
+                n_init = 1,
+                random_state = 0)
 kmeans.fit(X_train)
 
 labels = kmeans.labels_
