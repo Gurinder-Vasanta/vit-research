@@ -31,15 +31,15 @@ output_path = 'data/hoop_ball_finding.mp4'
 
  
  
-hidden_size = 896 #768
+hidden_size = 768 #768
 model = vit.VisionTransformer(
     # image_size = 224,
-    input_specs=layers.InputSpec(shape=[None,504,896,3]),  #432,768   648,1152   504,896
-    patch_size=64, #16 128 had more variance
-    num_layers=14, #12
-    num_heads=14, #12
+    input_specs=layers.InputSpec(shape=[None,432,768,3]),  #432,768   648,1152   504,896
+    patch_size=256, #16 128 had more variance 64
+    num_layers=12, #12  14
+    num_heads=12, #12  14
     hidden_size=hidden_size,
-    mlp_dim=3584 #3072
+    mlp_dim=3072 #3072  3584
 )
 
 cap = cv2.VideoCapture(output_path)
@@ -73,7 +73,7 @@ while True:
         print(np.array(embeddings).shape)
     else:
         cur_count += 1
-        target_size = (hidden_size,504)
+        target_size = (hidden_size,432) #504
         temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
         aux.append(temp_frame)
 
@@ -96,7 +96,7 @@ print(np.array(X_test).shape)
 X_train = X_train.reshape(X_train.shape[0],hidden_size)
 X_test = X_test.reshape(X_test.shape[0],hidden_size)
 
-X_train = normalize(X_train,norm='l2')
+X_train = normalize(X_train,norm='l2') #l2 worked somewhat well
 X_test = normalize(X_test,norm='l2')
 
 print(X_train)
