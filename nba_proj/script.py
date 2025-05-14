@@ -80,8 +80,8 @@ while True:
 
 
 # input(np.array(embeddings).shape)
-for i in range(len(embeddings)):
-    embeddings[i] = embeddings[i] * 1000
+# for i in range(len(embeddings)):
+#     embeddings[i] = embeddings[i] * 1000
     # input(embeddings[i].shape)
 X_train,X_test = train_test_split(embeddings,train_size=0.8,random_state=0)
 
@@ -99,11 +99,11 @@ print(np.array(X_test).shape)
 X_train = X_train.reshape(X_train.shape[0],hidden_size)
 X_test = X_test.reshape(X_test.shape[0],hidden_size)
 
-X_train = normalize(X_train,norm='l1') #l2 worked somewhat well
-X_test = normalize(X_test,norm='l1')
+X_train = normalize(X_train,norm='l2') #l2 worked somewhat well
+X_test = normalize(X_test,norm='l2')
 
-X_train = X_train * 1000
-X_test = X_test * 1000
+# X_train = X_train * 1000
+# X_test = X_test * 1000
 # for i in range(len(X_train)):
 #     embeddings[i] = embeddings[i] * 1000
 
@@ -114,8 +114,8 @@ custom_centroids = np.array([
     X_train[4066]
 ]) #train_ind 185 (for left); 6419 (for right); 4066 (for neither)
 kmeans = KMeans(n_clusters = 3, 
-                init = custom_centroids,
-                n_init = 1,
+                # init = custom_centroids,
+                # n_init = 1,
                 random_state = 0)
 kmeans.fit(X_train)
 
@@ -125,11 +125,19 @@ centroids = kmeans.cluster_centers_
 print(labels)
 print(centroids)
 
-for i in range(30):
-    temp = frames[train_ind[i]]
-    temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
-    plt.imshow(temp_rgb)
-    plt.savefig(f'test_images/train_ind_{[train_ind[i]]}_labelled{[labels[i]]}.png')
+for cluster_id in range(3):
+    for i in np.where(labels == cluster_id)[0][:5]:
+        cv2.imwrite(f"test_images/cluster_{cluster_id}_frame_{i}.jpg", frames[i])
+
+
+# for i in range(30):
+#     temp = frames[train_ind[i]]
+#     temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
+#     plt.imshow(temp_rgb)
+#     plt.savefig(f'test_images/train_ind_{[train_ind[i]]}_labelled{[labels[i]]}.png')
+
+
+
 
 # temp = frames[train_ind[1]]
 # temp_rgb = cv2.cvtColor(temp,cv2.COLOR_BGR2RGB)
