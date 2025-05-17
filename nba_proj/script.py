@@ -77,12 +77,12 @@ while True:
     else:
         cur_count += 1
         target_size = (hidden_size,432) #504
-        cv2.imwrite(f"data/left/frame_{global_counter}.jpg", frame)
+        cv2.imwrite(f"data/temp/frame_{global_counter}.jpg", frame)
         temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
         
         aux.append(temp_frame)
 
-# these are labelled frames
+# these are labelled frames (put the manually labelled ones in the temp folder)
 # 1-420 is left
 # 421 to 458 is none
 # 458 to 896 is right
