@@ -49,13 +49,16 @@ embeddings = []
 aux = []
 frames = []
 
-max_frames = 10240 #10240  
+max_frames = 1024 #10240  12288
 train_ind,test_ind = train_test_split([i for i in range(max_frames)],train_size=0.8,random_state=0)
 
+global_counter = 0
 while True:
     if(len(embeddings) == max_frames): break #10240
     ret, frame = cap.read()
     if not ret: break
+    global_counter+=1
+    if(global_counter < 514): continue
     frames.append(frame)
     if(cur_count == batch_cap):
         aux = np.array(aux)
@@ -74,11 +77,22 @@ while True:
     else:
         cur_count += 1
         target_size = (hidden_size,432) #504
+        cv2.imwrite(f"data/left/frame_{global_counter}.jpg", frame)
         temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
+        
         aux.append(temp_frame)
 
+# these are labelled frames
+# 1-420 is left
+# 421 to 458 is none
+# 458 to 896 is right
+# 897 to 953 is none
+# 954 to 1303 is right
+# 1304 to 1540+ is left
 
-
+# going to write these to a npz file to load embeddings from them
+# the embeddings are going to be stored in the data/left data/none data/right folders
+input('stop')
 # input(np.array(embeddings).shape)
 # for i in range(len(embeddings)):
 #     embeddings[i] = embeddings[i] * 1000
@@ -104,8 +118,8 @@ X_test = normalize(X_test,norm='l2')
 
 # X_train = X_train * 1000
 # X_test = X_test * 1000
-# for i in range(len(X_train)):
-#     embeddings[i] = embeddings[i] * 1000
+for i in range(len(X_train)):
+    embeddings[i] = embeddings[i] * 1000
 
 print(X_train)
 custom_centroids = np.array([
