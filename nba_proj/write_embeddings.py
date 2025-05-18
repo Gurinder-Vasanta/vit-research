@@ -93,7 +93,14 @@ for f_name in all_frames:
         temp = temp.reshape(batch_cap,1,hidden_size)
 
         for i in range(len(temp)):
+            input(aux_frame_ids[i])
+            input(aux_frame_ids)
             f_class = class_from_frame(aux_frame_ids[i])
+
+            f_path = os.path.join(frames_path,aux_frame_ids[i])
+            im = cv2.imread(f_path)
+            im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
             if(f_class == 'left'):
                 l_embeddings.append(temp[i])
                 l_fids.append(aux_frame_ids[i])
