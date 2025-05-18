@@ -46,12 +46,12 @@ im_ranges = {'left':[[1,420],[1304,1540]],
 def class_from_frame(frame_name):
     splitted = frame_name.split('_')
     num = int(splitted[1].split('.')[0])
-    input(num)
+    # input(num)
     for inter in im_ranges['left']:
-        input(inter)
+        # input(inter)
         if(num >= inter[0] and num <= inter[1]): return 'left'
     for inter in im_ranges['right']:
-        input(inter)
+        # input(inter)
         if(num >= inter[0] and num <= inter[1]): return 'right'
     return 'none'
 
@@ -93,8 +93,8 @@ for f_name in all_frames:
         temp = temp.reshape(batch_cap,1,hidden_size)
 
         for i in range(len(temp)):
-            input(aux_frame_ids[i])
-            input(aux_frame_ids)
+            # input(aux_frame_ids[i])
+            # input(aux_frame_ids)
             f_class = class_from_frame(aux_frame_ids[i])
 
             f_path = os.path.join(frames_path,aux_frame_ids[i])
@@ -142,9 +142,9 @@ print(np.array(r_fids).shape)
 print(np.array(n_fids).shape)
 
 
-print(embeddings[0])
-print(frame_ids[0])
-print(class_from_frame(frame_ids[0]))
+# print(embeddings[0])
+# print(frame_ids[0])
+# print(class_from_frame(frame_ids[0]))
 
 
 # the left right none folders should have the frames themselves and the corresponding embeddings files
