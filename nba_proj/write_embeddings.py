@@ -79,8 +79,6 @@ aux_frame_ids = []
 frame_ids = []
 
 for f_name in all_frames: 
-    total_count += 1
-    if(total_count == 100): break
     f_path = os.path.join(frames_path,f_name)
     im = cv2.imread(f_path)
     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
@@ -141,7 +139,9 @@ print(np.array(l_fids).shape)
 print(np.array(r_fids).shape)
 print(np.array(n_fids).shape)
 
-
+np.savez('data/embeddings/left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
+np.savez('data/embeddings/right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
+np.savez('data/embeddings/none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
 # print(embeddings[0])
 # print(frame_ids[0])
 # print(class_from_frame(frame_ids[0]))
