@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import normalize
 import os
 
+
+layers = tf_keras.layers
+
 inputparameters = {}
 outputparameters = {}
 
@@ -35,19 +38,109 @@ model = vit.VisionTransformer(
 # 954 to 1303 is right
 # 1304 to 1540+ is left
 
-im_ranges = {'left':[[1,420],[1304,1540]],'right':}
+# going to add more intervals to this if the embeddings are still bad
+im_ranges = {'left':[[1,420],[1304,1540]],
+            'right':[[458,896],[954,1303]],
+            'none':[[421,458],[897,953]]}
+
+def class_from_frame(frame_name):
+    splitted = frame_name.split('_')
+    num = int(splitted[1].split('.')[0])
+    input(num)
+    for inter in im_ranges['left']:
+        input(inter)
+        if(num >= inter[0] and num <= inter[1]): return 'left'
+    for inter in im_ranges['right']:
+        input(inter)
+        if(num >= inter[0] and num <= inter[1]): return 'right'
+    return 'none'
+
 frames_path = 'data/temp'
+left_path = 'data/left'
+right_path = 'data/right'
+none_path = 'data/none'
+
 all_frames = os.listdir(frames_path)
 
-batch_cap = 256
+total_count = 0
+batch_cap = 32
 cur_count = 0
 embeddings = []
+l_embeddings = []
+r_embeddings = []
+n_embeddings = []
+
+l_fids = []
+r_fids = []
+n_fids = []
+
 aux = []
+aux_frame_ids = []
+frame_ids = []
 
 for f_name in all_frames: 
+    total_count += 1
+    if(total_count == 100): break
     f_path = os.path.join(frames_path,f_name)
     im = cv2.imread(f_path)
     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+    if(cur_count == batch_cap):
+        aux = np.array(aux)
+        output = model.predict(aux, batch_size = 32, verbose=1)
+
+        temp = np.array(output['pre_logits'])
+        temp = temp.reshape(batch_cap,1,hidden_size)
+
+        for i in range(len(temp)):
+            f_class = class_from_frame(aux_frame_ids[i])
+            if(f_class == 'left'):
+                l_embeddings.append(temp[i])
+                l_fids.append(aux_frame_ids[i])
+                cv2.imwrite(f"{left_path}/left_{aux_frame_ids[i]}", im)
+            elif(f_class == 'right'):
+                r_embeddings.append(temp[i])
+                r_fids.append(aux_frame_ids[i])
+                cv2.imwrite(f"{right_path}/right_{aux_frame_ids[i]}", im)
+            elif(f_class == 'none'):
+                n_embeddings.append(temp[i])
+                n_fids.append(aux_frame_ids[i])
+                cv2.imwrite(f"{none_path}/none_{aux_frame_ids[i]}", im)
+
+        # for embd in temp:
+        #     f_class = class_from_frame()
+        #     embeddings.append(embd)
+        
+        # frame_ids = np.append(np.array(frame_ids),np.array(aux_frame_ids))
+
+        aux = []
+        aux_frame_ids = []
+        cur_count = 0
+    
+    else:
+        cur_count += 1
+        target_size = (hidden_size,432)
+        temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
+        aux.append(temp_frame)
+        aux_frame_ids.append(f_name)
+
+# print(np.array(embeddings).shape)
+# print(np.array(frame_ids).shape)
+
+print(np.array(l_embeddings).shape)
+print(np.array(r_embeddings).shape)
+print(np.array(n_embeddings).shape)
+print(np.array(l_fids).shape)
+print(np.array(r_fids).shape)
+print(np.array(n_fids).shape)
+
+
+print(embeddings[0])
+print(frame_ids[0])
+print(class_from_frame(frame_ids[0]))
+
+
+# the left right none folders should have the frames themselves and the corresponding embeddings files
 
 # cap = cv2.VideoCapture(output_path)
 # batch_cap = 256
