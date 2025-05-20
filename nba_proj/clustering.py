@@ -4,6 +4,9 @@
 
 import numpy as np
 from scipy.spatial.distance import cosine, euclidean
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+from sklearn.linear_model import LogisticRegression
 
 left_data = np.load('left_embeddings.npz')
 right_data = np.load('right_embeddings.npz')
@@ -29,10 +32,53 @@ print("Right vs None:", euclidean(tr_mean, tn_mean))
 # Left vs None: 5.2430291175842285
 # Right vs None: 4.360372066497803
 
-# cosine distances (very bad)
-print("Left vs Right:", cosine(tl_mean, tr_mean)) 
-print("Left vs None:", cosine(tl_mean, tn_mean))
-print("Right vs None:", cosine(tr_mean, tn_mean))
-# Left vs Right: 0.010567313435242087
-# Left vs None: 0.01952976033597853
-# Right vs None: 0.013695738828088944
+# # cosine distances (very bad)
+# print("Left vs Right:", cosine(tl_mean, tr_mean)) 
+# print("Left vs None:", cosine(tl_mean, tn_mean))
+# print("Right vs None:", cosine(tr_mean, tn_mean))
+# # Left vs Right: 0.010567313435242087
+# # Left vs None: 0.01952976033597853
+# # Right vs None: 0.013695738828088944
+
+print(tl.shape)
+print(tr.shape)
+yl = [0]*len(tl)
+yr = [1]*len(tr)
+yn = [2]*len(tn)
+combined = np.append(tl, tr,axis=0)
+cy = np.append(yl,yr)
+combined = np.append(combined, tn,axis=0)
+cy = np.append(cy, yn)
+# input(combined.shape)
+# input(cy.shape)
+custom_centroids = np.array([
+    tl_mean,
+    tr_mean,
+    tn_mean
+]) 
+
+kmeans = KMeans(n_clusters = 3, 
+                init = custom_centroids,
+                n_init = 1,
+                random_state = 0)
+kmeans.fit(combined)
+
+labels = kmeans.labels_
+centroids = kmeans.cluster_centers_
+
+preds = kmeans.predict(combined)
+print(preds.shape)
+print(cy.shape)
+print(preds == cy)
+print(np.sum(preds == cy))
+
+# input(cy[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)])
+print(f'Class 0 (left side): {np.sum(preds[0:len(tl)] == cy[0:len(tl)])} / {len(tl)}')
+print(f'Class 1 (right side): {np.sum(preds[len(tl)+1 : len(tl) + len(tr)] == cy[len(tl)+1 : len(tl) + len(tr)])} / {len(tr)}')
+print(f'Class 2 (none): {np.sum(preds[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)] == cy[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)])} / {len(tn)}')
+
+clf = LogisticRegression(max_iter=1000,verbose=1)
+clf.fit(combined, cy)
+
+print(clf.score(combined,cy))
+# print(cy[0:len(tl)])
