@@ -79,6 +79,6 @@ print(f'Class 2 (none): {np.sum(preds[len(tl)+1+len(tr) : len(tl) + len(tr)+len(
 
 clf = LogisticRegression(max_iter=1000,verbose=1)
 clf.fit(combined, cy)
-
+ 
 print(clf.score(combined,cy))
 # print(cy[0:len(tl)])
