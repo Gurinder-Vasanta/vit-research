@@ -39,9 +39,10 @@ model = vit.VisionTransformer(
 # 1304 to 1540+ is left
 
 # going to add more intervals to this if the embeddings are still bad
-im_ranges = {'left':[[1,420],[1304,1540]],
-            'right':[[458,896],[954,1303]],
-            'none':[[421,458],[897,953]]}
+# maybe put this in a separate text file instead of manually hardcoding dictionary
+im_ranges = {'left':[[1,420],[1304,1842],[1872,2056],[2161,2414]],
+            'right':[[458,896],[954,1303],[2464,2650],[2671,2879],[2949,3198],[3292,3540]],
+            'none':[[421,458],[897,953],[1843,1871],[2057,2160],[2415,2463],[2651,2670],[2880,2948],[3199,3291],[3541,3595]]}
 
 def class_from_frame(frame_name):
     splitted = frame_name.split('_')

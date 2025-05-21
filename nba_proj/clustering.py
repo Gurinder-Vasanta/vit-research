@@ -8,9 +8,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 
-left_data = np.load('left_embeddings.npz')
-right_data = np.load('right_embeddings.npz')
-none_data = np.load('none_embeddings.npz')
+left_data = np.load('data/embeddings/left_embeddings.npz')
+right_data = np.load('data/embeddings/right_embeddings.npz')
+none_data = np.load('data/embeddings/none_embeddings.npz')
 
 tl = left_data['embeddings']
 tr = right_data['embeddings']
