@@ -77,8 +77,16 @@ print(f'Class 0 (left side): {np.sum(preds[0:len(tl)] == cy[0:len(tl)])} / {len(
 print(f'Class 1 (right side): {np.sum(preds[len(tl)+1 : len(tl) + len(tr)] == cy[len(tl)+1 : len(tl) + len(tr)])} / {len(tr)}')
 print(f'Class 2 (none): {np.sum(preds[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)] == cy[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)])} / {len(tn)}')
 
+splitted = train_test_split(combined,cy,train_size=0.8,random_state=0,stratify=cy)
+X_train = np.array(splitted[0])
+X_test = np.array(splitted[1])
+y_train = np.array(splitted[2])
+y_test = np.array(splitted[3])
+
 clf = LogisticRegression(max_iter=1000,verbose=1)
-clf.fit(combined, cy)
+clf.fit(X_train, y_train)
  
-print(clf.score(combined,cy))
+print(X_test.shape)
+print(clf.score(X_train,y_train))
+print(clf.score(X_test,y_test))
 # print(cy[0:len(tl)])
