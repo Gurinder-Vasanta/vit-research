@@ -97,10 +97,15 @@ svcCV.fit(X_train, y_train)
 print('Best C =',svcCV.best_params_)
 print('Validation R2 = ',svcCV.best_score_)
 
+confidences = svcCV.decision_function(X_test)
+
 print('Test Accuracy',svcCV.score(X_test,y_test))
 print('Train Accuracy',svcCV.score(X_train,y_train))
+print('Confidences???',confidences)
 
-print(X_test.shape)
+
+for i in range(len(X_test)):
+    print(f'confidences: {confidences[i]} actual: {y_test[i]}')
 # print(X_test.shape)
 # print(svcCV.score(X_train,y_train))
 # print(svcCV.score(X_test,y_test))
