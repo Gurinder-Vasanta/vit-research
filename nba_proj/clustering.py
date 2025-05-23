@@ -7,6 +7,8 @@ from scipy.spatial.distance import cosine, euclidean
 from sklearn.model_selection import train_test_split
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.svm import SVC
 
 left_data = np.load('data/embeddings/left_embeddings.npz')
 right_data = np.load('data/embeddings/right_embeddings.npz')
@@ -83,10 +85,23 @@ X_test = np.array(splitted[1])
 y_train = np.array(splitted[2])
 y_test = np.array(splitted[3])
 
-clf = LogisticRegression(max_iter=1000,verbose=1)
-clf.fit(X_train, y_train)
- 
+grid = {'C':np.arange(9,10,0.05)}
+
+# clf = LogisticRegression(max_iter=1000,verbose=1)
+# clf.fit(X_train, y_train)
+
+svc = SVC(kernel='rbf')
+svcCV = GridSearchCV(svc,param_grid=grid,return_train_score=True,n_jobs=-1,verbose=True)
+svcCV.fit(X_train, y_train)
+
+print('Best C =',svcCV.best_params_)
+print('Validation R2 = ',svcCV.best_score_)
+
+print('Test Accuracy',svcCV.score(X_test,y_test))
+print('Train Accuracy',svcCV.score(X_train,y_train))
+
 print(X_test.shape)
-print(clf.score(X_train,y_train))
-print(clf.score(X_test,y_test))
+# print(X_test.shape)
+# print(svcCV.score(X_train,y_train))
+# print(svcCV.score(X_test,y_test))
 # print(cy[0:len(tl)])
