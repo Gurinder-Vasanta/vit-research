@@ -104,8 +104,8 @@ print('Train Accuracy',svcCV.score(X_train,y_train))
 print('Confidences???',confidences)
 
 
-for i in range(len(X_test)):
-    print(f'confidences: {confidences[i]} actual: {y_test[i]}')
+# for i in range(len(X_test)):
+#     print(f'confidences: {confidences[i]} actual: {y_test[i]}')
 # print(X_test.shape)
 # print(svcCV.score(X_train,y_train))
 # print(svcCV.score(X_test,y_test))
