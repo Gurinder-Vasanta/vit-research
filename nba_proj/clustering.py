@@ -9,6 +9,7 @@ from sklearn.cluster import KMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
 from sklearn.svm import SVC
+from joblib import dump
 
 left_data = np.load('data/embeddings/left_embeddings.npz')
 right_data = np.load('data/embeddings/right_embeddings.npz')
@@ -97,6 +98,7 @@ svcCV.fit(X_train, y_train)
 print('Best C =',svcCV.best_params_)
 print('Validation R2 = ',svcCV.best_score_)
 
+dump(svcCV, 'side_clustering.joblib')
 confidences = svcCV.decision_function(X_test)
 
 print('Test Accuracy',svcCV.score(X_test,y_test))
