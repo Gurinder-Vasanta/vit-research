@@ -143,6 +143,8 @@ print(np.array(n_fids).shape)
 np.savez('data/embeddings/left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
 np.savez('data/embeddings/right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
 np.savez('data/embeddings/none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
+model.save_weights('vit_random_weights.h5')
+
 # print(embeddings[0])
 # print(frame_ids[0])
 # print(class_from_frame(frame_ids[0]))
