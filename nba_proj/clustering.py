@@ -92,7 +92,7 @@ print(f'Class 0 (left side): {np.sum(preds[0:len(tl)] == cy[0:len(tl)])} / {len(
 print(f'Class 1 (right side): {np.sum(preds[len(tl)+1 : len(tl) + len(tr)] == cy[len(tl)+1 : len(tl) + len(tr)])} / {len(tr)}')
 print(f'Class 2 (none): {np.sum(preds[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)] == cy[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)])} / {len(tn)}')
 
-splitted = train_test_split(combined,cy,train_size=0.975,random_state=0,stratify=cy)
+splitted = train_test_split(combined,cy,train_size=0.8,random_state=0,stratify=cy)
 X_train = np.array(splitted[0])
 X_test = np.array(splitted[1])
 y_train = np.array(splitted[2])
