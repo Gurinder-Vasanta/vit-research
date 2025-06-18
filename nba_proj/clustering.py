@@ -10,6 +10,18 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import GridSearchCV
 from sklearn.svm import SVC
 from joblib import dump
+import tensorflow
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import Input
+from tensorflow.keras.layers import Flatten
+from tensorflow.keras.layers import LSTM
+from tensorflow.keras.layers import RepeatVector
+from tensorflow.keras.layers import TimeDistributed
+from tensorflow.keras.layers import Bidirectional
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.backend import sigmoid
+
 
 left_data = np.load('data/embeddings/left_embeddings.npz')
 right_data = np.load('data/embeddings/right_embeddings.npz')
@@ -80,30 +92,63 @@ print(f'Class 0 (left side): {np.sum(preds[0:len(tl)] == cy[0:len(tl)])} / {len(
 print(f'Class 1 (right side): {np.sum(preds[len(tl)+1 : len(tl) + len(tr)] == cy[len(tl)+1 : len(tl) + len(tr)])} / {len(tr)}')
 print(f'Class 2 (none): {np.sum(preds[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)] == cy[len(tl)+1+len(tr) : len(tl) + len(tr)+len(tn)])} / {len(tn)}')
 
-splitted = train_test_split(combined,cy,train_size=0.8,random_state=0,stratify=cy)
+splitted = train_test_split(combined,cy,train_size=0.975,random_state=0,stratify=cy)
 X_train = np.array(splitted[0])
 X_test = np.array(splitted[1])
 y_train = np.array(splitted[2])
 y_test = np.array(splitted[3])
 
-grid = {'C':np.arange(9,10,0.05)}
+acc_y_train = []
+acc_y_test = []
 
-# clf = LogisticRegression(max_iter=1000,verbose=1)
-# clf.fit(X_train, y_train)
+for target in y_train:
+    temp = [0.0,0.0,0.0]
+    temp[target] = 1.0
+    acc_y_train.append(temp)
 
-svc = SVC(kernel='rbf')
-svcCV = GridSearchCV(svc,param_grid=grid,return_train_score=True,n_jobs=-1,verbose=True)
-svcCV.fit(X_train, y_train)
+for target in y_test: 
+    temp = [0.0,0.0,0.0]
+    temp[target] = 1.0
+    acc_y_test.append(temp)
 
-print('Best C =',svcCV.best_params_)
-print('Validation R2 = ',svcCV.best_score_)
+y_train = np.array(acc_y_train)
+y_test = np.array(acc_y_test)
 
-dump(svcCV, 'side_clustering.joblib')
-confidences = svcCV.decision_function(X_test)
+# input(X_train.shape)
+optimizer = tensorflow.keras.optimizers.Adam(0.0001)
 
-print('Test Accuracy',svcCV.score(X_test,y_test))
-print('Train Accuracy',svcCV.score(X_train,y_train))
-print('Confidences???',confidences)
+model = Sequential()
+
+# model.add(Input(shape=(768,)))
+model.add((Dense(250,activation='relu')))
+model.add(Dense(128,activation='relu'))
+model.add(Dense(3,activation='softmax'))
+
+# input(y_train.shape)
+model.compile(optimizer = optimizer, loss='categorical_crossentropy', metrics=['mse','mae','acc'])
+history = model.fit(X_train, y_train, epochs=25, verbose=1, validation_data = (X_test, y_test))
+
+model.save("side_nn.keras")
+# model.save_weights("side_nn.weights.h5")
+# grid = {'C':np.arange(26.75,27,0.075), 
+#         'gamma': [10**i for i in range(-5,1)]} #9, 10, 0.05; 14, 15, 0.05; 19,20, 0.05; 25, 30, 0.05
+
+# # clf = LogisticRegression(max_iter=1000,verbose=1)
+# # clf.fit(X_train, y_train)
+
+# svc = SVC(kernel='rbf')
+# svcCV = GridSearchCV(svc,param_grid=grid,return_train_score=True,n_jobs=-1,verbose=True)
+# svcCV.fit(X_train, y_train)
+
+# print('Best C =',svcCV.best_params_)
+# print('Validation R2 = ',svcCV.best_score_)
+
+# dump(svcCV, 'side_clustering.joblib')
+# confidences = svcCV.decision_function(X_test)
+
+# print('Test Accuracy',svcCV.score(X_test,y_test))
+# print('Train Accuracy',svcCV.score(X_train,y_train))
+# print('Confidences???',confidences)
 
 
 # for i in range(len(X_test)):
