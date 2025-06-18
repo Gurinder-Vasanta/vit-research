@@ -1,6 +1,7 @@
 from official.vision.modeling.backbones import vit
 import tensorflow as tf
 import numpy as np
+import pandas as pd
 import tensorflow as tf, tf_keras
 import skvideo.io
 import cv2
@@ -11,6 +12,39 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import normalize
 import os
 
+def generate_manual_intervals():
+    df = pd.read_csv('data/manual_intervals.csv')
+    # print(df)
+
+    output_dict = {}
+
+    ls = np.array(df['left_start'])
+    le = np.array(df['left_end'])
+
+    left = []
+    for i in range(len(ls)):
+        if(not np.isnan(ls[i])):
+            left.append([int(ls[i]),int(le[i])])
+    output_dict['left'] = left
+
+    rs = np.array(df['right_start'])
+    re = np.array(df['right_end'])
+
+    right = []
+    for i in range(len(rs)):
+        if(not np.isnan(rs[i])):
+            right.append([int(rs[i]),int(re[i])])
+    output_dict['right'] = right
+
+    ns = np.array(df['none_start'])
+    ne = np.array(df['none_end'])
+
+    none = []
+    for i in range(len(ns)):
+        if(not np.isnan(ns[i])):
+            none.append([int(ns[i]),int(ne[i])])
+    output_dict['none'] = none
+    return output_dict
 
 layers = tf_keras.layers
 
@@ -40,9 +74,11 @@ model = vit.VisionTransformer(
 
 # going to add more intervals to this if the embeddings are still bad
 # maybe put this in a separate text file instead of manually hardcoding dictionary
-im_ranges = {'left':[[1,420],[1304,1842],[1872,2056],[2161,2414]],
-            'right':[[458,896],[954,1303],[2464,2650],[2671,2879],[2949,3198],[3292,3540]],
-            'none':[[421,458],[897,953],[1843,1871],[2057,2160],[2415,2463],[2651,2670],[2880,2948],[3199,3291],[3541,3595]]}
+# im_ranges = {'left':[[1,420],[1304,1842],[1872,2056],[2161,2414]],
+#             'right':[[458,896],[954,1303],[2464,2650],[2671,2879],[2949,3198],[3292,3540]],
+#             'none':[[421,458],[897,953],[1843,1871],[2057,2160],[2415,2463],[2651,2670],[2880,2948],[3199,3291],[3541,3595]]}
+
+im_ranges = generate_manual_intervals()
 
 def class_from_frame(frame_name):
     splitted = frame_name.split('_')
