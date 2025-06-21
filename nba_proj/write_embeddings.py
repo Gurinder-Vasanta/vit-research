@@ -13,6 +13,38 @@ from sklearn.preprocessing import normalize
 import os
 
 def generate_manual_intervals():
+    # df = pd.read_csv('data/manual_intervals.csv')
+    # # print(df)
+
+    # output_dict = {}
+
+    # ls = np.array(df['left_start'])
+    # le = np.array(df['left_end'])
+
+    # left = []
+    # for i in range(len(ls)):
+    #     if(not np.isnan(ls[i])):
+    #         left.append([int(ls[i]),int(le[i])])
+    # output_dict['left'] = left
+
+    # rs = np.array(df['right_start'])
+    # re = np.array(df['right_end'])
+
+    # right = []
+    # for i in range(len(rs)):
+    #     if(not np.isnan(rs[i])):
+    #         right.append([int(rs[i]),int(re[i])])
+    # output_dict['right'] = right
+
+    # ns = np.array(df['none_start'])
+    # ne = np.array(df['none_end'])
+
+    # none = []
+    # for i in range(len(ns)):
+    #     if(not np.isnan(ns[i])):
+    #         none.append([int(ns[i]),int(ne[i])])
+    # output_dict['none'] = none
+    # return output_dict
     df = pd.read_csv('data/manual_intervals.csv')
     # print(df)
 
@@ -23,8 +55,11 @@ def generate_manual_intervals():
 
     left = []
     for i in range(len(ls)):
-        if(not np.isnan(ls[i])):
-            left.append([int(ls[i]),int(le[i])])
+        try: 
+            splitted = ls[i].split('_')
+            left.append([ls[i],le[i]])
+        except: 
+            continue
     output_dict['left'] = left
 
     rs = np.array(df['right_start'])
@@ -32,8 +67,11 @@ def generate_manual_intervals():
 
     right = []
     for i in range(len(rs)):
-        if(not np.isnan(rs[i])):
-            right.append([int(rs[i]),int(re[i])])
+        try: 
+            splitted = rs[i].split('_')
+            right.append([rs[i],re[i]])
+        except: 
+            continue
     output_dict['right'] = right
 
     ns = np.array(df['none_start'])
@@ -41,8 +79,11 @@ def generate_manual_intervals():
 
     none = []
     for i in range(len(ns)):
-        if(not np.isnan(ns[i])):
-            none.append([int(ns[i]),int(ne[i])])
+        try: 
+            splitted = ns[i].split('_')
+            none.append([ns[i],ne[i]])
+        except: 
+            continue
     output_dict['none'] = none
     return output_dict
 
@@ -82,14 +123,28 @@ im_ranges = generate_manual_intervals()
 
 def class_from_frame(frame_name):
     splitted = frame_name.split('_')
-    num = int(splitted[1].split('.')[0])
+    # input(splitted)
+    # input(im_ranges['left'])
+    num = int(splitted[2].split('.')[0])
     # input(num)
     for inter in im_ranges['left']:
+        # print('in ranges left')
         # input(inter)
-        if(num >= inter[0] and num <= inter[1]): return 'left'
+        # inter: ['vid1_1', 'vid1_420']
+        vid_str = inter[0].split('_')[0]
+        inter_start = int(inter[0].split('_')[1])
+        inter_end = int(inter[1].split('_')[1])
+        if(num >= inter_start and num <= inter_end and splitted[0] == vid_str): return 'left'
     for inter in im_ranges['right']:
         # input(inter)
-        if(num >= inter[0] and num <= inter[1]): return 'right'
+        # print('in ranges left')
+        # input(inter)
+        # inter: ['vid1_1', 'vid1_420']
+        vid_str = inter[0].split('_')[0]
+        inter_start = int(inter[0].split('_')[1])
+        inter_end = int(inter[1].split('_')[1])
+        if(num >= inter_start and num <= inter_end and splitted[0] == vid_str): return 'right'
+
     return 'none'
 
 frames_path = 'data/temp'
@@ -108,7 +163,7 @@ r_embeddings = []
 n_embeddings = []
 
 l_fids = []
-r_fids = []
+r_fids = [] 
 n_fids = []
 
 aux = []
