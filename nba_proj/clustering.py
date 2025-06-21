@@ -21,7 +21,7 @@ from tensorflow.keras.layers import TimeDistributed
 from tensorflow.keras.layers import Bidirectional
 from tensorflow.keras.layers import Dropout
 from tensorflow.keras.backend import sigmoid
-
+from sklearn.utils.class_weight import compute_class_weight
 
 left_data = np.load('data/embeddings/left_embeddings.npz')
 right_data = np.load('data/embeddings/right_embeddings.npz')
@@ -98,6 +98,18 @@ X_test = np.array(splitted[1])
 y_train = np.array(splitted[2])
 y_test = np.array(splitted[3])
 
+# input(np.unique(y_train,return_counts = True))
+
+# class_weights = compute_class_weight(
+#     class_weight = 'balanced',
+#     classes = np.unique(y_train),
+#     y = y_train
+# )
+
+# class_weight_dict = dict(enumerate(class_weights))
+# input(class_weight_dict)
+
+class_weight_dict = {0:1.2, 1:0.85, 2:1.95}
 acc_y_train = []
 acc_y_test = []
 
@@ -117,6 +129,7 @@ y_test = np.array(acc_y_test)
 # input(X_train.shape)
 optimizer = tensorflow.keras.optimizers.Adam(0.0001)
 
+# need more none frames
 model = Sequential()
 
 # model.add(Input(shape=(768,)))
@@ -126,7 +139,12 @@ model.add(Dense(3,activation='softmax'))
 
 # input(y_train.shape)
 model.compile(optimizer = optimizer, loss='categorical_crossentropy', metrics=['mse','mae','acc'])
-history = model.fit(X_train, y_train, epochs=25, verbose=1, validation_data = (X_test, y_test))
+history = model.fit(X_train, 
+                    y_train, 
+                    epochs=25, 
+                    verbose=1, 
+                    validation_data = (X_test, y_test), 
+                    class_weight = class_weight_dict)
 
 model.save("side_nn.keras")
 # model.save_weights("side_nn.weights.h5")
