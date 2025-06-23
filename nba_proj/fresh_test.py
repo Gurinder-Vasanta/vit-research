@@ -55,9 +55,20 @@ model = vit.VisionTransformer(
 
 model.load_weights('vit_random_weights.h5')
 
+def comparator(fname):
+    splitted = fname.split('_')
+    vid_num = int(splitted[0][3::])
+    frame_num = int(splitted[2].split('.')[0])
+    return (vid_num, frame_num)
+
+test_ims = sorted(test_ims, key = comparator)
+# input(np.array(test_ims))
 for fname in test_ims:
     # fname = 'frame_' + str(i) + '.jpg'
     print(fname)
+    temp_split = fname.split('_')
+    if(temp_split[0] == 'vid1'): continue
+    # if(int(temp_split[2].split('.')[0]) < 8530): continue
     full_path = os.path.join(images_folder,fname)
     im = cv2.imread(full_path)
     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
@@ -68,13 +79,13 @@ for fname in test_ims:
 
     aux = []
     aux.append(temp_frame)
-    print(np.array(aux).shape)
+    # print(np.array(aux).shape)
     output = model.predict(np.array(aux), batch_size = 32, verbose=1)
 
 
     cur_embedding = output['pre_logits']
     cur_embedding = cur_embedding.reshape(1,768)
-    print(cur_embedding.shape)
+    # print(cur_embedding.shape)
     side = clustering.predict(cur_embedding)
     # confidences = clustering.decision_function(cur_embedding)
     print(side)
