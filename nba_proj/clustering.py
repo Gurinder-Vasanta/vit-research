@@ -141,7 +141,7 @@ model.add(Dense(3,activation='softmax'))
 model.compile(optimizer = optimizer, loss='categorical_crossentropy', metrics=['mse','mae','acc'])
 history = model.fit(X_train, 
                     y_train, 
-                    epochs=25, 
+                    epochs=35, 
                     verbose=1, 
                     validation_data = (X_test, y_test), 
                     class_weight = class_weight_dict)
