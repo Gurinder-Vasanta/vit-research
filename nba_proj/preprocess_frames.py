@@ -38,7 +38,7 @@ layers = tf_keras.layers
 inputparameters = {}
 outputparameters = {}
 
-output_path = 'data/raw_videos/okc_2016.mp4'
+output_path = 'data/raw_videos/heat_2014.mp4'
 # reader = skvideo.io.FFmpegReader(output_path,
 #                                  inputdict=inputparameters,
 #                                  outputdict=outputparameters)
@@ -84,7 +84,7 @@ while True:
     cur_count += 1
     target_size = (hidden_size,432) #504
     # first write all frames to ims so that i can just pull what frames I need after
-    cv2.imwrite(f"data/unseen_test_images/ims/vid2_frame_{global_counter}.jpg", frame)
+    cv2.imwrite(f"data/unseen_test_images/ims/vid3_frame_{global_counter}.jpg", frame)
     # temp_frame = cv2.resize(frame,target_size,interpolation=cv2.INTER_AREA)
     
     # aux.append(temp_frame)
