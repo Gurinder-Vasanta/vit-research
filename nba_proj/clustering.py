@@ -109,7 +109,7 @@ y_test = np.array(splitted[3])
 # class_weight_dict = dict(enumerate(class_weights))
 # input(class_weight_dict)
 
-class_weight_dict = {0:1.2, 1:0.85, 2:1.95}
+class_weight_dict = {0:1.75, 1:1.5, 2:5} # 0:1.2, 1:0.85, 2:1.95
 acc_y_train = []
 acc_y_test = []
 
@@ -127,14 +127,14 @@ y_train = np.array(acc_y_train)
 y_test = np.array(acc_y_test)
 
 # input(X_train.shape)
-optimizer = tensorflow.keras.optimizers.Adam(0.00005)
+optimizer = tensorflow.keras.optimizers.Adam(0.0001) #0.00005
 
 # need more none frames
 model = Sequential()
 
 # model.add(Input(shape=(768,)))
-model.add((Dense(512,activation='relu')))
-model.add(Dense(128,activation='relu'))
+model.add((Dense(512,activation='relu'))) #512
+model.add(Dense(128,activation='relu')) #128
 model.add(Dense(3,activation='softmax'))
 
 # input(y_train.shape)
@@ -143,8 +143,9 @@ history = model.fit(X_train,
                     y_train, 
                     epochs=25, 
                     verbose=1, 
-                    validation_data = (X_test, y_test), 
-                    class_weight = class_weight_dict)
+                    class_weight = class_weight_dict,
+                    validation_data = (X_test, y_test) 
+                    )
 
 model.save("side_nn.keras")
 # model.save_weights("side_nn.weights.h5")
