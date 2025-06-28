@@ -127,13 +127,13 @@ y_train = np.array(acc_y_train)
 y_test = np.array(acc_y_test)
 
 # input(X_train.shape)
-optimizer = tensorflow.keras.optimizers.Adam(0.0001)
+optimizer = tensorflow.keras.optimizers.Adam(0.00005)
 
 # need more none frames
 model = Sequential()
 
 # model.add(Input(shape=(768,)))
-model.add((Dense(250,activation='relu')))
+model.add((Dense(512,activation='relu')))
 model.add(Dense(128,activation='relu'))
 model.add(Dense(3,activation='softmax'))
 
@@ -141,7 +141,7 @@ model.add(Dense(3,activation='softmax'))
 model.compile(optimizer = optimizer, loss='categorical_crossentropy', metrics=['mse','mae','acc'])
 history = model.fit(X_train, 
                     y_train, 
-                    epochs=35, 
+                    epochs=25, 
                     verbose=1, 
                     validation_data = (X_test, y_test), 
                     class_weight = class_weight_dict)
