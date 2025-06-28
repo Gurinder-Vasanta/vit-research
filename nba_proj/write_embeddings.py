@@ -57,6 +57,7 @@ def generate_manual_intervals():
     for i in range(len(ls)):
         try: 
             splitted = ls[i].split('_')
+            if(splitted[0] == 'vid1'): continue # temporarily skip vid1 (vid1 is not a full game)
             left.append([ls[i],le[i]])
         except: 
             continue
@@ -69,6 +70,7 @@ def generate_manual_intervals():
     for i in range(len(rs)):
         try: 
             splitted = rs[i].split('_')
+            if(splitted[0] == 'vid1'): continue # temporarily skip vid1 (vid1 is not a full game)
             right.append([rs[i],re[i]])
         except: 
             continue
@@ -81,6 +83,7 @@ def generate_manual_intervals():
     for i in range(len(ns)):
         try: 
             splitted = ns[i].split('_')
+            if(splitted[0] == 'vid1'): continue # temporarily skip vid1 (vid1 is not a full game)
             none.append([ns[i],ne[i]])
         except: 
             continue
@@ -127,6 +130,7 @@ def class_from_frame(frame_name):
     # input(im_ranges['left'])
     num = int(splitted[2].split('.')[0])
     # input(num)
+    if(splitted[0] == 'vid3' and num <= 4900 and num >= 1): return 'ignore' # limit the number of none frames
     for inter in im_ranges['left']:
         # print('in ranges left')
         # input(inter)
@@ -144,7 +148,7 @@ def class_from_frame(frame_name):
         inter_start = int(inter[0].split('_')[1])
         inter_end = int(inter[1].split('_')[1])
         if(num >= inter_start and num <= inter_end and splitted[0] == vid_str): return 'right'
-
+    # input(frame_name)
     return 'none'
 
 frames_path = 'data/temp'
@@ -155,7 +159,7 @@ none_path = 'data/none'
 all_frames = os.listdir(frames_path)
 
 total_count = 0
-batch_cap = 32
+batch_cap = 1024 # was 32
 cur_count = 0
 embeddings = []
 l_embeddings = []
@@ -171,13 +175,14 @@ aux_frame_ids = []
 frame_ids = []
 
 for f_name in all_frames: 
+    # if(f_name.split('_')[0] == 'vid1'): continue
     f_path = os.path.join(frames_path,f_name)
     im = cv2.imread(f_path)
     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
 
     if(cur_count == batch_cap):
         aux = np.array(aux)
-        output = model.predict(aux, batch_size = 32, verbose=1)
+        output = model.predict(aux, batch_size = 1024, verbose=1) # batch_size was 32
 
         temp = np.array(output['pre_logits'])
         temp = temp.reshape(batch_cap,1,hidden_size)
@@ -187,6 +192,7 @@ for f_name in all_frames:
             # input(aux_frame_ids)
             f_class = class_from_frame(aux_frame_ids[i])
 
+            if(f_class == 'ignore'): continue
             f_path = os.path.join(frames_path,aux_frame_ids[i])
             im = cv2.imread(f_path)
             im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
