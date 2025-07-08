@@ -89,7 +89,19 @@ model = vit.VisionTransformer(
 
 im_ranges = generate_manual_intervals()
 
-input(im_ranges)
+get_max_vid = lambda inter: int(inter[len(inter)-1][1].split('_')[0].split('vid')[1])
+
+get_vid_num = lambda frm: int(frm.split('_')[2].split('.')[0])
+
+max_vid = max(get_max_vid(list(im_ranges.values())[0]),
+              get_max_vid(list(im_ranges.values())[1]),
+              get_max_vid(list(im_ranges.values())[2]))
+input(max_vid)
+# input(im_ranges)
+# input(list(im_ranges.values())[0])
+# input(list(im_ranges.values())[1])
+# input(list(im_ranges.values())[2])
+
 def class_from_frame(frame_name):
     splitted = frame_name.split('_')
     # input(splitted)
