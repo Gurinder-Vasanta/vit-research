@@ -91,16 +91,18 @@ im_ranges = generate_manual_intervals()
 
 get_max_vid = lambda inter: int(inter[len(inter)-1][1].split('_')[0].split('vid')[1])
 
-get_vid_num = lambda frm: int(frm.split('_')[2].split('.')[0])
+get_frame_num = lambda frm: int(frm.split('_')[2].split('.')[0])
 
+get_vid_num = lambda frm: int(frm.split('_')[0].split('vid')[1])
 max_vid = max(get_max_vid(list(im_ranges.values())[0]),
               get_max_vid(list(im_ranges.values())[1]),
               get_max_vid(list(im_ranges.values())[2]))
-input(max_vid)
+# input(max_vid)
 # input(im_ranges)
 # input(list(im_ranges.values())[0])
 # input(list(im_ranges.values())[1])
 # input(list(im_ranges.values())[2])
+
 
 def class_from_frame(frame_name):
     splitted = frame_name.split('_')
@@ -135,6 +137,8 @@ right_path = 'data/right'
 none_path = 'data/none'
 
 all_frames = os.listdir(frames_path)
+all_frames = sorted(all_frames, key = lambda frm: int(frm.split('_')[0].split('vid')[1]))
+# input(all_frames)
 
 total_count = 0
 batch_cap = 1024 # was 32
@@ -152,59 +156,226 @@ aux = []
 aux_frame_ids = []
 frame_ids = []
 
+vid_to_frames_dict = {}
 for f_name in all_frames: 
-    f_path = os.path.join(frames_path,f_name)
-    im = cv2.imread(f_path)
-    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-
-    if(cur_count == batch_cap):
-        aux = np.array(aux)
-        output = model.predict(aux, batch_size = 1024, verbose=1) # batch_size was 32
-
-        temp = np.array(output['pre_logits'])
-        temp = temp.reshape(batch_cap,1,hidden_size)
-
-        for i in range(len(temp)):
-            f_class = class_from_frame(aux_frame_ids[i])
-
-            if(f_class == 'ignore'): continue
-            f_path = os.path.join(frames_path,aux_frame_ids[i])
-            im = cv2.imread(f_path)
-            im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-
-            if(f_class == 'left'):
-                l_embeddings.append(temp[i])
-                l_fids.append(aux_frame_ids[i])
-                cv2.imwrite(f"{left_path}/left_{aux_frame_ids[i]}", im)
-            elif(f_class == 'right'):
-                r_embeddings.append(temp[i])
-                r_fids.append(aux_frame_ids[i])
-                cv2.imwrite(f"{right_path}/right_{aux_frame_ids[i]}", im)
-            elif(f_class == 'none'):
-                n_embeddings.append(temp[i])
-                n_fids.append(aux_frame_ids[i])
-                cv2.imwrite(f"{none_path}/none_{aux_frame_ids[i]}", im)
-
-        aux = []
-        aux_frame_ids = []
-        cur_count = 0
-    
+    vid_category = f_name.split('_')[0]
+    if(vid_category not in vid_to_frames_dict.keys()):
+        vid_to_frames_dict[vid_category] = [f_name]
     else:
-        cur_count += 1
-        target_size = (hidden_size,432)
-        temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
-        aux.append(temp_frame)
-        aux_frame_ids.append(f_name)
+        vid_to_frames_dict[vid_category].append(f_name)
 
-print(np.array(l_embeddings).shape)
-print(np.array(r_embeddings).shape)
-print(np.array(n_embeddings).shape)
-print(np.array(l_fids).shape)
-print(np.array(r_fids).shape)
-print(np.array(n_fids).shape)
+for vid in vid_to_frames_dict.keys():
+    for f_name in vid_to_frames_dict[vid]: 
+        f_path = os.path.join(frames_path, f_name)
+        im = cv2.imread(f_path)
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
 
-np.savez('data/embeddings/left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
-np.savez('data/embeddings/right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
-np.savez('data/embeddings/none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
+        if(cur_count == batch_cap):
+            aux = np.array(aux)
+            output = model.predict(aux, batch_size = 1024, verbose=1)
+
+            temp = np.array(output['pre_logits'])
+            temp = temp.reshape(batch_cap,1,hidden_size)
+
+            for i in range(len(temp)):
+                # input(aux_frame_ids[i])
+                # input(aux_frame_ids)
+                f_class = class_from_frame(aux_frame_ids[i])
+
+                if(f_class == 'ignore'): continue
+                f_path = os.path.join(frames_path,aux_frame_ids[i])
+                im = cv2.imread(f_path)
+                im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+                if(f_class == 'left'):
+                    l_embeddings.append(temp[i])
+                    l_fids.append(aux_frame_ids[i])
+                    cv2.imwrite(f"{left_path}/left_{aux_frame_ids[i]}", im)
+                elif(f_class == 'right'):
+                    r_embeddings.append(temp[i])
+                    r_fids.append(aux_frame_ids[i])
+                    cv2.imwrite(f"{right_path}/right_{aux_frame_ids[i]}", im)
+                elif(f_class == 'none'):
+                    n_embeddings.append(temp[i])
+                    n_fids.append(aux_frame_ids[i])
+                    cv2.imwrite(f"{none_path}/none_{aux_frame_ids[i]}", im)
+
+            aux = []
+            aux_frame_ids = []
+            cur_count = 0
+
+        else:
+            cur_count += 1
+            target_size = (hidden_size,432)
+            temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
+            aux.append(temp_frame)
+            aux_frame_ids.append(f_name)
+
+    np.savez(f'data/embeddings/{vid}_left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
+    np.savez(f'data/embeddings/{vid}_right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
+    np.savez(f'data/embeddings/{vid}_none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
+
+    total_count = 0
+    batch_cap = 1024 # was 32
+    cur_count = 0
+    embeddings = []
+    l_embeddings = []
+    r_embeddings = []
+    n_embeddings = []
+
+    l_fids = []
+    r_fids = [] 
+    n_fids = []
+
+    aux = []
+    aux_frame_ids = []
+    frame_ids = []
+
+
+# for f_name in all_frames: 
+#     # if(f_name.split('_')[0] == 'vid1'): continue
+#     f_path = os.path.join(frames_path,f_name)
+#     im = cv2.imread(f_path)
+#     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+#     if(cur_count == batch_cap):
+#         aux = np.array(aux)
+#         output = model.predict(aux, batch_size = 1024, verbose=1) # batch_size was 32
+
+#         temp = np.array(output['pre_logits'])
+#         temp = temp.reshape(batch_cap,1,hidden_size)
+
+#         for i in range(len(temp)):
+#             # input(aux_frame_ids[i])
+#             # input(aux_frame_ids)
+#             f_class = class_from_frame(aux_frame_ids[i])
+
+#             if(f_class == 'ignore'): continue
+#             f_path = os.path.join(frames_path,aux_frame_ids[i])
+#             im = cv2.imread(f_path)
+#             im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+#             if(f_class == 'left'):
+#                 l_embeddings.append(temp[i])
+#                 l_fids.append(aux_frame_ids[i])
+#                 cv2.imwrite(f"{left_path}/left_{aux_frame_ids[i]}", im)
+#             elif(f_class == 'right'):
+#                 r_embeddings.append(temp[i])
+#                 r_fids.append(aux_frame_ids[i])
+#                 cv2.imwrite(f"{right_path}/right_{aux_frame_ids[i]}", im)
+#             elif(f_class == 'none'):
+#                 n_embeddings.append(temp[i])
+#                 n_fids.append(aux_frame_ids[i])
+#                 cv2.imwrite(f"{none_path}/none_{aux_frame_ids[i]}", im)
+
+#         # for embd in temp:
+#         #     f_class = class_from_frame()
+#         #     embeddings.append(embd)
+        
+#         # frame_ids = np.append(np.array(frame_ids),np.array(aux_frame_ids))
+
+#         aux = []
+#         aux_frame_ids = []
+#         cur_count = 0
+    
+#     else:
+#         cur_count += 1
+#         target_size = (hidden_size,432)
+#         temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
+#         aux.append(temp_frame)
+#         aux_frame_ids.append(f_name)
+# for vid_num in range(1,max_vid+1):
+#     for f_name in all_frames: 
+#         f_path = os.path.join(frames_path, f_name)
+#         im = cv2.imread(f_path)
+#         im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+# cur_vid_num = 1
+
+# all_frames=['vid1_frame_1996.jpg','vid2_frame_553.jpg','vid3_frame_3200.jpg','vid4_frame_3974.jpg']
+# for f_name in all_frames: 
+#     input(f_name)
+#     # input(f_name)
+#     # input(f_name.split('_')[0].split('vid'))
+#     vid_num = get_vid_num(f_name)
+#     if(vid_num > cur_vid_num):
+#         print(f'vid{cur_vid_num} info')
+#         print(np.array(l_embeddings).shape)
+#         print(np.array(r_embeddings).shape)
+#         print(np.array(n_embeddings).shape)
+#         print(np.array(l_fids).shape)
+#         print(np.array(r_fids).shape)
+#         print(np.array(n_fids).shape)
+
+#         np.savez(f'data/embeddings/vid{cur_vid_num}_left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
+#         np.savez(f'data/embeddings/vid{cur_vid_num}_right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
+#         np.savez(f'data/embeddings/vid{cur_vid_num}_none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
+#         cur_vid_num = vid_num
+
+#         total_count = 0
+#         batch_cap = 1024 # was 32
+#         cur_count = 0
+#         embeddings = []
+#         l_embeddings = []
+#         r_embeddings = []
+#         n_embeddings = []
+
+#         l_fids = []
+#         r_fids = [] 
+#         n_fids = []
+
+#         aux = []
+#         aux_frame_ids = []
+#         frame_ids = []
+#     # input(vid_num)
+#     print('hello??')
+#     f_path = os.path.join(frames_path,f_name)
+#     im = cv2.imread(f_path)
+#     im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+#     if(cur_count == batch_cap):
+#         aux = np.array(aux)
+#         output = model.predict(aux, batch_size = 1024, verbose=1) # batch_size was 32
+
+#         temp = np.array(output['pre_logits'])
+#         temp = temp.reshape(batch_cap,1,hidden_size)
+
+#         for i in range(len(temp)):
+#             f_class = class_from_frame(aux_frame_ids[i])
+
+#             if(f_class == 'ignore'): continue
+#             f_path = os.path.join(frames_path,aux_frame_ids[i])
+#             im = cv2.imread(f_path)
+#             im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+#             if(f_class == 'left'):
+#                 l_embeddings.append(temp[i])
+#                 l_fids.append(aux_frame_ids[i])
+#                 cv2.imwrite(f"{left_path}/left_{aux_frame_ids[i]}", im)
+#             elif(f_class == 'right'):
+#                 r_embeddings.append(temp[i])
+#                 r_fids.append(aux_frame_ids[i])
+#                 cv2.imwrite(f"{right_path}/right_{aux_frame_ids[i]}", im)
+#             elif(f_class == 'none'):
+#                 n_embeddings.append(temp[i])
+#                 n_fids.append(aux_frame_ids[i])
+#                 cv2.imwrite(f"{none_path}/none_{aux_frame_ids[i]}", im)
+
+#         aux = []
+#         aux_frame_ids = []
+#         cur_count = 0
+    
+#     else:
+#         cur_count += 1
+#         target_size = (hidden_size,432)
+#         temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
+#         aux.append(temp_frame)
+#         aux_frame_ids.append(f_name)
+
+
+
+# np.savez('data/embeddings/left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
+# np.savez('data/embeddings/right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
+# np.savez('data/embeddings/none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
 model.save_weights('vit_random_weights.h5')
 
