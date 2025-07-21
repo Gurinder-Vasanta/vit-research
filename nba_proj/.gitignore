@@ -5,3 +5,5 @@ share/
 pyvenv.cfg
 data/
 test_images/
+cache/
+mongo_data/
