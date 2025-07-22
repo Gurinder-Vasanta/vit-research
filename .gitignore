@@ -1,0 +1,10 @@
+bin/
+lib/
+lib64/
+share/
+pyvenv.cfg
+data/
+test_images/
+cache/
+mongo_data/
+mongodb/
