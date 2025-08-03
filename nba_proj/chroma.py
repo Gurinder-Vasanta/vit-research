@@ -17,10 +17,21 @@ from tensorflow.keras.models import load_model
 import tensorflow as tf, tf_keras
 import cv2
 import numpy as np
-import os
 from joblib import load
 
-top_n_closest = 20
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1" #need to use this everywhere to select gpu 1
+
+# also, the ones without probabilities are ones that are written from the manual intervals
+
+top_n_closest = 25
+def softmax(x):
+    exp_x = np.exp(x - np.max(x))  # subtract max for numerical stability
+    return exp_x / exp_x.sum()
+
+def temp_smax(x, temperature=1.0):
+    x = np.array(x, dtype=np.float64)
+    return softmax(x / temperature)
 
 def determine_class_pass1(ids, metadatas, distances):
     # some of them are pretty unconfident and wrong
@@ -47,16 +58,17 @@ def determine_class_pass1(ids, metadatas, distances):
     print(num_none)
 
     nums = [num_left, num_right, num_none]
-    if(max(nums)>=17):
+    # input(temp_smax(nums,8.0))
+    if(max(nums)>=20): #20/25; want to use an odd number to avoid ties
         a = np.array(nums).argmax()
         if(a == 0):
-            return 'left'
+            return {'dir':'left','probs':temp_smax(nums,7.0)}
         elif(a == 1):
-            return 'right'
+            return {'dir':'right','probs':temp_smax(nums,7.0)}
         else:
-            return 'none'
+            return {'dir':'none','probs':temp_smax(nums,7.0)}
     else:
-        return 'pass2'
+        return {'dir':'pass2'}
     # calcd_distances = []
     # calcd_left = []
     # calcd_right = []
@@ -115,11 +127,11 @@ def determine_class_pass2(ids, metadatas, distances):
     
     a = np.array(nums).argmax()
     if(a == 0):
-        return 'left'
+        return {'dir':'left','probs':temp_smax(nums,7.0)}
     elif(a == 1):
-        return 'right'
+        return {'dir':'right','probs':temp_smax(nums,7.0)}
     else:
-        return 'none'
+        return {'dir':'none','probs':temp_smax(nums,7.0)}
 
     
 
@@ -207,25 +219,37 @@ for image in frames:
     
     pass1_class = determine_class_pass1(results['ids'][0],results['metadatas'][0],results['distances'][0])
 
-    if(pass1_class == 'left'):
+    if(pass1_class['dir'] == 'left'):
         # predicted_lefts.append(embd[0][0][0])
         # predicted_l_ids.append(image)
         temp.append(embd[0][0][0])
         cur_fnames.append(image)
-        directions.append({'label':'left','video':vid})
-    elif(pass1_class == 'right'):
+        directions.append({'label':'left',
+                            'video':vid,
+                            'left_prob':pass1_class['probs'][0],
+                            'right_prob':pass1_class['probs'][1],
+                            'none_prob':pass1_class['probs'][2]})
+    elif(pass1_class['dir'] == 'right'):
         # predicted_rights.append(embd[0][0][0])
         # predicted_r_ids.append(image)
         temp.append(embd[0][0][0])
         cur_fnames.append(image)
-        directions.append({'label':'right','video':vid})
-    elif(pass1_class == 'none'):
+        directions.append({'label':'right',
+                            'video':vid,
+                            'left_prob':pass1_class['probs'][0],
+                            'right_prob':pass1_class['probs'][1],
+                            'none_prob':pass1_class['probs'][2]})
+    elif(pass1_class['dir'] == 'none'):
         # predicted_nones.append(embd[0][0][0])
         # predicted_n_ids.append(image)
         temp.append(embd[0][0][0])
         cur_fnames.append(image)
-        directions.append({'label':'none','video':vid})
-    elif(pass1_class == 'pass2'):
+        directions.append({'label':'none',
+                            'video':vid,
+                            'left_prob':pass1_class['probs'][0],
+                            'right_prob':pass1_class['probs'][1],
+                            'none_prob':pass1_class['probs'][2]})
+    elif(pass1_class['dir'] == 'pass2'):
         pass2s.append(embd[0][0][0])
         pass2_ids.append(image)
 print(len(pass2s))
@@ -247,24 +271,36 @@ for i in range(len(pass2s)):
         n_results = top_n_closest
     )
     pass2_class = determine_class_pass2(results['ids'][0],results['metadatas'][0],results['distances'][0])
-    if(pass2_class == 'left'):
+    if(pass2_class['dir'] == 'left'):
         # predicted_lefts.append(embd[0][0][0])
         # predicted_l_ids.append(image)
         # temp.append(embd)
         cur_fnames.append(pass2_ids[i])
-        directions.append({'label':'left','video':vid})
-    elif(pass2_class == 'right'):
+        directions.append({'label':'left',
+                            'video':vid,
+                            'left_prob':pass2_class['probs'][0],
+                            'right_prob':pass2_class['probs'][1],
+                            'none_prob':pass2_class['probs'][2]})
+    elif(pass2_class['dir'] == 'right'):
         # predicted_rights.append(embd[0][0][0])
         # predicted_r_ids.append(image)
         # temp.append(embd)
         cur_fnames.append(pass2_ids[i])
-        directions.append({'label':'right','video':vid})
-    elif(pass2_class == 'none'):
+        directions.append({'label':'right',
+                            'video':vid,
+                            'left_prob':pass2_class['probs'][0],
+                            'right_prob':pass2_class['probs'][1],
+                            'none_prob':pass2_class['probs'][2]})
+    elif(pass2_class['dir'] == 'none'):
         # predicted_nones.append(embd[0][0][0])
         # predicted_n_ids.append(image)
         # temp.append(embd)
         cur_fnames.append(pass2_ids[i])
-        directions.append({'label':'none','video':vid})
+        directions.append({'label':'none',
+                            'video':vid,
+                            'left_prob':pass2_class['probs'][0],
+                            'right_prob':pass2_class['probs'][1],
+                            'none_prob':pass2_class['probs'][2]})
 
 embeddings.upsert(
             embeddings=pass2s,
