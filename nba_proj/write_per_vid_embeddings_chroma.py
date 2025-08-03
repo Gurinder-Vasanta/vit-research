@@ -12,7 +12,9 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import normalize
+
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 def generate_manual_intervals():
     df = pd.read_csv('data/manual_intervals.csv')
@@ -77,6 +79,7 @@ model = vit.VisionTransformer(
     mlp_dim=3072 #3072  3584
 )
 
+model.load_weights('vit_random_weights.h5')
 # these are labelled frames (put the manually labelled ones in the temp folder)
 # 1-420 is left
 # 421 to 458 is none
@@ -152,11 +155,13 @@ l_embeddings = []
 r_embeddings = []
 n_embeddings = []
 
+vid = 'vid3'
+
 # left_collection = chroma_client.get_or_create_collection(name="left_collection",metadata={"hnsw:space": "l2"})
 # right_collection = chroma_client.get_or_create_collection(name="right_collection",metadata={"hnsw:space": "l2"})
 # none_collection = chroma_client.get_or_create_collection(name="none_collection",metadata={"hnsw:space": "l2"})
 
-embeddings = chroma_client.get_or_create_collection(name='embeddings',metadata={'hnsw:space': 'l2'})
+embeddings = chroma_client.get_or_create_collection(name=f'{vid}_embeddings',metadata={'hnsw:space': 'l2'})
 
 
 l_fids = []
@@ -180,7 +185,7 @@ for f_name in all_frames:
 # del(vid_to_frames_dict['vid3'])
 # del(vid_to_frames_dict['vid4'])
 
-vid = 'vid2'
+
 # input(vid_to_frames_dict.keys())
 
 directions = []
@@ -205,7 +210,7 @@ for fname in vid_to_frames_dict[vid]:
         print(temp)
 
         print(temp.shape)
-        embeddings.add(
+        embeddings.upsert(
             embeddings=temp,
             ids=cur_fnames,
             metadatas = directions
@@ -224,7 +229,24 @@ for fname in vid_to_frames_dict[vid]:
         im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
         temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
         aux.append(temp_frame)
-        directions.append({'label':frame_class})
+        if(frame_class == 'left'):
+            directions.append({'label':frame_class,
+                                'video':vid,
+                                'left_prob':1.0,
+                                'right_prob':0.0,
+                                'none_prob':0.0})
+        elif(frame_class == 'right'):
+            directions.append({'label':frame_class,
+                                'video':vid,
+                                'left_prob':0.0,
+                                'right_prob':1.0,
+                                'none_prob':0.0})
+        elif(frame_class == 'none'):
+            directions.append({'label':frame_class,
+                                'video':vid,
+                                'left_prob':0.0,
+                                'right_prob':0.0,
+                                'none_prob':1.0})
 
 if(len(aux) > 0):
     aux = np.array(aux)
@@ -420,5 +442,5 @@ if(len(aux) > 0):
 # np.savez('data/embeddings/left_embeddings.npz',embeddings=l_embeddings,frame_ids=l_fids)
 # np.savez('data/embeddings/right_embeddings.npz',embeddings=r_embeddings,frame_ids=r_fids)
 # np.savez('data/embeddings/none_embeddings.npz',embeddings=n_embeddings,frame_ids=n_fids)
-model.save_weights('vit_random_weights.h5')
+# model.save_weights('vit_random_weights.h5')
 
