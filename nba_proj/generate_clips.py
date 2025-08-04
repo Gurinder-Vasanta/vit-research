@@ -18,6 +18,7 @@ import tensorflow as tf, tf_keras
 import cv2
 import numpy as np
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from joblib import load
 
 cur_vid = 'vid2'
@@ -43,7 +44,7 @@ model = vit.VisionTransformer(
     hidden_size=hidden_size,
     mlp_dim=3072 #3072  3584
 )
-top_n_closest = 20
+top_n_closest = 25
 model.load_weights('vit_random_weights.h5')
 
 def comparator(fname):
@@ -60,7 +61,7 @@ def determine_class(ids, metadatas, distances):
     #     if 80% (arbitrarily decided) or more agree, then thats the class and add the embeddng to the chromadb
     #     if its not 80%, then do the weighted distances thing
     # second pass does the same thing as the first pass, but just with more embeddings in the chromadb
-
+    
     num_results = len(ids)
     num_left = 0
     num_right = 0
@@ -78,6 +79,21 @@ def determine_class(ids, metadatas, distances):
 
     nums = [num_left, num_right, num_none]
     a = np.array(nums).argmax()
+
+    print('inside determine class')
+    # input(metadatas)
+
+    probs = {'left_sides':[],'right_sides':[],'none_sides':[]}
+    for prob in metadatas: 
+        probs['left_sides'].append(prob['left_prob'])
+        probs['right_sides'].append(prob['right_prob'])
+        probs['none_sides'].append(prob['none_prob'])
+    print(f'left prob: {np.mean(np.array(probs["left_sides"]))}') 
+    print(f'right prob: {np.mean(np.array(probs["right_sides"]))}')
+    print(f'none prob: {np.mean(np.array(probs["none_sides"]))}')
+    # an average of 0.80 or better can prolly just be written back to the db
+    # it looks like perfects have at least a 0.85 average probability, but the lowest perfect i saw was 0.83
+    input(probs)
     if(a == 0):
         return 'left'
     elif(a == 1):
@@ -137,7 +153,7 @@ for fname in test_ims:
     for k in results.keys(): 
         print(f'{k}: {results[k]}')
         print()
-    
+    input('stop')
     side = determine_class(results['ids'][0],results['metadatas'][0],results['distances'][0])
 
     if(side == 'left'):
