@@ -77,8 +77,8 @@ def determine_class(ids, metadatas, distances):
     print(num_right)
     print(num_none)
 
-    nums = [num_left, num_right, num_none]
-    a = np.array(nums).argmax()
+    # nums = [num_left, num_right, num_none]
+    # a = np.array(nums).argmax()
 
     print('inside determine class')
     # input(metadatas)
@@ -91,9 +91,17 @@ def determine_class(ids, metadatas, distances):
     print(f'left prob: {np.mean(np.array(probs["left_sides"]))}') 
     print(f'right prob: {np.mean(np.array(probs["right_sides"]))}')
     print(f'none prob: {np.mean(np.array(probs["none_sides"]))}')
+    lmean = np.mean(np.array(probs["left_sides"]))
+    rmean = np.mean(np.array(probs["right_sides"]))
+    nmean = np.mean(np.array(probs["none_sides"]))
     # an average of 0.80 or better can prolly just be written back to the db
     # it looks like perfects have at least a 0.85 average probability, but the lowest perfect i saw was 0.83
-    input(probs)
+    
+    # input(probs)
+
+    nums = [lmean, rmean, nmean]
+    a = np.array(nums).argmax()
+
     if(a == 0):
         return 'left'
     elif(a == 1):
@@ -114,6 +122,17 @@ embeddings = client.get_or_create_collection(name=f"{cur_vid}_embeddings",metada
 # current_side_info = {'side': 0,'count':0}
 
 classes_confidences = {}
+
+# this sliding window array would lets us know when a switch happened
+# so it would be 30 frames long 
+# so theoretically, if there were like 30 lefts, and then like 10 nones started to appear, 
+# then we know that the clip ends there 
+# so that means you need to track where the start is in a different variable prolly
+# for reference, I would just be using the name of the frame itself
+
+sliding_window = []
+starting_frame = ''
+ending_frame = ''
 # input(np.array(test_ims))
 for fname in test_ims:
     # fname = 'frame_' + str(i) + '.jpg'
@@ -153,7 +172,7 @@ for fname in test_ims:
     for k in results.keys(): 
         print(f'{k}: {results[k]}')
         print()
-    input('stop')
+    # input('stop')
     side = determine_class(results['ids'][0],results['metadatas'][0],results['distances'][0])
 
     if(side == 'left'):
@@ -163,6 +182,10 @@ for fname in test_ims:
     elif(side == 'none'):
         cv2.imwrite(f"{none_path}/none_{fname}", im)
 
+    # if(len(sliding_window)<30):
+    #     sliding_window.append(side)
+    # else: 
+    #     input(sliding_window)
     print(side)
     # print(cur_embedding.shape)
     # side = clustering.predict(cur_embedding)[0]
