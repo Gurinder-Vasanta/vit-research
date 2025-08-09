@@ -18,10 +18,14 @@ import tensorflow as tf, tf_keras
 import cv2
 import numpy as np
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
 from joblib import load
 
 cur_vid = 'vid2'
+
+client = PersistentClient(path="./chroma_store")
+embeddings = client.get_or_create_collection(name=f"{cur_vid}_embeddings",metadata={"hnsw:space": "l2"})
+
 layers = tf_keras.layers
 
 clustering = load_model(f"{cur_vid}_side_nn.keras")
@@ -96,25 +100,59 @@ def determine_class(ids, metadatas, distances):
     nmean = np.mean(np.array(probs["none_sides"]))
     # an average of 0.80 or better can prolly just be written back to the db
     # it looks like perfects have at least a 0.85 average probability, but the lowest perfect i saw was 0.83
+    # but maybe its better to add things with a prob >= .90 because thats pretty much guaranteed correct
     
     # input(probs)
 
     nums = [lmean, rmean, nmean]
     a = np.array(nums).argmax()
 
+# embeddings.upsert(
+#             embeddings=temp,
+#             ids=cur_fnames,
+#             metadatas = directions
+#         )
+
+# temp.append(embd[0][0][0])
+#         cur_fnames.append(image)
+#         directions.append({'label':'left',
+#                             'video':vid,
+#                             'left_prob':pass1_class['probs'][0],
+#                             'right_prob':pass1_class['probs'][1],
+#                             'none_prob':pass1_class['probs'][2]})
+
+
     if(a == 0):
-        return 'left'
+        if(lmean >= 0.85):
+            return ['left',lmean,{'label':'left',
+                    'video':cur_vid,
+                    'left_prob':lmean,
+                    'right_prob':rmean,
+                    'none_prob':nmean}]
+        return ['left',lmean]
     elif(a == 1):
-        return 'right'
+        if(rmean >= 0.85):
+            return ['right',rmean,{'label':'right',
+                    'video':cur_vid,
+                    'left_prob':lmean,
+                    'right_prob':rmean,
+                    'none_prob':nmean}]
+        return ['right',rmean]
     else:
-        return 'none'
+        if(nmean >= 0.85):
+            return ['none',nmean,{'label':'none',
+                    'video':cur_vid,
+                    'left_prob':lmean,
+                    'right_prob':rmean,
+                    'none_prob':nmean}]
+        return ['none',nmean]
     
     
 
 test_ims = sorted(test_ims, key = comparator)
-client = PersistentClient(path="./chroma_store")
 
-embeddings = client.get_or_create_collection(name=f"{cur_vid}_embeddings",metadata={"hnsw:space": "l2"})
+clip_intervals = open('clip_intervals.csv','w')
+clip_intervals.write('start_frame,end_frame\n')
 
 # current_clip = []
 # all_clips = []
@@ -130,9 +168,15 @@ classes_confidences = {}
 # so that means you need to track where the start is in a different variable prolly
 # for reference, I would just be using the name of the frame itself
 
-sliding_window = []
+sliding_window = [] # TODO: should prolly be an actual queue, but this should do for now
 starting_frame = ''
 ending_frame = ''
+
+clips = []
+# variables to keep track of how long the current streak is
+# the confidence needs to be at least 0.7 to count as part of a streak (scratched this, but possibly implement later)
+
+streaks = {'left': 0, 'right': 0, 'none': 0}
 # input(np.array(test_ims))
 for fname in test_ims:
     # fname = 'frame_' + str(i) + '.jpg'
@@ -141,7 +185,7 @@ for fname in test_ims:
     # input(cur_vid != fname.split('_')[0])
     if(cur_vid != fname.split('_')[0]):
         continue
-    if(int(fname.split('_')[2].split('.')[0]) <11000): 
+    if(int(fname.split('_')[2].split('.')[0]) <18060): # was 11000
         continue
     print(fname)
     temp_split = fname.split('_')
@@ -169,18 +213,91 @@ for fname in test_ims:
         n_results = top_n_closest
     )
 
-    for k in results.keys(): 
-        print(f'{k}: {results[k]}')
-        print()
+    # for k in results.keys(): 
+    #     print(f'{k}: {results[k]}')
+    #     print()
     # input('stop')
     side = determine_class(results['ids'][0],results['metadatas'][0],results['distances'][0])
 
-    if(side == 'left'):
+    if(len(sliding_window) == 0):
+        sliding_window.append([side[0],side[1]])
+        streaks[side[0]] = 1
+        starting_frame = fname
+    elif(len(sliding_window)<50 and len(sliding_window) > 0): # 50 is an arbitrary length for the sliding window
+        # it also needs to account for occasional blips, so in case of occassional misclassifications, 
+        # we need to check what the current streak is and if its like 20 or something, its prolly a blip
+        # if previous frame is the same side and the current one is 70% confident
+        # all of these numbers are arbitrary, i just picked them cause they felt right
+        if(sliding_window[-1][0] == side[0]): # incorporate confidence later
+            streaks[side[0]] += 1
+            ending_frame = fname
+        else:
+            streaks[sliding_window[-1][0]] = 0
+            streaks[side[0]] = 1
+            clips.append([starting_frame,ending_frame])
+            clip_intervals.write(f'{starting_frame},{ending_frame}\n')
+            starting_frame = fname
+        
+        sliding_window.append([side[0],side[1]]) # TODO: rewrite this using a side class 
+
+        print('streaks:')
+        print(streaks)
+        # print('sliding window: ')
+        # input(sliding_window)
+        # for now, just use if confidence is over 0.7 for the streak
+        # but later, it looks like the confidences increase like over frames (which is expected), 
+        # so maybe have a substreak of increasing confidences?
+
+    else:
+        print(clips)
+        # print('sliding window maxed at 50: ')
+        # input(sliding_window)
+        sliding_window = sliding_window[1::]
+        if(sliding_window[-1][0] == side[0]): # incorporate confidence later
+            streaks[side[0]] += 1
+            ending_frame = fname
+        else:
+            streaks[sliding_window[-1][0]] = 0
+            streaks[side[0]] = 1
+            clips.append([starting_frame,ending_frame])
+            clip_intervals.write(f'{starting_frame},{ending_frame}\n')
+            starting_frame = fname
+        sliding_window.append([side[0],side[1]])
+
+        print('streaks')
+        # print(len(sliding_window))
+        print(streaks)
+        print(starting_frame)
+        print(ending_frame)
+        # input(len(sliding_window))
+    # side is now an array of either 1 or 2 elements
+    # if it has 2 elements, then it needs to be written to chroma cause its confident enough
+    # if it has 1 element, then its not confident enough
+    # input(side)
+    if(side[0] == 'left'):
         cv2.imwrite(f"{left_path}/left_{fname}", im)
-    elif(side == 'right'):
+        if(len(side) == 3):
+            embeddings.upsert(
+                embeddings = cur_embedding,
+                ids=fname,
+                metadatas = side[2]
+            )
+    elif(side[0] == 'right'):
         cv2.imwrite(f"{right_path}/right_{fname}", im)
-    elif(side == 'none'):
+        if(len(side) == 3):
+            embeddings.upsert(
+                embeddings = cur_embedding,
+                ids=fname,
+                metadatas = side[2]
+            )
+    elif(side[0] == 'none'):
         cv2.imwrite(f"{none_path}/none_{fname}", im)
+        if(len(side) == 3):
+            embeddings.upsert(
+                embeddings = cur_embedding,
+                ids=fname,
+                metadatas = side[2]
+            )
 
     # if(len(sliding_window)<30):
     #     sliding_window.append(side)
