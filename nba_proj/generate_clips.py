@@ -234,9 +234,11 @@ for fname in test_ims:
         else:
             streaks[sliding_window[-1][0]] = 0
             streaks[side[0]] = 1
-            clips.append([starting_frame,ending_frame])
-            clip_intervals.write(f'{starting_frame},{ending_frame}\n')
+            clips.append([starting_frame,fname])
+            clip_intervals.write(f'{starting_frame},{fname}\n')
             starting_frame = fname
+            print('sliding window streak ended')
+            input(sliding_window)
         
         sliding_window.append([side[0],side[1]]) # TODO: rewrite this using a side class 
 
@@ -249,9 +251,7 @@ for fname in test_ims:
         # so maybe have a substreak of increasing confidences?
 
     else:
-        print(clips)
-        # print('sliding window maxed at 50: ')
-        # input(sliding_window)
+        
         sliding_window = sliding_window[1::]
         if(sliding_window[-1][0] == side[0]): # incorporate confidence later
             streaks[side[0]] += 1
@@ -259,16 +259,17 @@ for fname in test_ims:
         else:
             streaks[sliding_window[-1][0]] = 0
             streaks[side[0]] = 1
-            clips.append([starting_frame,ending_frame])
-            clip_intervals.write(f'{starting_frame},{ending_frame}\n')
+            clips.append([starting_frame,fname])
+            clip_intervals.write(f'{starting_frame},{fname}\n')
             starting_frame = fname
+            print('sliding window streak ended')
+            input(sliding_window)
         sliding_window.append([side[0],side[1]])
 
         print('streaks')
         # print(len(sliding_window))
         print(streaks)
         print(starting_frame)
-        print(ending_frame)
         # input(len(sliding_window))
     # side is now an array of either 1 or 2 elements
     # if it has 2 elements, then it needs to be written to chroma cause its confident enough
