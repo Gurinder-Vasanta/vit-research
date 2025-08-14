@@ -57,6 +57,45 @@ def comparator(fname):
     frame_num = int(splitted[2].split('.')[0])
     return (vid_num, frame_num)
 
+def softmax(x):
+    exp_x = np.exp(x - np.max(x))  # subtract max for numerical stability
+    return exp_x / exp_x.sum()
+
+def temp_smax(x, temperature=1.0):
+    x = np.array(x, dtype=np.float64)
+    return softmax(x / temperature)
+
+def calculate_context_probs(left_part, right_part):
+    counts = {'left':0, 'right': 0, 'none': 0}
+    probs = {'left': 0.0, 'right':0.0, 'none':0.0}
+
+    for arr in left_part: 
+        counts[arr[0]] += 1
+        probs[arr[0]] += arr[1]
+    ps = list(probs.values())
+    # ps = [probs['left']/counts['left'] if counts['left'] != 0 else 0.0,
+    #         probs['right']/counts['right'] if counts['right'] != 0 else 0.0,
+    #         probs['none']/counts['none'] if counts['none'] != 0 else 0.0]
+    print(ps)
+    print(counts)
+    final_probs = temp_smax(ps,1.0)
+    print('left side')
+    print(final_probs)
+    counts = {'left':0, 'right': 0, 'none': 0}
+    probs = {'left': 0.0, 'right':0.0, 'none':0.0}
+    for arr in right_part: 
+        counts[arr[0]] += 1
+        probs[arr[0]] += arr[1]
+    ps = list(probs.values())
+    # ps = [probs['left']/counts['left'] if counts['left'] != 0 else 0.0,
+    #         probs['right']/counts['right'] if counts['right'] != 0 else 0.0,
+    #         probs['none']/counts['none'] if counts['none'] != 0 else 0.0]
+
+    final_probs = temp_smax(ps,10.0)
+    print('counts then right side probs')
+    print(counts)
+    print()
+    input(final_probs)
 def determine_class(ids, metadatas, distances):
     # some of them are pretty unconfident and wrong
     # like some of the frames have the lowest distance at like 150
@@ -207,9 +246,10 @@ for fname in test_ims:
         print(sliding_window[int(flagged_indices[0])])
         flagged_indices = flagged_indices[1::]
         print('new context: ')
-        print(sliding_window[-25::])
+        print(sliding_window[-24::])
         print()
         print(len(sliding_window))
+        calculate_context_probs(sliding_window[:25],sliding_window[-24::])
         input(sliding_window[:25])
     temp_split = fname.split('_')
     # if(temp_split[0] == 'vid1'): continue
