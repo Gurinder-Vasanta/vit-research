@@ -18,7 +18,7 @@ import tensorflow as tf, tf_keras
 import cv2
 import numpy as np
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5,6,7"
 from joblib import load
 
 cur_vid = 'vid2'
@@ -172,6 +172,16 @@ sliding_window = [] # TODO: should prolly be an actual queue, but this should do
 starting_frame = ''
 ending_frame = ''
 
+# so we will add indices to this array
+# the indices are flagged because they didnt match the pattern
+# the point of holding these indices is to get full context to make a decision
+# an element will always enter this array as 49 (basically just len(sliding window)-1)
+# every next frame will subtract 1 from each index in this array (because the window is sliding onward)
+# once the first index in the array is 29, that means 20 more frames were processed and that means theres more context
+# if most of the frames on both sides have the same label and a pretty high confidence (>0.85), then the flagged index was wrong
+# then you would need to rewrite the embedding and for the confidence you can just put 1
+flagged_indices = np.array([])
+
 clips = []
 # variables to keep track of how long the current streak is
 # the confidence needs to be at least 0.7 to count as part of a streak (scratched this, but possibly implement later)
@@ -188,6 +198,19 @@ for fname in test_ims:
     if(int(fname.split('_')[2].split('.')[0]) <18060): # was 11000
         continue
     print(fname)
+    
+    if(len(sliding_window) == 50 and len(flagged_indices) > 0 and int(flagged_indices[0]) == len(sliding_window)-25):
+        print('all flagged indices: ')
+        print(flagged_indices)
+        print('flagged index has enough context')
+        print('flagged index: ')
+        print(sliding_window[int(flagged_indices[0])])
+        flagged_indices = flagged_indices[1::]
+        print('new context: ')
+        print(sliding_window[-25::])
+        print()
+        print(len(sliding_window))
+        input(sliding_window[:25])
     temp_split = fname.split('_')
     # if(temp_split[0] == 'vid1'): continue
     # if(int(temp_split[2].split('.')[0]) < 12000): continue
@@ -237,8 +260,8 @@ for fname in test_ims:
             clips.append([starting_frame,fname])
             clip_intervals.write(f'{starting_frame},{fname}\n')
             starting_frame = fname
-            print('sliding window streak ended')
-            input(sliding_window)
+            # print('sliding window streak ended')
+            # input(sliding_window)
         
         sliding_window.append([side[0],side[1]]) # TODO: rewrite this using a side class 
 
@@ -250,7 +273,7 @@ for fname in test_ims:
         # but later, it looks like the confidences increase like over frames (which is expected), 
         # so maybe have a substreak of increasing confidences?
 
-    else:
+    else: # sliding window is fully populated
         
         sliding_window = sliding_window[1::]
         if(sliding_window[-1][0] == side[0]): # incorporate confidence later
@@ -262,8 +285,11 @@ for fname in test_ims:
             clips.append([starting_frame,fname])
             clip_intervals.write(f'{starting_frame},{fname}\n')
             starting_frame = fname
-            print('sliding window streak ended')
-            input(sliding_window)
+            flagged_indices = np.append(flagged_indices,int(len(sliding_window))+1)
+            input(flagged_indices)
+            # print('sliding window streak ended')
+            # print(sliding_window)
+            # input(flagged_indices)
         sliding_window.append([side[0],side[1]])
 
         print('streaks')
@@ -271,6 +297,7 @@ for fname in test_ims:
         print(streaks)
         print(starting_frame)
         # input(len(sliding_window))
+    flagged_indices = flagged_indices - 1
     # side is now an array of either 1 or 2 elements
     # if it has 2 elements, then it needs to be written to chroma cause its confident enough
     # if it has 1 element, then its not confident enough
