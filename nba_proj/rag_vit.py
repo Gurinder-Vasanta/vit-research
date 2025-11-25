@@ -26,7 +26,6 @@ from official.vision.modeling.backbones.vit_specs import VIT_SPECS
 from official.vision.modeling.layers import nn_blocks
 from official.vision.modeling.layers import nn_layers
 
-import retrieve_tokens
 
 layers = tf_keras.layers
 
@@ -141,20 +140,6 @@ class TokenLayer(layers.Layer):
     cls = tf.cast(self.cls, inputs.dtype)
     cls = cls + tf.zeros_like(inputs[:, 0:1])  # A hacky way to tile.
     x = tf.concat([cls, inputs], axis=1)
-
-    # this inputs at initialization is just a placeholder tensor
-    # makes sense that it wont have values at initialization 
-
-    print('token layer')
-    print(x.shape)
-    try:
-      print(inputs.numpy())
-      print(inputs.shape)
-    except: 
-      print('cant numpy this bih')
-      print(inputs)
-    
-    # rag_embeddings = retrieve_tokens.
     return x
 
 
@@ -271,6 +256,77 @@ class Encoder(layers.Layer):
     config.update(updates)
     return config
 
+class RetrievalModule(tf_keras.layers.Layer): 
+  def __init__(self, chroma_obj, top_k = 50, search_k = 100): 
+    super().__init__()
+    self.collection = chroma_obj
+    self.top_k = top_k
+    self.search_k = search_k
+  
+  def call(self, cls_embeddings, metadata): 
+    batch_retrieved = []
+
+    for i in range(cls_embeddings.shape[0]):
+      emb = cls_embeddings[i:i+1].numpy().tolist()
+
+      vid = int(metadata["vid"][i])
+      clip = int(metadata["clip"][i])
+      side = metadata["side"][i].numpy().decode()
+      tnorm = float(metadata["t_norm"][i])
+
+      # Query ChromaDB
+      results = self.collection.query(
+          query_embeddings=emb,
+          n_results=self.search_k,
+          where={
+              "$and": [
+                  {"side": side},
+                  {"t_norm": {"$gte": tnorm - 0.05}},
+                  {"t_norm": {"$lte": tnorm + 0.05}},
+              ]
+          },
+          include=["embeddings","metadatas","distances"]
+      )
+
+      # Filter out same clip
+      retrieved = []
+      for emb_, meta in zip(results["embeddings"][0], results["metadatas"][0]):
+          if meta["clip_num"] != clip:
+              retrieved.append(emb_)
+          if len(retrieved) == self.top_k:
+              break
+
+      # At least one result
+      retrieved = np.array(retrieved, dtype=np.float32)
+      batch_retrieved.append(retrieved)
+
+    # Pad all retrieved to (B, top_k, 768)
+    return tf.convert_to_tensor(batch_retrieved, dtype=tf.float32)
+
+class RAGVisionTransformer(tf_keras.Model):
+  def __init__(self, vit, retrieval_module):
+    super().__init__()
+    self.vit = vit 
+    self.retrieval_module = retrieval_module
+    self.pooler = RetrievalMultiQueryPooler(hidden_size=768, num_queries=4)
+  
+  def call(self, frame, metadata, training=False):
+    endpoints = self.vit(frame, training=training)
+
+    tokens = endpoints['tokens_before_encoder']
+    cls_embeddings = endpoints['pre_logits']
+
+    retrieved_embeddings = self.retrieval_module(cls_embeddings, metadata)
+
+    retrieval_tokens = self.pooler(retrieved_embeddings)
+
+    augmented_tokens = tf.concat([tokens, retrieval_tokens], axis=1)
+
+    encoder_out = self.vit.encoder(augmented_tokens, training=training)
+
+    cls_final = encoder_out[: ,0]
+    return cls_final
+  
 
 class VisionTransformer(tf_keras.Model):
   """Class to build VisionTransformer family model."""
@@ -291,13 +347,11 @@ class VisionTransformer(tf_keras.Model):
       kernel_regularizer=None,
       original_init: bool = True,
       output_encoded_tokens: bool = True,
-      output_2d_feature_maps: bool = True,
+      output_2d_feature_maps: bool = False,
       pos_embed_shape: Optional[Tuple[int, int]] = None,
       layer_scale_init_value: float = 0.0,
       transformer_partition_dims: Optional[Tuple[int, int, int, int]] = None,
-      output_attention_scores: bool = True,
-      use_retrieval: bool = True, 
-      max_retrieval_tokens: int = 0
+      output_attention_scores: bool = False,
   ):
     """VisionTransformer initialization function."""
     self._mlp_dim = mlp_dim
@@ -307,7 +361,6 @@ class VisionTransformer(tf_keras.Model):
     self._patch_size = patch_size
 # [1080 1920 None 3]
     inputs = tf_keras.Input(shape=input_specs.shape[1:])
-    # print("input specs???")
     # input(input_specs)
     x = layers.Conv2D(
         filters=hidden_size,
@@ -331,23 +384,15 @@ class VisionTransformer(tf_keras.Model):
     pos_embed_target_shape = (x.shape[rows_axis], x.shape[cols_axis])
     feat_h = input_specs.shape[rows_axis] // patch_size
     feat_w = input_specs.shape[cols_axis] // patch_size
-    # print(feat_h)
-    # print(feat_w)
-    # print(x.shape)
-    # input('stop')
     seq_len = feat_h * feat_w
     x = tf.reshape(x, [-1, seq_len, hidden_size])
-
-    # TODO: need to add the if retrieval == true, add those 
-    # retrieved tokens (i think)
-    
 # InputSpec(shape=(None, None, None, 3), ndim=4)
     # If we want to add a class token, add it here.
     if pooler == 'token':
       x = TokenLayer(name='cls')(x)
       tokens_before_encoder = x
 
-    encoder_output = Encoder(
+    self.encoder = Encoder(
         num_layers=num_layers,
         mlp_dim=mlp_dim,
         num_heads=num_heads,
@@ -362,7 +407,9 @@ class VisionTransformer(tf_keras.Model):
         pos_embed_target_shape=pos_embed_target_shape,
         layer_scale_init_value=layer_scale_init_value,
         output_attention_scores=output_attention_scores,
-    )(tokens_before_encoder)
+    )
+
+    encoder_output = self.encoder(tokens_before_encoder)
 
     endpoints = {}
     endpoints['tokens_before_encoder'] = tokens_before_encoder
@@ -374,8 +421,6 @@ class VisionTransformer(tf_keras.Model):
 
     if pooler == 'token':
       output_feature = x[:, 1:]
-      # print('output feature below')
-      # input(output_feature)
       x = x[:, 0]
     elif pooler == 'gap':
       output_feature = x
