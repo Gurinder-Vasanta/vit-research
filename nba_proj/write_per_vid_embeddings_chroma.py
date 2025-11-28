@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import normalize
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
 
 def generate_manual_intervals():
     df = pd.read_csv('data/manual_intervals.csv')
@@ -72,7 +72,7 @@ hidden_size = 768 #768
 model = vit.VisionTransformer(
     # image_size = 224,
     input_specs=layers.InputSpec(shape=[None,432,768,3]),  #432,768   648,1152   504,896
-    patch_size=256, #16 128 had more variance 64
+    patch_size=32, #16 128 had more variance 64
     num_layers=12, #12  14
     num_heads=12, #12  14
     hidden_size=hidden_size,
@@ -135,8 +135,17 @@ def class_from_frame(frame_name):
         inter_start = int(inter[0].split('_')[1])
         inter_end = int(inter[1].split('_')[1])
         if(num >= inter_start and num <= inter_end and splitted[0] == vid_str): return 'right'
+    for inter in im_ranges['none']:
+        # input(inter)
+        # print('in ranges left')
+        # input(inter)
+        # inter: ['vid1_1', 'vid1_420']
+        vid_str = inter[0].split('_')[0]
+        inter_start = int(inter[0].split('_')[1])
+        inter_end = int(inter[1].split('_')[1])
+        if(num >= inter_start and num <= inter_end and splitted[0] == vid_str): return 'none'
     # input(frame_name)
-    return 'none'
+    return 'ignore'
 
 frames_path = 'data/temp'
 left_path = 'data/left'
@@ -148,20 +157,20 @@ all_frames = sorted(all_frames, key = lambda frm: int(frm.split('_')[0].split('v
 # input(all_frames)
 
 total_count = 0
-batch_cap = 1024 # was 32
+batch_cap = 128 # was 32
 cur_count = 0
 embeddings = []
 l_embeddings = []
 r_embeddings = []
 n_embeddings = []
 
-vid = 'vid3'
+vid = 'vid4'
 
 # left_collection = chroma_client.get_or_create_collection(name="left_collection",metadata={"hnsw:space": "l2"})
 # right_collection = chroma_client.get_or_create_collection(name="right_collection",metadata={"hnsw:space": "l2"})
 # none_collection = chroma_client.get_or_create_collection(name="none_collection",metadata={"hnsw:space": "l2"})
 
-embeddings = chroma_client.get_or_create_collection(name=f'{vid}_embeddings',metadata={'hnsw:space': 'l2'})
+embeddings = chroma_client.get_or_create_collection(name=f'{vid}_p32_embeddings',metadata={'hnsw:space': 'l2'})
 
 
 l_fids = []
@@ -191,6 +200,10 @@ for f_name in all_frames:
 directions = []
 cur_fnames = []
 
+total_num_chunks = int(len(vid_to_frames_dict[vid])/batch_cap) + 1
+batch_num = 1
+
+# input(len(vid_to_frames_dict[vid]))
 for fname in vid_to_frames_dict[vid]: 
     frame_class = class_from_frame(fname)
 
@@ -204,12 +217,15 @@ for fname in vid_to_frames_dict[vid]:
         print(aux.shape)
         print(len(directions))
         print(len(cur_fnames))
-        output = model.predict(aux, batch_size=1024, verbose=1)
+        output = model.predict(aux, batch_size=batch_cap, verbose=1)
         temp = np.array(output['pre_logits'])
         temp = temp.reshape(batch_cap,hidden_size)
         print(temp)
 
         print(temp.shape)
+
+        print(f'batch {batch_num} / {total_num_chunks} completed')
+        batch_num += 1
         embeddings.upsert(
             embeddings=temp,
             ids=cur_fnames,
@@ -255,7 +271,7 @@ if(len(aux) > 0):
     temp = np.array(output['pre_logits'])
     temp = temp.reshape(len(aux),hidden_size)
 
-    embeddings.add(
+    embeddings.upsert(
         embeddings=temp,
         ids=cur_fnames,
         metadatas = directions
