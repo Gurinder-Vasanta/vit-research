@@ -64,8 +64,8 @@ for clip in clips:
     max_frame_num = extract_frame_number(max_frame)
 
     # skip this for vid 4
-    if(max_frame_num-min_frame_num < 200):
-        continue
+    # if(max_frame_num-min_frame_num < 200):
+    #     continue
     if(interval == []):
         interval.append(extract_frame_number(min_frame))
         interval.append(extract_frame_number(max_frame))
@@ -73,7 +73,7 @@ for clip in clips:
         # input('stop')
     else: 
         if(cur_type == prev_type):
-            print('need to actually merge')
+            print('possibly need to actually merge')
             print(min_frame)
             print(max_frame)
             print('prev interval: ')
@@ -83,13 +83,19 @@ for clip in clips:
             # if cur start is in prev interval, merge
             # if diff between end of last interval and start of cur interval is less than 30, merge (its prolly close enough)
             if(interval[1] > min_frame_num or (min_frame_num - interval[1] <=30)): 
+                print(' ------ need to actually merge --------')
+                print('previous interval: ')
+                print(interval)
+                print('current interval: ')
+                print(f'[{min_frame_num},{max_frame_num}]')
                 print(f'{cur_vid}_frame_{interval[0]}.jpg')
                 # input('stop pt 1')
                 delete_non_merged_clip(len(os.listdir(f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{cur_vid}')),cur_type)
                 # input('stop pt 2')
                 copy_clip(f'{cur_vid}_frame_{interval[0]}.jpg',max_frame,cur_type)
                 # input('stop pt3')
-            
+            else: 
+                copy_clip(min_frame,max_frame,cur_type)
             # input('stop at need to merge')
         else:
             copy_clip(min_frame,max_frame,cur_type)
