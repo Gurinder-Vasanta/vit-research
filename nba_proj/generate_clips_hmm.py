@@ -25,7 +25,7 @@ import shutil
 from joblib import load
 import hmm
 
-cur_vid = 'vid4'
+cur_vid = 'vid5'
 
 # search for CONFIDENT UPSERTS to uncomment those upserts
 client = PersistentClient(path="./chroma_store")
@@ -38,9 +38,10 @@ layers = tf_keras.layers
 left_path = 'data/unseen_test_images/left'
 right_path = 'data/unseen_test_images/right'
 none_path = 'data/unseen_test_images/none'
-images_folder = 'data/unseen_test_images/ims'
+images_folder = f'data/unseen_test_images/ims_{cur_vid}'
 
 test_ims = os.listdir(images_folder)
+# input(test_ims)
 # print(test_ims)
 
 hidden_size = 768 #768
@@ -61,7 +62,7 @@ model.load_weights('vit_random_weights.h5')
 # this should be 901 (30 seconds of footage is giving around 2 full possessions, which makes sense)
 # IGNORE THE SHIFTING THING FOR NOW
 # 10000 worked well
-hmm_matrix = hmm.hmm(15001) # if you want x frames in the window, do x+1 as the parameter cause we don't use index 0
+hmm_matrix = hmm.hmm(20001) # if you want x frames in the window, do x+1 as the parameter cause we don't use index 0
 # hmm_matrix.add_col_to_lattic()
 
 def store_clip(starting_frame,ending_frame,dir): 
@@ -373,9 +374,9 @@ for fname in test_ims:
     # once you do the extended clips, maybe go through each one and do one final check to remove any obviously none frames
     if(cur_vid != fname.split('_')[0]):
         continue
-    if(int(fname.split('_')[2].split('.')[0]) <170000) : # was 11000 first; was 18060 ; 109624
+    if(int(fname.split('_')[2].split('.')[0]) <80000) : # was 11000 first; was 18060 ; 109624
         continue
-    if(int(fname.split('_')[2].split('.')[0]) == 180000): # was 11000
+    if(int(fname.split('_')[2].split('.')[0]) == 90000): # was 11000
         break
     print(fname)
     frame_names.append(fname)
@@ -389,7 +390,6 @@ for fname in test_ims:
 
     target_size = (hidden_size,432)
     temp_frame = cv2.resize(im,target_size,interpolation=cv2.INTER_AREA)
-
 
     aux = []
     aux.append(temp_frame)
