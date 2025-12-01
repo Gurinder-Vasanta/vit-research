@@ -8,7 +8,7 @@ from models.vit_backbone import VisionTransformer
 from models.rag_head import RAGHead
 from retrieval.frame_retriever import FrameRetriever
 from dataset import build_tf_dataset
-
+import random
 
 layers = tf_keras.layers
 os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
@@ -73,8 +73,10 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
         # cls_np = cls_embeddings.numpy()
         # retrieved_np = retriever(cls_embeddings, metadata_batch)
         # retrieved_embeddings = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
-        retrieved_embeddings = retriever(cls_embeddings, metadata_batch)
+        retrieved_embeddings = retriever(cls_embeddings, metadata)
 
+        # print(np.mean(np.var(retrieved_embeddings, axis=1))) variance is around 0.05
+        # input('stop')
         logits, _ = rag_head(cls_embeddings, retrieved_embeddings, training=True)
         loss = loss_fn(labels, logits)
 
@@ -92,6 +94,10 @@ if __name__ == "__main__":
 
     train_vids = ["vid2",'vid4']
     samples = load_samples(train_vids)
+    # input(np.array(samples))
+    random.shuffle(samples)
+    # input(np.array(samples))
+    # samples = 
 
     # print("Unique labels:", set(s["label"] for s in samples))
     # input('stop')
@@ -132,15 +138,63 @@ if __name__ == "__main__":
     optimizer = tf.keras.optimizers.Adam(1e-4)
     bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
+    acc_count = 0
+    acc_frames = []
+    acc_metadata = {"vid": [], "clip": [], "side": [], "t_norm": []}
+    acc_labels = []
+
     # training loop
     for frames_batch, metadata_batch, labels_batch in train_dataset:
-        print(frames_batch)
-        print(metadata_batch)
-        print(labels_batch)
-        input('stop')
-        loss = train_step(
-            vit, rag_head, retriever,
-            optimizer, bce,
-            frames_batch, metadata_batch, labels_batch
-        )
-        print("loss:", float(loss))
+        
+        # print(frames_batch) shape=(4, 432, 768, 3)
+        # print(metadata_batch)
+        # print(labels_batch)
+        # input('stop')
+
+# {'vid': <tf.Tensor: shape=(4,), dtype=int32, numpy=array([2, 2, 2, 2], dtype=int32)>, 
+#  'clip': <tf.Tensor: shape=(4,), dtype=int32, numpy=array([100, 100, 100, 100], dtype=int32)>, 
+#  'side': <tf.Tensor: shape=(4,), dtype=string, numpy=array([b'left', b'left', b'left', b'left'], dtype=object)>, 
+#  't_norm': <tf.Tensor: shape=(4,), dtype=float32, numpy=array([0.0020284 , 0.0040568 , 0.00608519, 0.00811359], dtype=float32)>}
+
+        acc_frames.append(frames_batch)
+        acc_metadata["vid"].append(metadata_batch["vid"])
+        acc_metadata["clip"].append(metadata_batch["clip"])
+        acc_metadata["side"].append(metadata_batch["side"])
+        acc_metadata["t_norm"].append(metadata_batch["t_norm"])
+        acc_labels.append(labels_batch)
+
+        acc_count += 1
+
+        if(acc_count == 4):
+            big_frames = tf.concat(acc_frames, axis=0)
+
+            big_metadata = {
+                "vid": tf.concat(acc_metadata["vid"], axis=0),
+                "clip": tf.concat(acc_metadata["clip"], axis=0),
+                "side": tf.concat(acc_metadata["side"], axis=0),
+                "t_norm": tf.concat(acc_metadata["t_norm"], axis=0)
+            }
+
+            big_labels = tf.concat(acc_labels, axis=0)
+
+            loss = train_step(
+                vit, rag_head, retriever,
+                optimizer, bce,
+                big_frames, big_metadata, big_labels
+            )
+            print("loss:", float(loss))
+
+            acc_frames = []
+            acc_metadata = {"vid": [], "clip": [], "side": [], "t_norm": []}
+            acc_labels = []
+            acc_count = 0
+
+            # print(big_metadata)
+            # input('stop')
+
+        # loss = train_step(
+        #     vit, rag_head, retriever,
+        #     optimizer, bce,
+        #     frames_batch, metadata_batch, labels_batch
+        # )
+        # print("loss:", float(loss))
