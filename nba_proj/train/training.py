@@ -100,11 +100,14 @@ if __name__ == "__main__":
     train_dataset = build_tf_dataset(samples, batch_size=4, num_workers=32)
 
     # input(len(train_dataset))
+    # input(len(samples)) --> is 50100 (only vid2 and vid4)
     # count = 0
     # for _ in train_dataset: 
     #     count += 1
-    #     if(count == 500):break
-    # input(count)
+    #     print(count)
+    # #     if(count == 500):break
+    # input(count) 
+
     # build backbone
     vit = VisionTransformer(
         input_specs=layers.InputSpec(shape=[None, 432, 768, 3]),
@@ -131,6 +134,10 @@ if __name__ == "__main__":
 
     # training loop
     for frames_batch, metadata_batch, labels_batch in train_dataset:
+        print(frames_batch)
+        print(metadata_batch)
+        print(labels_batch)
+        input('stop')
         loss = train_step(
             vit, rag_head, retriever,
             optimizer, bce,
