@@ -31,7 +31,14 @@ class RAGHead(tf_keras.Model):
         self.transformer_blocks.append(block)
 
     self.norm = layers.LayerNormalization(epsilon=1e-6)
-    self.classifier = layers.Dense(1)  # for binary make/miss
+
+    self.classifier = tf.keras.Sequential([
+        layers.Dense(256, activation='relu'),
+        layers.Dropout(0.2),
+        layers.Dense(1)
+    ])
+
+    # self.classifier = layers.Dense(1)  # for binary make/miss
 
   def call(self, cls_embeddings, retrieved_embeddings, training=False):
     """
