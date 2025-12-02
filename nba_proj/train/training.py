@@ -11,7 +11,7 @@ from dataset import build_tf_dataset
 import random
 
 layers = tf_keras.layers
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2,3,4,5"
 
 # usage: python -m train.training
 
@@ -50,7 +50,10 @@ def load_samples(train_vids):
             num_frames = len(frames)
             for i, f in enumerate(frames, start=1):
                 fpath = os.path.join(clip_path, f)
-
+                
+                temp_tnorm = i / num_frames
+                if(temp_tnorm < 0.7):
+                    continue
                 samples.append({
                     "pth": fpath,
                     "side": clip.split("_")[3],
@@ -59,7 +62,7 @@ def load_samples(train_vids):
                     "vid_num": int(f.split("_")[0][3:]),
                     "label": clip_label
                 })
-
+    input(np.array(samples))
     return samples
 
 
@@ -76,13 +79,17 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
 
         # Python retrieval step
         # cls_np = cls_embeddings.numpy()
-        # retrieved_np = retriever(cls_embeddings, metadata_batch)
-        # retrieved_embeddings = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
-        retrieved_embeddings = retriever(cls_embeddings, metadata)
+        retrieved_np = retriever(cls_embeddings, metadata)
+        retrieved_embeddings = tf.stop_gradient(tf.convert_to_tensor(retrieved_np, dtype=tf.float32))
+        # retrieved_embeddings = retriever(cls_embeddings, metadata)
 
         # print(np.mean(np.var(retrieved_embeddings, axis=1))) variance is around 0.05
         # input('stop')
         logits, _ = rag_head(cls_embeddings, retrieved_embeddings, training=True)
+        print()
+        print('train logits')
+        print(logits)
+        print()
         loss = loss_fn(labels, logits)
 
     train_vars = vit.trainable_variables + rag_head.trainable_variables
@@ -98,22 +105,30 @@ def evaluate(val_ds, vit, rag_head, retriever):
     losses = []
     accs = []
 
+    counter = 0
     # input(val_ds)
     for frames, metadata, labels in val_ds:
+        counter += 1
         vit_out = vit(frames, training=False)
         cls = vit_out["pre_logits"]
         retrieved = retriever(cls, metadata)
 
         logits, _ = rag_head(cls, retrieved, training=False)
 
+        print(logits)
+        print('------------------------ validation logits')
+        # input('stop')
         loss = bce(labels, logits)
         # preds = (tf.sigmoid(logits) > 0.5)
         acc = compute_accuracy(labels,logits)
 
         losses.append(loss.numpy())
         accs.append(acc.numpy())
+        print()
+        print(f'validation batch: {counter} validation loss: {loss.numpy()} validation acc: {acc.numpy()}')
     
     print("validation loss:", np.mean(losses), "validation acc:", np.mean(accs))
+    print()
     # return np.mean(losses), np.mean(accs)
 
 # -------------------------
@@ -126,8 +141,8 @@ if __name__ == "__main__":
     # input(np.array(samples))
     random.shuffle(samples)
 
-    train_samples = samples[0:600]
-    validation_samples = samples[600:700]
+    train_samples = samples[0:1000]
+    validation_samples = samples[1000:1004]
 
     # input(np.array(samples))
     # samples = 
@@ -168,7 +183,7 @@ if __name__ == "__main__":
         name="ragdb_p32_embeddings",
         metadata={"hnsw:space": "l2"}
     )
-    retriever = FrameRetriever(collection, top_k=50, search_k=100)
+    retriever = FrameRetriever(collection, top_k=10, search_k=100)
 
     # rag head
     rag_head = RAGHead(hidden_size=768, num_queries=4)
@@ -205,7 +220,7 @@ if __name__ == "__main__":
         acc_count += 1
         valid_counter += 1
 
-        if(acc_count == 5):
+        if(acc_count == 1):
             big_frames = tf.concat(acc_frames, axis=0)
 
             big_metadata = {
@@ -216,6 +231,11 @@ if __name__ == "__main__":
             }
 
             big_labels = tf.concat(acc_labels, axis=0)
+
+            print(big_metadata)
+            print()
+            print(big_labels)
+            # input('stop')
 
             loss = train_step(
                 vit, rag_head, retriever,
