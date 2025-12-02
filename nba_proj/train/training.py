@@ -15,6 +15,11 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
 
 # usage: python -m train.training
 
+def compute_accuracy(labels, logits):
+    preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+    return tf.reduce_mean(tf.cast(preds == labels, tf.float32))
+
+
 # -------------------------
 # 1. Load labels + build samples
 # -------------------------
@@ -63,7 +68,7 @@ def load_samples(train_vids):
 # -------------------------
 # @tf.function
 def train_step(vit, rag_head, retriever, optimizer, loss_fn,
-               frames, metadata, labels):
+               frames, metadata, labels): 
 
     with tf.GradientTape() as tape:
         vit_out = vit(frames, training=True)
@@ -84,8 +89,32 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
     grads = tape.gradient(loss, train_vars)
     optimizer.apply_gradients(zip(grads, train_vars))
 
+    acc = compute_accuracy(labels, logits)
+    print("loss:", loss.numpy(), "acc:", acc.numpy())
+
     return loss
 
+def evaluate(val_ds, vit, rag_head, retriever):
+    losses = []
+    accs = []
+
+    # input(val_ds)
+    for frames, metadata, labels in val_ds:
+        vit_out = vit(frames, training=False)
+        cls = vit_out["pre_logits"]
+        retrieved = retriever(cls, metadata)
+
+        logits, _ = rag_head(cls, retrieved, training=False)
+
+        loss = bce(labels, logits)
+        # preds = (tf.sigmoid(logits) > 0.5)
+        acc = compute_accuracy(labels,logits)
+
+        losses.append(loss.numpy())
+        accs.append(acc.numpy())
+    
+    print("validation loss:", np.mean(losses), "validation acc:", np.mean(accs))
+    # return np.mean(losses), np.mean(accs)
 
 # -------------------------
 # 3. Main
@@ -96,6 +125,10 @@ if __name__ == "__main__":
     samples = load_samples(train_vids)
     # input(np.array(samples))
     random.shuffle(samples)
+
+    train_samples = samples[0:600]
+    validation_samples = samples[600:700]
+
     # input(np.array(samples))
     # samples = 
 
@@ -103,8 +136,13 @@ if __name__ == "__main__":
     # input('stop')
 
     # build dataset
-    train_dataset = build_tf_dataset(samples, batch_size=4, num_workers=32)
-
+    # train_dataset = build_tf_dataset(samples, batch_size=4, num_workers=32)
+    train_dataset = build_tf_dataset(train_samples,batch_size=4, num_workers=24)
+    valid_dataset = build_tf_dataset(validation_samples,batch_size=4, num_workers=8)
+    
+    # print(train_dataset)
+    # print(valid_dataset)
+    # input('stop')
     # input(len(train_dataset))
     # input(len(samples)) --> is 50100 (only vid2 and vid4)
     # count = 0
@@ -143,6 +181,7 @@ if __name__ == "__main__":
     acc_metadata = {"vid": [], "clip": [], "side": [], "t_norm": []}
     acc_labels = []
 
+    valid_counter = 0
     # training loop
     for frames_batch, metadata_batch, labels_batch in train_dataset:
         
@@ -164,8 +203,9 @@ if __name__ == "__main__":
         acc_labels.append(labels_batch)
 
         acc_count += 1
+        valid_counter += 1
 
-        if(acc_count == 4):
+        if(acc_count == 5):
             big_frames = tf.concat(acc_frames, axis=0)
 
             big_metadata = {
@@ -182,13 +222,20 @@ if __name__ == "__main__":
                 optimizer, bce,
                 big_frames, big_metadata, big_labels
             )
-            print("loss:", float(loss))
+
+            # if(valid_counter == 1):
+            evaluate(valid_dataset,vit,rag_head,retriever)
+                # valid_counter = 0
+            # print("loss:", float(loss))
 
             acc_frames = []
             acc_metadata = {"vid": [], "clip": [], "side": [], "t_norm": []}
             acc_labels = []
             acc_count = 0
 
+            # for v_frames, v_metadata, v_labels in valid_dataset
+        
+        
             # print(big_metadata)
             # input('stop')
 
@@ -198,3 +245,17 @@ if __name__ == "__main__":
         #     frames_batch, metadata_batch, labels_batch
         # )
         # print("loss:", float(loss))
+
+
+# code for checkpointing: 
+#         ckpt = tf.train.Checkpoint(
+#     vit=vit,
+#     rag_head=rag_head,
+#     optimizer=optimizer
+# )
+# manager = tf.train.CheckpointManager(ckpt, "./checkpoints", max_to_keep=5)
+
+# if batch_i % 10 == 0:
+#     manager.save()
+
+#     ckpt.restore(manager.latest_checkpoint)
