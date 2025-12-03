@@ -76,11 +76,33 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
     with tf.GradientTape() as tape:
         vit_out = vit(frames, training=True)
         cls_embeddings = vit_out["pre_logits"]  # (B, 768)
+        cls_embeddings = tf.stop_gradient(cls_embeddings)
 
+        # cls_embeddings = tf.nn.l2_normalize(cls_embeddings, axis=1)
+
+        # for i in range(5):
+        #     retrieved = retriever(cls_embeddings, metadata_batch)
+        #     print("mean:", retrieved.mean(), "std:", retrieved.std())
+
+        # input('stop')
         # Python retrieval step
         # cls_np = cls_embeddings.numpy()
-        retrieved_np = retriever(cls_embeddings, metadata)
-        retrieved_embeddings = tf.stop_gradient(tf.convert_to_tensor(retrieved_np, dtype=tf.float32))
+    retrieved_np = retriever(cls_embeddings, metadata)
+    retrieved_embeddings = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
+    retrieved_embeddings = tf.stop_gradient(retrieved_embeddings)
+
+    with tf.GradientTape() as tape2:
+        # print("CLS embeddings:", 
+        # float(tf.reduce_mean(cls_embeddings)), 
+        # float(tf.math.reduce_std(cls_embeddings)))
+
+        # print("RET embeddings:", 
+        # float(tf.reduce_mean(retrieved_embeddings)), 
+        # float(tf.math.reduce_std(retrieved_embeddings)))
+
+        # input('stop')
+        # retrieved_embeddings = tf.nn.l2_normalize(retrieved_embeddings, axis=2)
+
         # retrieved_embeddings = retriever(cls_embeddings, metadata)
 
         # print(np.mean(np.var(retrieved_embeddings, axis=1))) variance is around 0.05
@@ -92,9 +114,12 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
         print()
         loss = loss_fn(labels, logits)
 
-    train_vars = vit.trainable_variables + rag_head.trainable_variables
-    grads = tape.gradient(loss, train_vars)
-    optimizer.apply_gradients(zip(grads, train_vars))
+    # train_vars = vit.trainable_variables + rag_head.trainable_variables
+    # grads = tape.gradient(loss, train_vars)
+    # optimizer.apply_gradients(zip(grads, train_vars))
+
+    grads = tape2.gradient(loss, rag_head.trainable_variables)
+    optimizer.apply_gradients(zip(grads, rag_head.trainable_variables))
 
     acc = compute_accuracy(labels, logits)
     print("loss:", loss.numpy(), "acc:", acc.numpy())
@@ -111,9 +136,13 @@ def evaluate(val_ds, vit, rag_head, retriever):
         counter += 1
         vit_out = vit(frames, training=False)
         cls = vit_out["pre_logits"]
-        retrieved = retriever(cls, metadata)
+        cls = tf.nn.l2_normalize(cls, axis=1)
 
-        logits, _ = rag_head(cls, retrieved, training=False)
+        retrieved = retriever(cls, metadata)
+        retrieved_embeddings = tf.nn.l2_normalize(retrieved, axis=2)
+
+        logits, _ = rag_head(cls, retrieved_embeddings, training=False)
+
 
         print(logits)
         print('------------------------ validation logits')
@@ -176,6 +205,19 @@ if __name__ == "__main__":
         hidden_size=768,
         mlp_dim=3072,
     )
+
+    # vecs = []
+    # for frames, _, _ in train_dataset.take(50):
+    #     out = vit(frames, training=False)["pre_logits"]  # shape (4, 768)
+    #     vecs.append(out.numpy())
+
+    # vecs = np.concatenate(vecs, axis=0)
+
+    # from sklearn.metrics.pairwise import cosine_similarity
+
+    # sim = cosine_similarity(vecs)
+    # print(sim.mean(), sim.std())
+    # input('stop')
 
     # retriever
     client = PersistentClient(path="./chroma_store")

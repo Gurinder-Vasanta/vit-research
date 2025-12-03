@@ -54,8 +54,8 @@ class FrameRetriever:
                 where={
                     "$and": [
                         {"side": side},
-                        {"t_norm": {"$gte": tnorm - 0.05}},
-                        {"t_norm": {"$lte": tnorm + 0.05}},
+                        {"t_norm": {"$gte": tnorm - 0.15}},
+                        {"t_norm": {"$lte": tnorm + 0.15}},
                         {"vid": {"$ne": int(vid)}}
                     ]
                 },

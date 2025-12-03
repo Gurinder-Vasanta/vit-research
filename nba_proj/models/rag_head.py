@@ -38,6 +38,24 @@ class RAGHead(tf_keras.Model):
         layers.Dense(1)
     ])
 
+    self.cls_type = self.add_weight(
+        shape=(1, 1, hidden_size),
+        initializer="zeros",
+        trainable=True
+    )
+
+    self.ret_type = self.add_weight(
+        shape=(1, 1, hidden_size),
+        initializer="zeros",
+        trainable=True
+    )
+
+    self.pos_embedding = self.add_weight(
+        shape=(1, 1 + num_queries, hidden_size),
+        initializer=tf.keras.initializers.RandomNormal(stddev=0.02),
+        trainable=True
+    )
+
     # self.classifier = layers.Dense(1)  # for binary make/miss
 
   def call(self, cls_embeddings, retrieved_embeddings, training=False):
@@ -45,15 +63,29 @@ class RAGHead(tf_keras.Model):
     cls_embeddings: (B, D)
     retrieved_embeddings: (B, k, D)
     """
+
+    # print("CLS embeddings:", 
+    #   float(tf.reduce_mean(cls_embeddings)), 
+    #   float(tf.math.reduce_std(cls_embeddings)))
+
+    # print("RET embeddings:", 
+    #   float(tf.reduce_mean(retrieved_embeddings)), 
+    #   float(tf.math.reduce_std(retrieved_embeddings)))
+    
+    # input('stop')
     # (B, R, D)
     retrieval_tokens = self.pooler(retrieved_embeddings)
 
     # (B, 1, D)
     cls_tokens = tf.expand_dims(cls_embeddings, axis=1)
 
+    cls_tokens = cls_tokens + self.cls_type
+    retrieval_tokens = retrieval_tokens + self.ret_type
+
     # concat → (B, 1+R, D)
     x = tf.concat([cls_tokens, retrieval_tokens], axis=1)
 
+    x = x + self.pos_embedding
     for block in self.transformer_blocks:
         x = block(x, training=training)
 
