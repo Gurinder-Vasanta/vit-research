@@ -8,6 +8,7 @@ from chromadb import PersistentClient
 from dataset import load_samples, build_chunks, build_tf_dataset_chunks
 from models.vit_backbone import VisionTransformer
 from models.rag_head import RAGHead
+from models.projection_head import ProjectionHead
 from retrieval.frame_retriever import FrameRetriever
 
 layers = tf_keras.layers
@@ -43,7 +44,7 @@ class Accumulator:
             self.step = 0
 
 
-def train_step(vit, rag_head, retriever, optimizer, loss_fn,
+def train_step(vit, rag_head, proj_head, retriever, optimizer, loss_fn,
                frames, metadata, labels,
                accum):
     
@@ -58,10 +59,24 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
 
     frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))
 
-    chunk_embs = tf.reduce_max(frame_embs, axis=1)
-    chunk_embs = tf.stop_gradient(chunk_embs)
+    # chunk_embs = tf.reduce_max(frame_embs, axis=1)
+    # chunk_embs = tf.stop_gradient(chunk_embs)
 
+    # retrieved_np = retriever(chunk_embs, metadata)
+
+    # Pool raw chunk embeddings
+    raw_chunk = tf.reduce_max(frame_embs, axis=1)  # (B, 768)
+    raw_chunk = tf.stop_gradient(raw_chunk)
+
+    # Learnable projection
+    chunk_embs = proj_head(raw_chunk)  # (B, 768)
+
+    # Retrieval now expects projection-space embeddings
     retrieved_np = retriever(chunk_embs, metadata)
+    # retrieved_embs = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
+    # retrieved_embs = tf.nn.l2_normalize(retrieved_embs, axis=2)
+
+
     retrieved = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
     retrieved = tf.stop_gradient(retrieved)
 
@@ -70,7 +85,7 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
         logits, _ = rag_head(chunk_embs, retrieved, training=True)
         loss = loss_fn(labels, logits)
 
-    grads = tape.gradient(loss, rag_head.trainable_variables)
+    grads = tape.gradient(loss, rag_head.trainable_variables + proj_head.trainable_variables)
 
     # accumulate
     accum.accumulate(grads)
@@ -138,7 +153,7 @@ def train_step(vit, rag_head, retriever, optimizer, loss_fn,
 # ---------------------------------------------------------
 # VALIDATION
 # ---------------------------------------------------------
-def evaluate(val_ds, vit, rag_head, retriever, loss_fn):
+def evaluate(val_ds, vit, rag_head, proj_head, retriever, loss_fn):
     losses = []
     accs = []
 
@@ -164,7 +179,10 @@ def evaluate(val_ds, vit, rag_head, retriever, loss_fn):
         frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))  # (B,60,768)
 
         # ---- chunk pooling ----
-        chunk_embs = tf.reduce_max(frame_embs, axis=1)  # (B, 768) #TODO: reduce to max
+        # chunk_embs = tf.reduce_max(frame_embs, axis=1)  # (B, 768) #TODO: reduce to max
+        raw_chunk = tf.reduce_max(frame_embs, axis=1)
+        chunk_embs = proj_head(raw_chunk)
+        chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
 
         # print("frames:", frames.shape)
         # print("metadata['vid']:", metadata["vid"].shape)
@@ -278,11 +296,12 @@ if __name__ == "__main__":
     )
 
     # freeze ViT
-    vit.trainable = False
+    # vit.trainable = False
 
     # RAG head (trainable)
     rag_head = RAGHead(hidden_size=768, num_queries=4)
 
+    proj_head = ProjectionHead(hidden_dim=768, proj_dim=768)
     # Retrieval DB
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
@@ -317,7 +336,7 @@ if __name__ == "__main__":
         batch_counter = 0
         for frames_batch, metadata_batch, labels_batch in train_dataset:
             curloss, curacc = train_step(
-                vit, rag_head, retriever,
+                vit, rag_head, proj_head, retriever,
                 optimizer, bce,
                 frames_batch, metadata_batch, labels_batch,
                 accum
@@ -331,4 +350,4 @@ if __name__ == "__main__":
         print(f"EPOCH {epoch+1} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
 
         # validation at end of every epoch
-        evaluate(val_dataset, vit, rag_head, retriever, bce)
+        evaluate(val_dataset, vit, rag_head, proj_head, retriever, bce)
