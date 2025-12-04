@@ -1,84 +1,58 @@
 import numpy as np
 
 class FrameRetriever:
-    def __init__(self, chroma_collection, top_k=50, search_k=100):
-        self.collection = chroma_collection
+    def __init__(self, collection, top_k=50, search_k=200):
+        self.collection = collection
         self.top_k = top_k
         self.search_k = search_k
 
-    def __call__(self, cls_embeddings_np, metadata_batch):
+    def __call__(self, chunk_embs, metadata):
         """
-        cls_embeddings_np: (B, D) numpy array
-        metadata_batch: list of length B, each:
-            {
-              "vid": int,
-              "clip": int,
-              "side": str,
-              "t_norm": float
-            }
-        Returns: np.ndarray of shape (B, top_k, D)
+        chunk_embs: (B, 768)   raw ViT chunk embeddings from training
+        metadata: dict with:
+            - vid          (B,)   int
+            - side         (B,)   tf.string
+            - t_center     (B,)   float
+            - t_width      (B,)   float
         """
-        batch_retrieved = []
-        
-        batch_vids = metadata_batch['vid'].numpy()
-        batch_clips = metadata_batch['clip'].numpy()
-        batch_sides = metadata_batch['side'].numpy()
-        batch_tnorms = metadata_batch['t_norm'].numpy()
 
-        for emb_vec, vid, clip, side, tnorm in zip(cls_embeddings_np, batch_vids, batch_clips, batch_sides, batch_tnorms):
-            # input(emb_vec)
-            # emb = emb_vec.reshape(1, -1).tolist()
-            emb = emb_vec.numpy()[None, :]
+        B = chunk_embs.shape[0]
+        q_np = chunk_embs.numpy()
+        out = []
 
-            side = side.decode('utf-8')
-            # input([emb_vec,vid,clip,side,tnorm])
-            # input(metadata_batch.values())
-            # input(metadata_batch['vid'].numpy())
-# {'vid': <tf.Tensor: shape=(4,), dtype=int32, numpy=array([2, 2, 2, 2], dtype=int32)>, 
-# 'clip': <tf.Tensor: shape=(4,), dtype=int32, numpy=array([100, 100, 100, 100], dtype=int32)>, 
-# 'side': <tf.Tensor: shape=(4,), dtype=string, numpy=array([b'left', b'left', b'left', b'left'], dtype=object)>, 
-# 't_norm': <tf.Tensor: shape=(4,), dtype=float32, numpy=array([0.0020284 , 0.0040568 , 0.00608519, 0.00811359], dtype=float32)>}
-            # input(cls_embeddings_np)
-            # input(metadata_batch['vid'])
-            # input(meta)
-            # input(metadata_batch)
+        for i in range(B):
 
-            # vid = int(meta["vid"])
-            # clip = int(meta["clip"])
-            # side = meta["side"]
-            # tnorm = float(meta["t_norm"])
+            vid      = int(metadata["vid"][i].numpy())
+            side     = metadata["side"][i].numpy().decode()
+            t_center = float(metadata["t_center"][i].numpy())
+            t_width  = float(metadata["t_width"][i].numpy())
 
+            t_min = t_center - (t_width / 2)
+            t_max = t_center + (t_width / 2)
+
+            # Query the NEW enriched DB
             results = self.collection.query(
-                query_embeddings=emb,
+                query_embeddings=q_np[i:i+1],
                 n_results=self.search_k,
                 where={
                     "$and": [
+                        {"vid_num": {"$ne": vid}},
                         {"side": side},
-                        {"t_norm": {"$gte": tnorm - 0.15}},
-                        {"t_norm": {"$lte": tnorm + 0.15}},
-                        {"vid": {"$ne": int(vid)}}
+                        {"t_norm": {"$gte": t_min}},
+                        {"t_norm": {"$lte": t_max}}
                     ]
                 },
-                include=["embeddings", "metadatas", "distances"]
+                include=["embeddings"]
             )
 
-            retrieved = []
+            embs = results["embeddings"][0][:self.top_k]
 
-            for emb_, m in zip(results["embeddings"][0], results["metadatas"][0]):
-                # print(len(emb_))
-                # print(len(m))
-                # input('stop')
-                # print(emb_,m)
-                # input('stop')
-                # input(emb_)
-                # need to add the tnorm condition in here as well (no you dont, its in the query)
-                if (m["clip_num"] != clip):
-                    retrieved.append(emb_)
-                if len(retrieved) == self.top_k:
-                    break
+            # pad if too few results
+            if len(embs) < self.top_k:
+                D = q_np.shape[1]
+                pad = np.zeros((self.top_k - len(embs), D), dtype=np.float32)
+                embs = np.vstack([embs, pad])
 
-            retrieved = np.asarray(retrieved, dtype=np.float32)
-            batch_retrieved.append(retrieved)
-        # print(batch_retrieved)
-        # input('batch_retrieved')
-        return np.stack(batch_retrieved, axis=0)  # (B, top_k, D)
+            out.append(np.asarray(embs, dtype=np.float32))
+
+        return np.stack(out, axis=0)
