@@ -13,7 +13,7 @@ import os
 import torch
 from transformers import ViTModel, ViTImageProcessor
 
-
+ 
 # ------------------------------
 # GLOBAL CONFIG
 # ------------------------------
@@ -217,14 +217,14 @@ ragdb = client.get_or_create_collection(
 # ------------------------------
 # PROCESS VIDEOS (unchanged)
 # ------------------------------
-vids = ["vid2"]
+vids = ["vid2",'vid4']
 batch_cap = 128
 # nvidia-cudnn-cu12 9.3.0.75
 for vid in vids:
     all_clips_path = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
     clips = sorted(os.listdir(all_clips_path), key=comparator)
-    clips = clips[0:3]
-    print(clips)
+    # clips = clips[0:3]
+    # print(clips)
 
     for clip in clips:
         print("cur clip:", clip)
