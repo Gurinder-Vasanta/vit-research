@@ -10,11 +10,12 @@ from models.vit_backbone import VisionTransformer
 from models.rag_head import RAGHead
 from models.projection_head import ProjectionHead
 from retrieval.frame_retriever import FrameRetriever
+from db_maintainence.db_rebuild import rebuild_db
 
 layers = tf_keras.layers
 os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
 
-
+np.random.seed(1234)
 # ---------------------------------------------------------
 # Accuracy helper
 # ---------------------------------------------------------
@@ -27,76 +28,71 @@ def compute_accuracy(labels, logits):
 # ---------------------------------------------------------
 
 class Accumulator:
-    def __init__(self, model, accum_steps):
+    def __init__(self, rag_head, proj_head, accum_steps):
         self.accum_steps = accum_steps
         self.step = 0
-        self.gradients = [tf.zeros_like(v) for v in model.trainable_variables]
+        self.vars = rag_head.trainable_variables + proj_head.trainable_variables
+        self.gradients = [tf.zeros_like(v) for v in self.vars]
 
     def accumulate(self, grads):
         self.gradients = [g_old + g_new for g_old, g_new in zip(self.gradients, grads)]
         self.step += 1
 
-    def apply(self, optimizer, model):
+    def apply(self, optimizer):
         if self.step == self.accum_steps:
             avg_grads = [g / self.accum_steps for g in self.gradients]
-            optimizer.apply_gradients(zip(avg_grads, model.trainable_variables))
-            self.gradients = [tf.zeros_like(v) for v in model.trainable_variables]
+            optimizer.apply_gradients(zip(avg_grads, self.vars))
+            self.gradients = [tf.zeros_like(v) for v in self.vars]
             self.step = 0
 
 
 def train_step(vit, rag_head, proj_head, retriever, optimizer, loss_fn,
-               frames, metadata, labels,
-               accum):
-    
+               frames, metadata, labels, accum):
+
     B = tf.shape(frames)[0]
     T = tf.shape(frames)[1]
 
-    # ---- VI T (frozen) ----
+    # ----- ViT forward -----
     frames_reshaped = tf.reshape(frames, (-1, 432, 768, 3))
-
     vit_out = vit(frames_reshaped, training=False)
     frame_embs_flat = vit_out["pre_logits"]
-
+    frame_embs_flat = tf.nn.l2_normalize(frame_embs_flat, axis=1)
     frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))
 
-    # chunk_embs = tf.reduce_max(frame_embs, axis=1)
-    # chunk_embs = tf.stop_gradient(chunk_embs)
+    # ----- Raw chunk pool -----
+    raw_chunk = tf.reduce_max(frame_embs, axis=1)
+    # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1) 
+    # raw_chunk = tf.stop_gradient(raw_chunk)
 
-    # retrieved_np = retriever(chunk_embs, metadata)
-
-    # Pool raw chunk embeddings
-    raw_chunk = tf.reduce_max(frame_embs, axis=1)  # (B, 768)
-    raw_chunk = tf.stop_gradient(raw_chunk)
-
-    # Learnable projection
-    chunk_embs = proj_head(raw_chunk)  # (B, 768)
-
-    # Retrieval now expects projection-space embeddings
-    retrieved_np = retriever(chunk_embs, metadata)
-    # retrieved_embs = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
-    # retrieved_embs = tf.nn.l2_normalize(retrieved_embs, axis=2)
-
-
-    retrieved = tf.convert_to_tensor(retrieved_np, dtype=tf.float32)
-    retrieved = tf.stop_gradient(retrieved)
-
-    # ---- Train only RAG head ----
+    # ----- Forward projection (learnable) -----
     with tf.GradientTape() as tape:
+        chunk_embs = proj_head(raw_chunk, training=True)
+        # chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
+
+        # ----- Retrieval (stop gradient) -----
+        retrieved_np = retriever(chunk_embs, metadata)
+        retrieved = tf.nn.l2_normalize(
+            tf.stop_gradient(tf.convert_to_tensor(retrieved_np, tf.float32)),
+            axis=2
+        )
+
+
         logits, _ = rag_head(chunk_embs, retrieved, training=True)
         loss = loss_fn(labels, logits)
 
-    grads = tape.gradient(loss, rag_head.trainable_variables + proj_head.trainable_variables)
+    # Get grads for BOTH heads
+    grads = tape.gradient(loss,
+            rag_head.trainable_variables + proj_head.trainable_variables)
 
-    # accumulate
-    accum.accumulate(grads)
-
-    # apply when full accumulation reached
-    accum.apply(optimizer, rag_head)
+    optimizer.apply_gradients(zip(grads, rag_head.trainable_variables + proj_head.trainable_variables))
+    # accum.accumulate(grads)
+    # accum.apply(optimizer)
 
     acc = compute_accuracy(labels, logits)
 
     # print("loss:", float(loss), "acc:", float(acc))
     return float(loss), float(acc)
+
 
 # # ---------------------------------------------------------
 # # TRAIN STEP (ViT frozen, RAG-head trainable)
@@ -181,7 +177,8 @@ def evaluate(val_ds, vit, rag_head, proj_head, retriever, loss_fn):
         # ---- chunk pooling ----
         # chunk_embs = tf.reduce_max(frame_embs, axis=1)  # (B, 768) #TODO: reduce to max
         raw_chunk = tf.reduce_max(frame_embs, axis=1)
-        chunk_embs = proj_head(raw_chunk)
+        raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=-1)
+        chunk_embs = proj_head(raw_chunk, training=False)
         chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
 
         # print("frames:", frames.shape)
@@ -222,7 +219,7 @@ def evaluate(val_ds, vit, rag_head, proj_head, retriever, loss_fn):
 
         # Combined similarity (REAL)
         cos_comb = -tf.keras.losses.cosine_similarity(z1, z2)
-        # print("Combined true cosine similarity:", float(cos_comb))
+        print("Combined true cosine similarity:", float(cos_comb))
 
         # cos_cls = 1 - tf.keras.losses.cosine_similarity(chunk_embs[0], chunk_embs[1])
         # print("CLS cosine similarity:", float(cos_cls))
@@ -272,7 +269,7 @@ if __name__ == "__main__":
     # train_chunks = chunk_samples[:int(0.95*n)]
     # val_chunks = chunk_samples[int(0.95*n):]
 
-    train_chunks = chunk_samples[0:128]
+    train_chunks = chunk_samples[0:128] #was 128
     val_chunks = chunk_samples[150:161]
     print(f"Train chunks: {len(train_chunks)}")
     print(f"Val chunks:   {len(val_chunks)}")
@@ -301,13 +298,15 @@ if __name__ == "__main__":
     # RAG head (trainable)
     rag_head = RAGHead(hidden_size=768, num_queries=4)
 
-    proj_head = ProjectionHead(hidden_dim=768, proj_dim=768)
+    proj_head = ProjectionHead(input_dim=768, hidden_dim=768, proj_dim=768)
     # Retrieval DB
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
         name="ragdb_p32_rich_embeddings",
         metadata={"hnsw:space": "l2"}
     )
+
+    
     retriever = FrameRetriever(collection, top_k=10, search_k=200)
 
     dummy_chunk = tf.zeros((1, 768))
@@ -317,7 +316,7 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 4. Optimizer / loss
     # ---------------------------------------------
-    optimizer = tf.keras.optimizers.Adam(1e-6)
+    optimizer = tf.keras.optimizers.Adam(1e-4)
     bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
     # ---------------------------------------------
@@ -326,11 +325,12 @@ if __name__ == "__main__":
     EPOCHS = 10
 
     accum_steps = 8  # effective batch = physical batch * accum_steps
-    accum = Accumulator(rag_head, accum_steps)
+    accum = Accumulator(rag_head, proj_head, accum_steps)
 
     for epoch in range(EPOCHS):
         print(f"\n================= EPOCH {epoch+1} =================")
-
+        print('collection count in training ')
+        print(collection.count())
         losses = []
         accs = []
         batch_counter = 0
@@ -348,6 +348,8 @@ if __name__ == "__main__":
             if(batch_counter % 5 == 0):
                 print(f"EPOCH {epoch+1} BATCH {batch_counter} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
         print(f"EPOCH {epoch+1} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
-
+        proj_head.save_weights("projection_head.weights.h5")
         # validation at end of every epoch
         evaluate(val_dataset, vit, rag_head, proj_head, retriever, bce)
+        rebuild_db()
+
