@@ -94,7 +94,7 @@ def rebuild_db():
     for vid in vids:
         root = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
         clips = sorted(os.listdir(root), key=comparator)
-        clips = clips[0:5]
+        clips = clips[0:10]
         for clip in clips:
             print("rebuilding cur clip:", clip)
             frames = sorted(os.listdir(os.path.join(root, clip)), key=comparator)
