@@ -223,7 +223,7 @@ batch_cap = 128
 for vid in vids:
     all_clips_path = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
     clips = sorted(os.listdir(all_clips_path), key=comparator)
-    # clips = clips[0:3]
+    clips = clips[0:10]
     # print(clips)
 
     for clip in clips:
