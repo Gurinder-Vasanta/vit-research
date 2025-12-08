@@ -6,11 +6,13 @@ class ProjectionHead(tf.keras.Model):
         super().__init__()
         self.d1 = layers.Dense(input_dim, activation='relu')
         self.d2 = layers.Dense(hidden_dim, activation='relu')
+        # self.d3 = layers.Dense(hidden_dim, activation='relu')
         self.out = layers.Dense(proj_dim)
 
     def call(self, x):
         x = self.d1(x)
         x = self.d2(x)
+        # x = self.d3(x)
         x = self.out(x)
         x = tf.nn.l2_normalize(x, axis=-1)  # unit sphere (important!)
         return x

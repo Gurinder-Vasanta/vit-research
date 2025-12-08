@@ -8,12 +8,12 @@ from models.projection_head import ProjectionHead
 
 import torch
 from transformers import ViTModel, ViTImageProcessor
-
+from multiprocessing import Pool
 
 # --------------------------
 # DEVICE + SEED
 # --------------------------
-os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6,7"
 np.random.seed(1234)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -59,6 +59,22 @@ def vit_embed(img_np):
     cls = out.last_hidden_state[:, 0, :].cpu().numpy()[0]
     return cls / (np.linalg.norm(cls) + 1e-8)
 
+def worker_prepare_frame(args):
+    frame_path, local_idx, total_frames, clip_num = args
+
+    img = im_to_array(frame_path)
+
+    # frame_idx the global frame number from filename, but we don't use it for t_norm
+    fname = os.path.basename(frame_path)
+    global_frame_idx = int(fname.split("_")[2].split('.')[0])
+
+    clip_folder = os.path.basename(os.path.dirname(frame_path))
+    side = get_side(clip_folder)
+
+    # Correct t_norm:
+    t_norm = local_idx / total_frames   # local_idx is 1..N
+
+    return (img, t_norm, side, local_idx, fname)
 
 # --------------------------
 # LOAD TRAINED PROJECTOR
@@ -72,87 +88,129 @@ projector.call = tf.function(projector.call)
 client = PersistentClient(path="./chroma_store")
 
 ragdb = client.get_or_create_collection(
-    name="ragdb_p32_rich_embeddings",     # NEW, cleaner name
-    metadata={"hnsw:space": "l2"}
-)
+    name="ragdb_p32_rich_embeddings",
+    metadata={"hnsw:space":"cosine"
+              }
+    )
 
 # wipe old DB
 # ragdb.delete(where={})
 
 def rebuild_db():
+    POOL = Pool(processes=32)
+    # Wipe everything
     ragdb.delete(where={"vid_num": {"$ne": 'vid0'}})
-    # client.delete_collection(name=f'ragdb_p32_rich_embeddings')
 
-    # ragdb = client.get_or_create_collection(
-    #     name="ragdb_p32_rich_embeddings",     # NEW, cleaner name
-    #     metadata={"hnsw:space": "l2"}
-    # )
-    
     vids = ["vid2", "vid4"]
-    batch_cap = 128
+    CLIPS_PER_UPSERT = 10
+
+    b_embeddings = []
+    b_ids = []
+    b_metadatas = []
+    clip_counter = 0
 
     for vid in vids:
         root = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
         clips = sorted(os.listdir(root), key=comparator)
-        clips = clips[0:10]
+        clips = clips[:10] # should be at least 10
+
         for clip in clips:
             print("rebuilding cur clip:", clip)
-            frames = sorted(os.listdir(os.path.join(root, clip)), key=comparator)
+            clip_counter += 1
 
-            base_list = []
-            ids = []
-            metas = []
+            clip_path = os.path.join(root, clip)
+            frames = sorted(os.listdir(clip_path), key=comparator)
+            total_frames = len(frames)
+            clip_num = get_clip_num(clip)
 
-            # ---------------------------------------
-            # 1. Collect raw ViT base embeddings
-            # ---------------------------------------
-            count = 0
-            for fname in frames:
-                path = os.path.join(root, clip, fname)
-                img = im_to_array(path)
+            # -----------------------------------------
+            # Build worker tasks for parallel preprocessing
+            # -----------------------------------------
+            tasks = []
+            for local_i, fname in enumerate(frames, start=1):
+                full_path = os.path.join(clip_path, fname)
+                tasks.append((full_path, local_i, total_frames, clip_num))
 
-                base = vit_embed(img)     # 768-dim
-                base_list.append(base)
+            # -----------------------------------------
+            # Parallel CPU preprocessing
+            # -----------------------------------------
+            preprocessed = POOL.map(worker_prepare_frame, tasks)
 
-            #  batch_meta.append({
-            #     "side": get_side(clip),
-            #     "t_norm": f_i / total_frames,
-            #     "clip_num": clip_num,
-            #     "vid_num": int(fname.split("_")[0][3:])
-            # })
+            # Unpack worker outputs
+            imgs       = [x[0] for x in preprocessed]
+            t_norms    = [x[1] for x in preprocessed]
+            sides      = [x[2] for x in preprocessed]
+            frame_ids  = [x[3] for x in preprocessed]
+            fnames     = [x[4] for x in preprocessed]
 
-                ids.append(fname)
-                metas.append({
-                    "clip_num": get_clip_num(clip),
-                    "side": get_side(clip),
-                    "vid_num": vid,
-                    't_norm': count/len(frames)
-                })
+            # -----------------------------------------
+            # GPU embedding + enrichment
+            # (same logic as original write script)
+            # -----------------------------------------
+            # embeddings = enrich_embeddings(imgs, t_norms, sides, frame_ids)
 
-                count += 1
+            # with torch.no_grad():
+            #     inputs = processor(images=imgs, return_tensors="pt").to(device)
+            #     out = vit_model(**inputs)
+            #     base_embs = out.last_hidden_state[:, 0, :].cpu().numpy()  # (N, 768)
 
-            base_arr = np.stack(base_list, axis=0)
+            batch_size = 16   # safe for ViT-base on 24GB GPU
+            all_embs = []
 
-            # ---------------------------------------
-            # 2. Project using trained projection head
-            # ---------------------------------------
-            projected = projector(base_arr).numpy()
+            with torch.no_grad():
+                for i in range(0, len(imgs), batch_size):
+                    batch_imgs = imgs[i:i + batch_size]
 
-            # ---------------------------------------
-            # 3. Write to DB in batches
-            # ---------------------------------------
-            start = 0
-            n = len(projected)
-            while start < n:
-                end = min(start + batch_cap, n)
+                    inputs = processor(images=batch_imgs, return_tensors="pt").to(device)
 
+                    out = vit_model(**inputs)
+                    cls = out.last_hidden_state[:, 0, :]  # (batch, 768)
+
+                    all_embs.append(cls.cpu())
+
+            base_embs = torch.cat(all_embs, dim=0).numpy()  # (N_frames, 768)
+
+            projected = projector(tf.convert_to_tensor(base_embs, dtype=tf.float32)).numpy()
+
+            # Accumulate for 10-clip batch write
+            b_embeddings.append(projected)
+            b_ids.append(fnames)
+            b_metadatas.append([
+                {
+                    "side": sides[i],
+                    "t_norm": t_norms[i],
+                    "clip_num": clip_num,
+                    "vid_num": int(fnames[i].split("_")[0][3:])
+                }
+                for i in range(len(fnames))
+            ])
+
+            # -----------------------------------------
+            # Perform batched upsert every 10 clips
+            # -----------------------------------------
+            if clip_counter == CLIPS_PER_UPSERT:
+                print("Upserting batch of 10 clips…")
                 ragdb.upsert(
-                    embeddings=projected[start:end],
-                    ids=ids[start:end],
-                    metadatas=metas[start:end]
+                    embeddings=np.concatenate(b_embeddings, axis=0),
+                    ids=sum(b_ids, []),
+                    metadatas=sum(b_metadatas, [])
                 )
 
-                start = end
+                # reset batch accumulators
+                b_embeddings = []
+                b_ids = []
+                b_metadatas = []
+                clip_counter = 0
+
+    # -----------------------------------------
+    # Final flush for leftover clips
+    # -----------------------------------------
+    if len(b_embeddings) > 0:
+        ragdb.upsert(
+            embeddings=np.concatenate(b_embeddings, axis=0),
+            ids=sum(b_ids, []),
+            metadatas=sum(b_metadatas, [])
+        )
 
 
 # import numpy as np

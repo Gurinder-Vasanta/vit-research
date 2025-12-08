@@ -12,10 +12,62 @@ from models.projection_head import ProjectionHead
 from retrieval.frame_retriever import FrameRetriever
 from db_maintainence.db_rebuild import rebuild_db
 
+from transformers import ViTModel, ViTImageProcessor
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+hf_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+hf_processor.do_rescale = False
+hf_vit = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
+hf_vit.eval()
+
 layers = tf_keras.layers
 os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
 
 np.random.seed(1234)
+
+def hf_vit_embed_batch(frames_np):
+    """
+    frames_np: (N, 432, 768, 3) uint8 or float32
+    Returns (N, 768) numpy embeddings (L2 normalized)
+    """
+    frames_np = frames_np.astype(np.float32)
+    frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
+    with torch.no_grad():
+        inputs = hf_processor(images=frames_list, return_tensors="pt").to(device)
+        out = hf_vit(**inputs)
+        cls = out.last_hidden_state[:, 0, :]  # (N,768)
+        cls = cls.cpu().numpy()
+        cls = cls / (np.linalg.norm(cls, axis=1, keepdims=True) + 1e-8)
+        return cls.astype(np.float32)
+    
+def simple_retrieval_contrastive_loss(q, retrieved):
+    """
+    q:          (B, 768) projections of chunk embeddings
+    retrieved:  (B, K, 768) projections of retrieved embeddings
+    """
+
+    B = tf.shape(q)[0]
+
+    # mean retrieved embedding for each example
+    r_mean = tf.reduce_mean(retrieved, axis=1)  # (B, 768)
+
+    # positive pull = 1 - cosine(q_i, r_mean_i)
+    pos_sim = tf.reduce_sum(q * r_mean, axis=-1) #/ 0.1
+    pull = 1.0 - pos_sim   # (B,)
+
+    # negative push:
+    # shift r_mean by 1 position to create "other" neighborhoods
+    r_other = tf.roll(r_mean, shift=1, axis=0)
+
+    neg_sim = tf.reduce_sum(q * r_other, axis=-1) #/ 0.1
+    push = neg_sim         # (B,)
+
+    # final loss: pull + push
+    loss = pull + push
+    return tf.reduce_mean(loss)
+
 # ---------------------------------------------------------
 # Accuracy helper
 # ---------------------------------------------------------
@@ -46,28 +98,35 @@ class Accumulator:
             self.step = 0
 
 
-def train_step(vit, rag_head, proj_head, retriever, optimizer, loss_fn,
+def train_step(rag_head, proj_head, retriever, optimizer, loss_fn,
                frames, metadata, labels, accum):
 
     B = tf.shape(frames)[0]
     T = tf.shape(frames)[1]
 
-    # ----- ViT forward -----
-    frames_reshaped = tf.reshape(frames, (-1, 432, 768, 3))
-    vit_out = vit(frames_reshaped, training=False)
-    frame_embs_flat = vit_out["pre_logits"]
-    frame_embs_flat = tf.nn.l2_normalize(frame_embs_flat, axis=1)
-    frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))
+    frames_np = tf.numpy_function(
+        hf_vit_embed_batch,
+        [tf.reshape(frames, (-1, 432, 768, 3))],
+        tf.float32
+    )
+    frame_embs = tf.reshape(frames_np, (B, T, 768))
+
+    # # ----- ViT forward -----
+    # frames_reshaped = tf.reshape(frames, (-1, 432, 768, 3))
+    # vit_out = vit(frames_reshaped, training=False)
+    # frame_embs_flat = vit_out["pre_logits"]
+    # frame_embs_flat = tf.nn.l2_normalize(frame_embs_flat, axis=1)
+    # frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))
 
     # ----- Raw chunk pool -----
-    raw_chunk = tf.reduce_max(frame_embs, axis=1)
-    # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1) 
+    raw_chunk = tf.reduce_mean(frame_embs, axis=1)
+    raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1) 
     # raw_chunk = tf.stop_gradient(raw_chunk)
 
     # ----- Forward projection (learnable) -----
     with tf.GradientTape() as tape:
         chunk_embs = proj_head(raw_chunk, training=True)
-        # chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
+        chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
 
         # ----- Retrieval (stop gradient) -----
         retrieved_np = retriever(chunk_embs, metadata)
@@ -78,15 +137,21 @@ def train_step(vit, rag_head, proj_head, retriever, optimizer, loss_fn,
 
 
         logits, _ = rag_head(chunk_embs, retrieved, training=True)
-        loss = loss_fn(labels, logits)
+        loss_cls = loss_fn(labels, logits)
+        # loss = loss_fn(labels, logits)
+        # ----- NEW: simple retrieval-aware contrast -----
+        loss_contrast = simple_retrieval_contrastive_loss(chunk_embs, retrieved)
+
+        # combine them
+        loss = loss_cls + 0.0 * loss_contrast        # λ = 0.1 to start
 
     # Get grads for BOTH heads
     grads = tape.gradient(loss,
             rag_head.trainable_variables + proj_head.trainable_variables)
 
-    optimizer.apply_gradients(zip(grads, rag_head.trainable_variables + proj_head.trainable_variables))
-    # accum.accumulate(grads)
-    # accum.apply(optimizer)
+    # optimizer.apply_gradients(zip(grads, rag_head.trainable_variables + proj_head.trainable_variables))
+    accum.accumulate(grads)
+    accum.apply(optimizer)
 
     acc = compute_accuracy(labels, logits)
 
@@ -149,7 +214,7 @@ def train_step(vit, rag_head, proj_head, retriever, optimizer, loss_fn,
 # ---------------------------------------------------------
 # VALIDATION
 # ---------------------------------------------------------
-def evaluate(val_ds, vit, rag_head, proj_head, retriever, loss_fn):
+def evaluate(val_ds, rag_head, proj_head, retriever, loss_fn):
     losses = []
     accs = []
 
@@ -163,20 +228,28 @@ def evaluate(val_ds, vit, rag_head, proj_head, retriever, loss_fn):
         T = tf.shape(frames)[1]  # 60
 
         # input(frames)
-        # reshape so ViT sees individual frames
-        frames_reshaped = tf.reshape(frames, (-1, 432, 768, 3))  # (B*T, 432,768,3)
-        # input(frames_reshaped)
-       
-        vit_out = vit(frames_reshaped, training=False)
-        frame_embs_flat = vit_out["pre_logits"]   # (B*T, 768)
-        frame_embs_flat = tf.nn.l2_normalize(frame_embs_flat, axis=1)
 
-        # reshape back
-        frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))  # (B,60,768)
+        frames_np = tf.numpy_function(
+            hf_vit_embed_batch,
+            [tf.reshape(frames, (-1, 432, 768, 3))],
+            tf.float32
+        )
+        frame_embs = tf.reshape(frames_np, (B, T, 768))
+
+        # # reshape so ViT sees individual frames
+        # frames_reshaped = tf.reshape(frames, (-1, 432, 768, 3))  # (B*T, 432,768,3)
+        # # input(frames_reshaped)
+       
+        # vit_out = vit(frames_reshaped, training=False)
+        # frame_embs_flat = vit_out["pre_logits"]   # (B*T, 768)
+        # frame_embs_flat = tf.nn.l2_normalize(frame_embs_flat, axis=1)
+
+        # # reshape back
+        # frame_embs = tf.reshape(frame_embs_flat, (B, T, 768))  # (B,60,768)
 
         # ---- chunk pooling ----
         # chunk_embs = tf.reduce_max(frame_embs, axis=1)  # (B, 768) #TODO: reduce to max
-        raw_chunk = tf.reduce_max(frame_embs, axis=1)
+        raw_chunk = tf.reduce_mean(frame_embs, axis=1)
         raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=-1)
         chunk_embs = proj_head(raw_chunk, training=False)
         chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
@@ -265,12 +338,12 @@ if __name__ == "__main__":
 
     # split 95/5
     n = len(chunk_samples)
-
+    print(n)
     # train_chunks = chunk_samples[:int(0.95*n)]
     # val_chunks = chunk_samples[int(0.95*n):]
 
-    train_chunks = chunk_samples[0:128] #was 128
-    val_chunks = chunk_samples[150:161]
+    train_chunks = chunk_samples[0:300] #was 128
+    val_chunks = chunk_samples[300:325]
     print(f"Train chunks: {len(train_chunks)}")
     print(f"Val chunks:   {len(val_chunks)}")
 
@@ -283,31 +356,31 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 3. Build models
     # ---------------------------------------------
-    vit = VisionTransformer(
-        input_specs=layers.InputSpec(shape=[None, 432, 768, 3]),
-        patch_size=32,
-        num_layers=12,
-        num_heads=12,
-        hidden_size=768,
-        mlp_dim=3072,
-    )
+    # vit = VisionTransformer(
+    #     input_specs=layers.InputSpec(shape=[None, 432, 768, 3]),
+    #     patch_size=32,
+    #     num_layers=12,
+    #     num_heads=12,
+    #     hidden_size=768,
+    #     mlp_dim=3072,
+    # )
 
-    # freeze ViT
+    # # freeze ViT
     # vit.trainable = False
 
     # RAG head (trainable)
     rag_head = RAGHead(hidden_size=768, num_queries=4)
 
-    proj_head = ProjectionHead(input_dim=768, hidden_dim=768, proj_dim=768)
+    proj_head = ProjectionHead(input_dim=768, hidden_dim=768*4, proj_dim=768)
     # Retrieval DB
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
         name="ragdb_p32_rich_embeddings",
-        metadata={"hnsw:space": "l2"}
+        metadata={"hnsw:space": "cosine"}
     )
 
     
-    retriever = FrameRetriever(collection, top_k=10, search_k=200)
+    retriever = FrameRetriever(collection, top_k=3, search_k=200)
 
     dummy_chunk = tf.zeros((1, 768))
     dummy_retrieved = tf.zeros((1, 10, 768))
@@ -316,18 +389,26 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 4. Optimizer / loss
     # ---------------------------------------------
-    optimizer = tf.keras.optimizers.Adam(1e-4)
+    # optimizer = tf.keras.optimizers.Adam(1e-4)
+    optimizer = torch.optim.AdamW([
+        {"params": hf_vit.encoder.layer[-1].parameters(), "lr": 1e-6},
+        {"params": hf_vit.layernorm.parameters(), "lr": 1e-6},
+        {"params": rag_head.parameters(), "lr": 1e-5},
+        {"params": projector.parameters(), "lr": 1e-5},
+    ])
     bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
     # ---------------------------------------------
     # 5. Training loop
     # ---------------------------------------------
-    EPOCHS = 10
+    EPOCHS = 32
 
-    accum_steps = 8  # effective batch = physical batch * accum_steps
+    accum_steps = 16  # effective batch = physical batch * accum_steps
     accum = Accumulator(rag_head, proj_head, accum_steps)
 
     for epoch in range(EPOCHS):
+        if(epoch < 20):
+            continue
         print(f"\n================= EPOCH {epoch+1} =================")
         print('collection count in training ')
         print(collection.count())
@@ -336,7 +417,7 @@ if __name__ == "__main__":
         batch_counter = 0
         for frames_batch, metadata_batch, labels_batch in train_dataset:
             curloss, curacc = train_step(
-                vit, rag_head, proj_head, retriever,
+                rag_head, proj_head, retriever,
                 optimizer, bce,
                 frames_batch, metadata_batch, labels_batch,
                 accum
@@ -345,11 +426,14 @@ if __name__ == "__main__":
             batch_counter += 1
             losses.append(curloss)
             accs.append(curacc)
-            if(batch_counter % 5 == 0):
+            if(batch_counter % 10 == 0):
                 print(f"EPOCH {epoch+1} BATCH {batch_counter} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
         print(f"EPOCH {epoch+1} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
         proj_head.save_weights("projection_head.weights.h5")
         # validation at end of every epoch
-        evaluate(val_dataset, vit, rag_head, proj_head, retriever, bce)
-        rebuild_db()
+        evaluate(val_dataset, rag_head, proj_head, retriever, bce)
+        # rebuild_db()
+        if((epoch + 1) % 4 == 0 and (epoch+1) >= 4): 
+            rebuild_db()
+            
 
