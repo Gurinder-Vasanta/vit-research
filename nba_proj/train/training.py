@@ -143,7 +143,7 @@ def train_step(rag_head, proj_head, retriever, optimizer, loss_fn,
         loss_contrast = simple_retrieval_contrastive_loss(chunk_embs, retrieved)
 
         # combine them
-        loss = loss_cls + 0.0 * loss_contrast        # λ = 0.1 to start
+        loss = loss_cls + 0.1 * loss_contrast        # λ = 0.1 to start
 
     # Get grads for BOTH heads
     grads = tape.gradient(loss,
@@ -331,7 +331,7 @@ if __name__ == "__main__":
     # 1. Load samples -> chunkify
     # ---------------------------------------------
     train_vids = ["vid2", "vid4"]
-    samples = load_samples(train_vids,stride=2)
+    samples = load_samples(train_vids,stride=1)
     chunk_samples = build_chunks(samples, chunk_size=12)
 
     random.shuffle(chunk_samples)
@@ -342,8 +342,8 @@ if __name__ == "__main__":
     # train_chunks = chunk_samples[:int(0.95*n)]
     # val_chunks = chunk_samples[int(0.95*n):]
 
-    train_chunks = chunk_samples[0:300] #was 128
-    val_chunks = chunk_samples[300:325]
+    train_chunks = chunk_samples[0:500] #was 128
+    val_chunks = chunk_samples[600:625]
     print(f"Train chunks: {len(train_chunks)}")
     print(f"Val chunks:   {len(val_chunks)}")
 
@@ -372,6 +372,9 @@ if __name__ == "__main__":
     rag_head = RAGHead(hidden_size=768, num_queries=4)
 
     proj_head = ProjectionHead(input_dim=768, hidden_dim=768*4, proj_dim=768)
+
+    # proj_head.load_weights("projection_head.weights.h5")
+    
     # Retrieval DB
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
@@ -380,34 +383,40 @@ if __name__ == "__main__":
     )
 
     
-    retriever = FrameRetriever(collection, top_k=3, search_k=200)
+    retriever = FrameRetriever(collection, top_k=25, search_k=200)
 
     dummy_chunk = tf.zeros((1, 768))
     dummy_retrieved = tf.zeros((1, 10, 768))
     _ = rag_head(dummy_chunk, dummy_retrieved, training=False)
+    rag_head.load_weights('rag_head.weights.h5')
+
+    dummy = tf.zeros((1, 768), dtype=tf.float32)
+    _ = proj_head(dummy)   # builds variables
+    proj_head.load_weights("projection_head.weights.h5")
 
     # ---------------------------------------------
     # 4. Optimizer / loss
     # ---------------------------------------------
-    # optimizer = tf.keras.optimizers.Adam(1e-4)
-    optimizer = torch.optim.AdamW([
-        {"params": hf_vit.encoder.layer[-1].parameters(), "lr": 1e-6},
-        {"params": hf_vit.layernorm.parameters(), "lr": 1e-6},
-        {"params": rag_head.parameters(), "lr": 1e-5},
-        {"params": projector.parameters(), "lr": 1e-5},
-    ])
+    optimizer = tf.keras.optimizers.Adam(1e-5)
+    # optimizer = torch.optim.AdamW([
+    #     {"params": hf_vit.encoder.layer[-1].parameters(), "lr": 1e-6},
+    #     {"params": hf_vit.layernorm.parameters(), "lr": 1e-6},
+    #     {"params": rag_head.parameters(), "lr": 1e-5},
+    #     {"params": projector.parameters(), "lr": 1e-5},
+    # ])
     bce = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
     # ---------------------------------------------
     # 5. Training loop
     # ---------------------------------------------
-    EPOCHS = 32
+    EPOCHS = 48
 
+    # lower lr to 1e-5 and make contrastive coefficient 0.1 at epoch 24 (rebuild every 6)
     accum_steps = 16  # effective batch = physical batch * accum_steps
     accum = Accumulator(rag_head, proj_head, accum_steps)
 
     for epoch in range(EPOCHS):
-        if(epoch < 20):
+        if(epoch+1 < 25):
             continue
         print(f"\n================= EPOCH {epoch+1} =================")
         print('collection count in training ')
@@ -430,10 +439,11 @@ if __name__ == "__main__":
                 print(f"EPOCH {epoch+1} BATCH {batch_counter} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
         print(f"EPOCH {epoch+1} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch+1} TRAIN acc: {np.mean(accs):.4f}")
         proj_head.save_weights("projection_head.weights.h5")
+        rag_head.save_weights('rag_head.weights.h5')
         # validation at end of every epoch
         evaluate(val_dataset, rag_head, proj_head, retriever, bce)
         # rebuild_db()
-        if((epoch + 1) % 4 == 0 and (epoch+1) >= 4): 
+        if((epoch + 1) % 6 == 0 and (epoch+1) >= 6): 
             rebuild_db()
             
 
