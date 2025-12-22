@@ -1,0 +1,11 @@
+RAG_WEIGHTS = "rag_head.weights.h5"
+PROJ_WEIGHTS = "projection_head.weights.h5"
+
+CHROMADB_COLLECTION = "nba_embeddings_v3"
+
+TOP_K = 75
+SEARCH_K = 300
+
+EPOCHS = 24
+REBUILD_EVERY = 4
+BATCH_SIZE = 8
