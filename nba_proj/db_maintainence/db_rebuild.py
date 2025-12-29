@@ -5,6 +5,7 @@ from multiprocessing import cpu_count
 
 from chromadb import PersistentClient
 from models.projection_head import ProjectionHead
+import config
 
 import torch
 from transformers import ViTModel, ViTImageProcessor
@@ -13,7 +14,7 @@ from multiprocessing import Pool
 # --------------------------
 # DEVICE + SEED
 # --------------------------
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 np.random.seed(1234)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,14 +82,14 @@ def worker_prepare_frame(args):
 # --------------------------
 projector = ProjectionHead(input_dim = 768, hidden_dim=768, proj_dim=768)
 projector.build((None, 768))
-projector.load_weights("projection_head.weights.h5")
+projector.load_weights(config.PROJ_WEIGHTS)
 
 projector.call = tf.function(projector.call)
 
 client = PersistentClient(path="./chroma_store")
 
 ragdb = client.get_or_create_collection(
-    name="ragdb_p32_rich_embeddings",
+    name=config.CHROMADB_COLLECTION,
     metadata={"hnsw:space":"cosine"
               }
     )
@@ -97,11 +98,11 @@ ragdb = client.get_or_create_collection(
 # ragdb.delete(where={})
 
 def rebuild_db():
-    POOL = Pool(processes=32)
+    POOL = Pool(processes=36)
     # Wipe everything
     ragdb.delete(where={"vid_num": {"$ne": 'vid0'}})
 
-    vids = ["vid2", "vid4"]
+    vids = config.VIDS_TO_USE
     CLIPS_PER_UPSERT = 10
 
     b_embeddings = []
@@ -112,7 +113,7 @@ def rebuild_db():
     for vid in vids:
         root = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
         clips = sorted(os.listdir(root), key=comparator)
-        clips = clips[:10] # should be at least 10
+        clips = clips[:config.NUM_CLIPS_PER_VID] # should be at least 10
 
         for clip in clips:
             print("rebuilding cur clip:", clip)
