@@ -33,7 +33,7 @@ def load_samples(train_vids, stride = 1):
             # print(len(np.array(label_row)[0]))
             if label_row.empty or pd.isna(label_row['label'].iloc[0]):
                 continue
-            clip_label = int(label_row["label"])
+            clip_label = int(label_row["label"].iloc[0])
 
             num_frames = len(frames)
             stride_counter = 0
