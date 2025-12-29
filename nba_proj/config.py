@@ -1,19 +1,31 @@
-RAG_WEIGHTS = "rag_head.weights.h5"
-PROJ_WEIGHTS = "projection_head.weights.h5"
+RAG_WEIGHTS = "rag_weights/rag_head_6_vids.weights.h5"
+PROJ_WEIGHTS = "proj_weights/projection_head_6_vids.weights.h5"
 
-CHROMADB_COLLECTION = "nba_embeddings_v3"
+CHROMADB_COLLECTION = "rich_embeddings_6vids"
 
-TOP_K = 75
-SEARCH_K = 300
+TOP_K = 100
+SEARCH_K = 750
 
 EPOCHS = 24
 REBUILD_EVERY = 4
-BATCH_SIZE = 8
+ACCUM_BATCH_SIZE = 8
 
 PHASE_1_CONTRASTIVE_LOSS = 0.0
 PHASE_2_CONTRASTIVE_LOSS = 0.1
 
 PHASE_1_LEARNING_RATE = 1e-4
-PHASE_2_LEARNING_RATE + 1e-6
+PHASE_2_LEARNING_RATE = 1e-6
 
-NUM_CLIPS_PER_VID = 5
+NUM_QUERIES = 16
+NUM_LAYERS = 4
+NUM_HEADS = 8
+
+START_CHUNK_TRAIN = 0
+END_CHUNK_TRAIN = 2500
+
+START_CHUNK_VALID = 3000
+END_CHUNK_VALID = 3140
+
+NUM_CLIPS_PER_VID = 15
+VIDS_TO_USE = ["vid2", 'vid3','vid4','vid6','vid8','vid10']
+# VIDS_TO_USE = ['vid3']
