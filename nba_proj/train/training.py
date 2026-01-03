@@ -31,7 +31,7 @@ from sklearn.metrics import f1_score
 # maybe when you rebuild, you only rebuild things with the tag of 'auto' (or something like that)
 
 # usage: python -m train.training
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5,6,7"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 hf_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
@@ -88,8 +88,18 @@ def simple_retrieval_contrastive_loss(q, retrieved):
 # ---------------------------------------------------------
 # Accuracy helper
 # ---------------------------------------------------------
+# def compute_accuracy(labels, logits):
+#     preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+#     return tf.reduce_mean(tf.cast(preds == labels, tf.float32))
+
 def compute_accuracy(labels, logits):
+    labels = tf.cast(tf.reshape(labels, [-1]), tf.int32)   # (B,)
+    logits = tf.reshape(logits, [-1])                      # (B,)
     preds = tf.cast(tf.sigmoid(logits) > 0.5, tf.int32)
+    # print('raw sigmoid ')
+    # print(tf.sigmoid(logits))
+    # print('preds')
+    # print(preds)
     return tf.reduce_mean(tf.cast(preds == labels, tf.float32))
 
 def find_best_f1(labels, probs):
@@ -179,8 +189,14 @@ def train_step(rag_head, proj_head, retriever, optimizer, loss_fn,
     accum.accumulate(grads)
     accum.apply(optimizer)
 
+    # print(labels)
+    # print(logits)
+    # input('stop')
     acc = compute_accuracy(labels, logits)
-
+    # true_acc = compute_true_accuracy(labels, logits)
+    # print(acc)
+    # print(true_acc)
+    # input('stop')
     # print("loss:", float(loss), "acc:", float(acc))
     return float(loss), float(acc)
 
@@ -366,8 +382,8 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 2. Build TF datasets
     # ---------------------------------------------
-    train_dataset = build_tf_dataset_chunks(train_chunks, batch_size=8)
-    val_dataset   = build_tf_dataset_chunks(val_chunks,   batch_size=8)
+    train_dataset = build_tf_dataset_chunks(train_chunks, batch_size=config.CHUNK_BATCH_SIZE)
+    val_dataset   = build_tf_dataset_chunks(val_chunks,   batch_size=config.CHUNK_BATCH_SIZE)
 
     # ---------------------------------------------
     # 3. Build models
@@ -452,7 +468,7 @@ if __name__ == "__main__":
             batch_counter += 1
             losses.append(curloss)
             accs.append(curacc)
-            if(batch_counter % 5 == 0):
+            if(batch_counter % config.PRINT_EVERY == 0):
                 print(f"EPOCH {epoch} BATCH {batch_counter} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f}")
         print(f"EPOCH {epoch} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f}")
         proj_head.save_weights(config.PROJ_WEIGHTS)
