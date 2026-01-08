@@ -14,7 +14,7 @@ from multiprocessing import Pool
 # --------------------------
 # DEVICE + SEED
 # --------------------------
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6,7"
 np.random.seed(1234)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,27 +77,45 @@ def worker_prepare_frame(args):
 
     return (img, t_norm, side, local_idx, fname)
 
-# --------------------------
-# LOAD TRAINED PROJECTOR
-# --------------------------
-projector = ProjectionHead(input_dim = 768, hidden_dim=768, proj_dim=768)
-projector.build((None, 768))
-projector.load_weights(config.PROJ_WEIGHTS)
+# # --------------------------
+# # LOAD TRAINED PROJECTOR
+# # --------------------------
+# projector = ProjectionHead(input_dim = 768, hidden_dim=768, proj_dim=768)
+# projector.build((None, 768))
+# projector.load_weights(config.PROJ_WEIGHTS)
 
-projector.call = tf.function(projector.call)
+# projector.call = tf.function(projector.call)
 
-client = PersistentClient(path="./chroma_store")
+# client = PersistentClient(path="./chroma_store")
 
-ragdb = client.get_or_create_collection(
-    name=config.CHROMADB_COLLECTION,
-    metadata={"hnsw:space":"cosine"
-              }
-    )
+# ragdb = client.get_or_create_collection(
+#     name=config.CHROMADB_COLLECTION,
+#     metadata={"hnsw:space":"cosine"
+#               }
+#     )
 
 # wipe old DB
 # ragdb.delete(where={})
 
 def rebuild_db():
+    # --------------------------
+    # LOAD TRAINED PROJECTOR
+    # --------------------------
+    projector = ProjectionHead(input_dim = 768, hidden_dim=768, proj_dim=768)
+    projector.build((None, 768))
+    projector.load_weights(config.PROJ_WEIGHTS)
+
+    projector.call = tf.function(projector.call)
+
+    client = PersistentClient(path="./chroma_store")
+
+    ragdb = client.get_or_create_collection(
+    name=config.CHROMADB_COLLECTION,
+    metadata={"hnsw:space":"cosine"
+              }
+    )
+
+
     POOL = Pool(processes=36)
     # Wipe everything
     ragdb.delete(where={"vid_num": {"$ne": 'vid0'}})
