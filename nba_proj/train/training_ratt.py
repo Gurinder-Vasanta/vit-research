@@ -7,11 +7,11 @@ from chromadb import PersistentClient
 
 from dataset import load_samples, build_chunks, build_tf_dataset_chunks
 from models.vit_backbone import VisionTransformer
-from models.rag_head import RAGHead
+from models.ratt_head import RATTHead
 from models.projection_head import ProjectionHead
-from retrieval.frame_retriever import FrameRetriever
-from db_maintainence.db_rebuild_2304 import rebuild_db
-import config
+from retrieval.ratt_chunk_retriever import RattChunkRetriever
+from db_maintainence.db_rebuild_ratt import rebuild_db
+import config_ratt
 
 from transformers import ViTModel, ViTImageProcessor
 import torch
@@ -165,29 +165,35 @@ def train_step(rag_head, proj_head, retriever, optimizer, loss_fn,
     B = tf.shape(frames)[0]
     T = tf.shape(frames)[1]
 
-    print([B,T])
+    # print([B,T])
     frames_np = tf.numpy_function(
         hf_vit_embed_batch,
         [tf.reshape(frames, (-1, 432, 768, 3))],
         tf.float32
     )
     frame_embs = tf.reshape(frames_np, (B, T, 768))
-    
+    deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
+
     # ----- Raw chunk pool -----
     raw_chunk = tf.reduce_mean(frame_embs, axis=1)
     raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1) 
     # raw_chunk = tf.stop_gradient(raw_chunk)
 
-    print()
-    print('frame embds')
-    input(frame_embs)
+    # print()
+    # print('frame embds')
+    # input(frame_embs)
     
+    # for 
     # try this next 
     mean = tf.reduce_mean(frame_embs, axis=1)
-    std  = tf.math.reduce_std(frame_embs, axis=1)
-    max_ = tf.reduce_max(frame_embs, axis=1)
+    mean_deltas = tf.reduce_mean(deltas, axis=1)
+    std_deltas = tf.math.reduce_std(deltas, axis=1)
 
-    raw_chunk = tf.concat([mean, std, max_], axis=-1)
+    # std  = tf.math.reduce_std(frame_embs, axis=1)
+    # max_ = tf.reduce_max(frame_embs, axis=1)
+
+    # raw_chunk = tf.concat([mean, std, max_], axis=-1)
+    raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
     raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
     
     # input(raw_chunk)
@@ -196,18 +202,18 @@ def train_step(rag_head, proj_head, retriever, optimizer, loss_fn,
         chunk_embs = proj_head(raw_chunk, training=True)
         chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
 
-        print()
-        print('chunk embds')
-        input(chunk_embs)
+        # print()
+        # print('chunk embds')
+        # input(chunk_embs)
         # ----- Retrieval (stop gradient) -----
         retrieved_np = retriever(chunk_embs, metadata)
         retrieved = tf.nn.l2_normalize(
             tf.stop_gradient(tf.convert_to_tensor(retrieved_np, tf.float32)),
             axis=2
         )
-        print()
-        print('retrieved embds')
-        input(retrieved)
+        # print()
+        # print('retrieved embds')
+        # input(retrieved)
 
 
         logits, _ = rag_head(chunk_embs, retrieved, training=True)
@@ -425,7 +431,7 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 1. Load samples -> chunkify
     # ---------------------------------------------
-    train_vids = config.VIDS_TO_USE
+    train_vids = config_ratt.VIDS_TO_USE
     samples = load_samples(train_vids,stride=1)
     chunk_samples = build_chunks(samples, chunk_size=12)
 
@@ -437,23 +443,23 @@ if __name__ == "__main__":
     # train_chunks = chunk_samples[:int(0.95*n)]
     # val_chunks = chunk_samples[int(0.95*n):]
 
-    train_chunks = chunk_samples[config.START_CHUNK_TRAIN:config.END_CHUNK_TRAIN] #was 2000
-    val_chunks = chunk_samples[config.START_CHUNK_VALID:config.END_CHUNK_VALID]
+    train_chunks = chunk_samples[config_ratt.START_CHUNK_TRAIN:config_ratt.END_CHUNK_TRAIN] #was 2000
+    val_chunks = chunk_samples[config_ratt.START_CHUNK_VALID:config_ratt.END_CHUNK_VALID]
     print(f"Train chunks: {len(train_chunks)}")
     print(f"Val chunks:   {len(val_chunks)}")
 
     # ---------------------------------------------
     # 2. Build TF datasets
     # ---------------------------------------------
-    train_dataset = build_tf_dataset_chunks(train_chunks, batch_size=config.CHUNK_BATCH_SIZE)
-    val_dataset   = build_tf_dataset_chunks(val_chunks,   batch_size=config.CHUNK_BATCH_SIZE)
+    train_dataset = build_tf_dataset_chunks(train_chunks, batch_size=config_ratt.CHUNK_BATCH_SIZE)
+    val_dataset   = build_tf_dataset_chunks(val_chunks,   batch_size=config_ratt.CHUNK_BATCH_SIZE)
 
     # ---------------------------------------------
     # 3. Build models
     # ---------------------------------------------
     
     # RAG head (trainable)
-    rag_head = RAGHead(hidden_size=768, num_queries=config.NUM_QUERIES, num_layers=config.NUM_LAYERS,num_heads=config.NUM_HEADS)
+    ratt_head = RATTHead(hidden_size=768, num_queries=config_ratt.NUM_QUERIES, num_layers=config_ratt.NUM_LAYERS,num_heads=config_ratt.NUM_HEADS)
 
     proj_head = ProjectionHead(input_dim=2304, hidden_dim=768*8, proj_dim=768)
 
@@ -462,16 +468,16 @@ if __name__ == "__main__":
     # Retrieval DB
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
-        name=config.CHROMADB_COLLECTION,
+        name=config_ratt.CHROMADB_COLLECTION,
         metadata={"hnsw:space": "cosine"}
     )
 
     
-    retriever = FrameRetriever(collection, top_k=config.TOP_K, search_k=config.SEARCH_K)
+    retriever = RattChunkRetriever(collection, top_k=config_ratt.TOP_K, search_k=config_ratt.SEARCH_K)
 
     dummy_chunk = tf.zeros((1, 768))
     dummy_retrieved = tf.zeros((1, 10, 768))
-    _ = rag_head(dummy_chunk, dummy_retrieved, training=False)
+    _ = ratt_head(dummy_chunk, dummy_retrieved, training=False)
     # rag_head.save_weights(config.RAG_WEIGHTS)
     # rag_head.load_weights('rag_head_5vid_new_v2.weights.h5')
 
@@ -483,7 +489,7 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 4. Optimizer / loss
     # ---------------------------------------------
-    optimizer = tf.keras.optimizers.Adam(config.PHASE_1_LEARNING_RATE)
+    optimizer = tf.keras.optimizers.Adam(config_ratt.PHASE_1_LEARNING_RATE)
     # optimizer = torch.optim.AdamW([
     #     {"params": hf_vit.encoder.layer[-1].parameters(), "lr": 1e-6},
     #     {"params": hf_vit.layernorm.parameters(), "lr": 1e-6},
@@ -495,16 +501,16 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 5. Training loop
     # ---------------------------------------------
-    EPOCHS = config.EPOCHS
+    EPOCHS = config_ratt.EPOCHS
 
     # lower lr to 1e-5 and make contrastive coefficient 0.1 at epoch 24 (rebuild every 6)
     # stopped at epoch 39 (so if you were to start this run again, start it at epoch 40)
     # results look great, val loss (old treshold > 0.5 loss) is 0.2171, train loss is 0.2649, train acc is 0.75
-    accum_steps = config.ACCUM_BATCH_SIZE  # effective batch = physical batch * accum_steps
-    accum = Accumulator(rag_head, proj_head, accum_steps)
+    accum_steps = config_ratt.ACCUM_BATCH_SIZE  # effective batch = physical batch * accum_steps
+    accum = Accumulator(ratt_head, proj_head, accum_steps)
 
     contrastive_coefficient = 0.0
-    for epoch in range(2,EPOCHS+1):
+    for epoch in range(1,EPOCHS+1):
         # if(epoch < 5):
         #     continue
         print(f"\n================= EPOCH {epoch} =================")
@@ -516,15 +522,15 @@ if __name__ == "__main__":
         
         
         if(epoch >= int(EPOCHS/2)+1): 
-            optimizer.learning_rate.assign(config.PHASE_2_LEARNING_RATE)
+            optimizer.learning_rate.assign(config_ratt.PHASE_2_LEARNING_RATE)
             # contrastive_coefficient = config.PHASE_2_CONTRASTIVE_LOSS
         else: 
-            optimizer.learning_rate.assign(config.PHASE_1_LEARNING_RATE)
+            optimizer.learning_rate.assign(config_ratt.PHASE_1_LEARNING_RATE)
             # contrastive_coefficient = config.PHASE_1_CONTRASTIVE_LOSS
         
         for frames_batch, metadata_batch, labels_batch in train_dataset:
             curloss, curacc = train_step(
-                rag_head, proj_head, retriever,
+                ratt_head, proj_head, retriever,
                 optimizer, bce,
                 frames_batch, metadata_batch, labels_batch,
                 accum,contrastive_coefficient
@@ -533,7 +539,7 @@ if __name__ == "__main__":
             batch_counter += 1
             losses.append(curloss)
             accs.append(curacc)
-            if(batch_counter % config.PRINT_EVERY == 0):
+            if(batch_counter % config_ratt.PRINT_EVERY == 0):
                 print(f"EPOCH {epoch} BATCH {batch_counter} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f}")
         print(f"EPOCH {epoch} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f}")
 
@@ -544,14 +550,14 @@ if __name__ == "__main__":
             float(w.std())
         )
 
-        proj_head.save_weights(config.PROJ_WEIGHTS)
-        rag_head.save_weights(config.RAG_WEIGHTS)
+        proj_head.save_weights(config_ratt.PROJ_WEIGHTS)
+        ratt_head.save_weights(config_ratt.RATT_WEIGHTS)
         # validation at end of every epoch
-        evaluate(val_dataset, rag_head, proj_head, retriever, bce)
+        evaluate(val_dataset, ratt_head, proj_head, retriever, bce)
         # rebuild_db()
-        if(epoch % config.ADJUST_CONTRASTIVE_LOSS_EVERY == 0 and epoch >= config.ADJUST_CONTRASTIVE_LOSS_EVERY): 
-            contrastive_coefficient += config.INCREMENT_CONTRASTIVE_LOSS_BY
-        if((epoch) % config.REBUILD_EVERY == 0 and (epoch) >= config.REBUILD_EVERY): 
+        if(epoch % config_ratt.ADJUST_CONTRASTIVE_LOSS_EVERY == 0 and epoch >= config_ratt.ADJUST_CONTRASTIVE_LOSS_EVERY): 
+            contrastive_coefficient += config_ratt.INCREMENT_CONTRASTIVE_LOSS_BY
+        if((epoch) % config_ratt.REBUILD_EVERY == 0 and (epoch) >= config_ratt.REBUILD_EVERY): 
             rebuild_db()
 # epoch 1
 # VAL loss: 0.5056, VAL acc: 0.7833
