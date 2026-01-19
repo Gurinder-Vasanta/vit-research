@@ -11,7 +11,13 @@ import tensorflow.keras as tf_keras
 # 1. Load labels + build samples
 # -------------------------
 
-def load_samples(train_vids, stride = 1):
+def comparator(fname):
+    splitted = fname.split('_')
+    vid_num = int(splitted[0][3::])
+    frame_num = int(splitted[2].split('.')[0])
+    return (vid_num, frame_num)
+
+def load_samples(train_vids, stride = 1, max_clips = 10):
     already_labelled = pd.read_csv("clips_label.csv")
     
     samples = []
@@ -20,12 +26,13 @@ def load_samples(train_vids, stride = 1):
         # clip_root = f"/home/.../clips_finalized_{vid}"
 
         clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}'
-        clips = sorted(os.listdir(clip_root))
-
+        clips = sorted(os.listdir(clip_root),key=comparator) 
+    
+        clips = clips[0:max_clips]
         for clip in clips:
             clip_path = os.path.join(clip_root, clip)
-            frames = sorted(os.listdir(clip_path))
-
+            frames = sorted(os.listdir(clip_path),key=comparator) 
+            
             # find label
             label_row = already_labelled[
                 already_labelled["clip_path"] == clip_path
