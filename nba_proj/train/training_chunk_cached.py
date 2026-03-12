@@ -20,6 +20,19 @@ import torch
 
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import f1_score
+import pickle
+
+def save_retrieval_cache(cache, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[CACHE] Saved retrieval cache to {path}")
+
+def load_retrieval_cache(path):
+    with open(path, "rb") as f:
+        cache = pickle.load(f)
+    print(f"[CACHE] Loaded retrieval cache from {path}")
+    return cache
 
 # print("TRAIN CWD:", os.getcwd())
 # print("TRAIN chroma path:", os.path.abspath("./chroma_store"))
@@ -334,13 +347,23 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
 
         # if(disable_cls == True): 
         #     chunk_embs = tf.zeros_like(chunk_embs)
-        logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=disable_cls, training=True)
+        # logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=disable_cls, training=True)
         
-        print()
-        print('-------- raw logits ----------')
-        print(logits)
-        print('---------------- end logits ----------------')
-        print()
+        class_logit, relevance_logit, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=disable_cls, training=True)
+
+        # print()
+        # print('-------- raw class then relevance logits ----------')
+        # print(class_logit)
+        # print()
+        # print()
+        # print(relevance_logit)
+        # print()
+        # print()
+        relevance = 0 #tf.nn.sigmoid(relevance_logit)
+        # print(relevance)
+        # print('---------------- end logits ----------------')
+        # print()
+        
         cls_to_ret = attn_scores[-1][:, :, 0, 1:]
         importance = tf.reduce_mean(cls_to_ret, axis=1)
         # print(importance)
@@ -358,8 +381,20 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         #     print('----------------------------------------------- start attention score')
         #     print(importance)
         #     print('-------------------------------------------------------------- end attn score')
-        loss_cls = loss_fn(labels, logits)
-        # loss = loss_fn(labels, logits)
+        # loss_cls = loss_fn(labels, logits)
+        labels = tf.cast(labels, tf.float32)
+        labels = tf.reshape(labels, (-1, 1))
+
+        chunk_loss = tf.keras.losses.binary_crossentropy(
+            labels,
+            class_logit,
+            from_logits=True
+        )
+
+        
+        # loss_cls = tf.reduce_mean(relevance * chunk_loss)
+        # loss_cls = loss_fn(labels, logits)
+        loss_cls = loss_fn(labels, class_logit)
         
 
         z = chunk_embs                           # (B, D)
@@ -376,6 +411,10 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
             from_logits=True
         )
         loss_ibn = tf.reduce_mean(loss_ibn)
+        
+        loss_entropy_diff = -tf.reduce_mean(
+            relevance * tf.math.log(relevance + 1e-8)
+        )
 
         # contrastive_coefficient = 0
         # combine them
@@ -393,7 +432,7 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
     # print(labels)
     # print(logits)
     # input('stop')
-    acc = compute_accuracy(labels, logits)
+    acc = compute_accuracy(labels, class_logit)
     # true_acc = compute_true_accuracy(labels, logits)
     # print(acc)
     # print(true_acc)
@@ -460,10 +499,25 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
         retrieved = get_retrieval_cache(B,metadata,retrieval_cache)
         # ---- new retriever end -----
 
-        logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
+        # logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
 
-        all_val_logits.append(logits.numpy())
-        all_val_labels.append(labels.numpy())
+        class_logit, relevance_logit, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
+
+        # print()
+        # print('-------- raw class then relevance logits ----------')
+        # print(class_logit)
+        # print()
+        # print()
+        # print(relevance_logit)
+        # print()
+        # print()
+        relevance = 0#tf.nn.sigmoid(relevance_logit)
+        # print(relevance)
+        # print('---------------- end logits ----------------')
+        # print()
+
+        all_val_logits.append(class_logit.numpy())
+        all_val_labels.append(class_logit.numpy())
 
         # print()
         # print('eval logits')
@@ -538,8 +592,28 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
         # print("Combined feature similarity:", float(cos_comb))
         # print("--------------------------------------------------")
         
-        loss = loss_fn(labels, logits)
-        acc = compute_accuracy(labels, logits)
+        # loss = loss_fn(labels, logits)
+
+        # relevance = tf.nn.sigmoid(relevance_logit)
+
+        labels = tf.cast(labels, tf.float32)
+        labels = tf.reshape(labels, (-1, 1))
+
+        chunk_loss = tf.keras.losses.binary_crossentropy(
+            labels,
+            class_logit,
+            from_logits=True
+        )
+
+        # loss = tf.reduce_mean(relevance * chunk_loss)
+
+        loss_entropy = -tf.reduce_mean(
+            relevance * tf.math.log(relevance + 1e-8)
+        )
+
+        loss = loss_fn(labels, class_logit)
+        # loss = loss + 0.01 * loss_entropy
+        acc = compute_accuracy(labels, class_logit)
 
         print(f"val batch loss: {loss:.4f}, val batch acc: {acc:.4f}")
         print()
@@ -579,28 +653,37 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 1. Load samples -> chunkify
     # ---------------------------------------------
-    train_vids = config.VIDS_TO_USE
-    samples = load_samples(train_vids,stride=1)
-    chunk_samples = build_chunks(samples, chunk_size=12)
+    train_vids = config.TRAIN_VIDS
+    train_samples = load_samples(train_vids,stride=1)
+    train_chunk_samples = build_chunks(train_samples, chunk_size=12)
 
-    random.shuffle(chunk_samples)
+    test_vids = config.TEST_VIDS
+    test_samples = load_samples(test_vids,stride=1)
+    test_chunk_samples = build_chunks(test_samples, chunk_size=12)
+
+    random.shuffle(train_samples)
+    random.shuffle(test_samples)
 
     # split 95/5
-    n = len(chunk_samples)
-    print(n)
-    train_chunks = chunk_samples[:int(0.95*n)]
-    val_chunks = chunk_samples[int(0.95*n):]
+    # n = len(chunk_samples)
+    print(len(train_chunk_samples))
+    print(len(test_chunk_samples))
+    # train_chunks = chunk_samples[:int(0.95*n)]
+    # val_chunks = chunk_samples[int(0.95*n):]
 
     # train_chunks = chunk_samples[config.START_CHUNK_TRAIN:config.END_CHUNK_TRAIN] #was 2000
     # val_chunks = chunk_samples[config.START_CHUNK_VALID:config.END_CHUNK_VALID]
-    print(f"Train chunks: {len(train_chunks)}")
-    print(f"Val chunks:   {len(val_chunks)}")
+    print(f"Train chunks: {len(train_chunk_samples)}")
+    print(f"Val chunks:   {len(test_chunk_samples)}")
 
     # ---------------------------------------------
     # 2. Build TF datasets
     # ---------------------------------------------
-    train_dataset = build_tf_dataset_chunks(train_chunks, batch_size=config.CHUNK_BATCH_SIZE)
-    val_dataset   = build_tf_dataset_chunks(val_chunks,   batch_size=config.CHUNK_BATCH_SIZE)
+    train_dataset = build_tf_dataset_chunks(train_chunk_samples, batch_size=config.CHUNK_BATCH_SIZE, training=True)
+    val_dataset   = build_tf_dataset_chunks(test_chunk_samples,   batch_size=config.CHUNK_BATCH_SIZE, training=False)
+
+    print(f"Train dataset: {(train_dataset)}")
+    print(f"Val dataset:   {(val_dataset)}")
 
     # ---------------------------------------------
     # 3. Build models
@@ -680,11 +763,23 @@ if __name__ == "__main__":
         if(epoch >= 6):
             print_attention = True
         
-        retrieval_cache = build_retrieval_cache(
-            collection,
-            train_chunks,
-            C=config.SEARCH_K
-        )
+        # retrieval_cache = build_retrieval_cache(
+        #     collection,
+        #     train_chunks,
+        #     C=config.SEARCH_K
+        # )
+
+        
+
+        if os.path.exists(config.CACHE_PATH):
+            retrieval_cache = load_retrieval_cache(config.CACHE_PATH)
+        else:
+            retrieval_cache = build_retrieval_cache(
+                collection,
+                train_chunk_samples,
+                C=config.SEARCH_K
+            )
+            save_retrieval_cache(retrieval_cache, config.CACHE_PATH)
 
         for frames_batch, metadata_batch, labels_batch in train_dataset:
             curloss, curacc = train_step(
@@ -716,4 +811,17 @@ if __name__ == "__main__":
         if(epoch % config.ADJUST_CONTRASTIVE_LOSS_EVERY == 0 and epoch >= config.ADJUST_CONTRASTIVE_LOSS_EVERY): 
             contrastive_coefficient += config.INCREMENT_CONTRASTIVE_LOSS_BY
         if((epoch) % config.REBUILD_EVERY == 0 and (epoch) >= config.REBUILD_EVERY): 
-            rebuild_db()
+            # rebuild_db()
+            client = PersistentClient(path="./chroma_store")
+            collection = client.get_or_create_collection(
+                name=config.CHROMADB_COLLECTION,
+                metadata={"hnsw:space": "cosine"}
+            )
+            retriever = RattChunkRetriever(collection, top_k=config.TOP_K, search_k=config.SEARCH_K)
+
+            retrieval_cache = build_retrieval_cache(
+                collection,
+                train_chunk_samples,
+                C=config.SEARCH_K
+            )
+            save_retrieval_cache(retrieval_cache, config.CACHE_PATH)
