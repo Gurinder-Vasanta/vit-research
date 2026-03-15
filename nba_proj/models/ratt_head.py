@@ -33,11 +33,22 @@ class RATTHead(tf_keras.Model):
 
     self.norm = layers.LayerNormalization(epsilon=1e-6)
 
-    self.classifier = tf.keras.Sequential([
+    # self.classifier = tf.keras.Sequential([
+    #     layers.Dense(256, activation='relu'),
+    #     layers.Dropout(0.2),
+    #     layers.Dense(1)
+    # ])
+
+    self.class_head = tf.keras.Sequential([
         layers.Dense(256, activation='relu'),
         layers.Dropout(0.2),
-        layers.Dense(1)
+        layers.Dense(1)  # class logit
     ])
+
+    # self.relevance_head = tf.keras.Sequential([
+    #     layers.Dense(128, activation='relu'),
+    #     layers.Dense(1)  # relevance logit
+    # ])
 
     self.cls_type = self.add_weight(
         shape=(1, 1, hidden_size),
@@ -119,13 +130,23 @@ class RATTHead(tf_keras.Model):
 
     # fused = tf.reduce_sum(importance[:, :, None] * x, axis=1)
 
-    fused = x[:, 0, :]
+    # fused = x[:, 0, :]
 
-    # fused = tf.reduce_mean(x, axis=1)   # pool
+    fused = tf.reduce_mean(x, axis=1)   # pool
 
-    logits = self.classifier(fused,training=training)
+    # logits = self.classifier(fused,training=training)
 
-    return logits, fused, attention_scores_all
+    # return logits, fused, attention_scores_all
+    class_logit = self.class_head(fused, training=training)
+    # relevance_logit = self.relevance_head(fused, training=training)
+
+    relevance_logit = None
+    # return class_logit, relevance_logit, fused, attention_scores_all
+    return class_logit, fused, attention_scores_all
+
+
+
+
   
 #   def call(self, cls_embeddings, retrieved_embeddings, disable_cls=True, training=False, use_retrieval=True):
 #     """
