@@ -124,15 +124,27 @@ class RATTHead(tf_keras.Model):
     x = self.norm(x)
 
     attn = attention_scores_all[-1]
+    cls_attn = tf.reduce_mean(attn[:, :, 0, :], axis=1)
 
+    # for i in range(min(3, cls_attn.shape[0])):
+    #     top = tf.argsort(cls_attn[i], direction="DESCENDING")
+    #     vals = tf.gather(cls_attn[i], top)
+
+    #     print(f"\nSample {i}")
+    #     for t, v in zip(top.numpy(), vals.numpy()):
+    #         name = "CLS" if t == 0 else f"RET{t-1}"
+    #         print(f"{name}: {v:.5f}")
+
+    # print(cls_attn)
+    # print(attn[:, :, 0, :])
     # importance = tf.reduce_mean(attn, axis=[1,2])
     # importance = tf.nn.softmax(importance, axis=-1)
 
     # fused = tf.reduce_sum(importance[:, :, None] * x, axis=1)
 
-    # fused = x[:, 0, :]
+    fused = x[:, 0, :]
 
-    fused = tf.reduce_mean(x, axis=1)   # pool
+    # fused = tf.reduce_mean(x, axis=1)   # pool
 
     # logits = self.classifier(fused,training=training)
 
@@ -141,8 +153,8 @@ class RATTHead(tf_keras.Model):
     # relevance_logit = self.relevance_head(fused, training=training)
 
     relevance_logit = None
-    # return class_logit, relevance_logit, fused, attention_scores_all
-    return class_logit, fused, attention_scores_all
+    return class_logit, relevance_logit, fused, attention_scores_all
+    # return class_logit, fused, attention_scores_all
 
 
 
