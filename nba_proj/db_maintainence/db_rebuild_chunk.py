@@ -175,7 +175,7 @@ def frame_index_encoding(idx, total_frames):
 client = PersistentClient(path="./chroma_store")
 # chromadb hnsw metadata keys; search this up and go to the ai overview
 ratt_db = client.get_or_create_collection(
-    name = 'ratt_db',
+    name = config_chunks.CHROMADB_COLLECTION,
     # name = 'rich_embeddings_7_vids_bs4_cls_rag_temp_12_epochs_rebuild',
     # name='rich_embeddings_7_vids_bs4_cls_rag_12_epochs_rebuild',
     metadata={"hnsw:space":"cosine",
@@ -223,22 +223,22 @@ def rebuild_db():
         frame_embs = tf.reshape(frames_np, (B, T, 768))
 
         # should actually be this: 
-        # deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
+        deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
         
-        # mean = tf.reduce_mean(frame_embs, axis=1)
-        # mean_deltas = tf.reduce_mean(deltas, axis=1)
-        # std_deltas = tf.math.reduce_std(deltas, axis=1)
+        mean = tf.reduce_mean(frame_embs, axis=1)
+        mean_deltas = tf.reduce_mean(deltas, axis=1)
+        std_deltas = tf.math.reduce_std(deltas, axis=1)
 
-        # raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
+        raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
         # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
 
-        thirds = tf.split(frame_embs, 3, axis=1)
+        # thirds = tf.split(frame_embs, 3, axis=1)
 
-        early = tf.reduce_mean(thirds[0], axis=1)
-        mid   = tf.reduce_mean(thirds[1], axis=1)
-        late  = tf.reduce_mean(thirds[2], axis=1)
+        # early = tf.reduce_mean(thirds[0], axis=1)
+        # mid   = tf.reduce_mean(thirds[1], axis=1)
+        # late  = tf.reduce_mean(thirds[2], axis=1)
 
-        raw_chunk = tf.concat([early, mid, late], axis=-1)
+        # raw_chunk = tf.concat([early, mid, late], axis=-1)
 
         projected = projector(tf.convert_to_tensor(raw_chunk, dtype=tf.float32)).numpy()
 
@@ -251,6 +251,7 @@ def rebuild_db():
             "vid_num": int(metadata_batch["vid"][0]),
             "clip_num": int(metadata_batch["clip"][0]),
             "side": metadata_batch["side"][0].numpy().decode(),
+            'label': int(metadata_batch['label'][0]),
             "t_center": float(metadata_batch["t_center"][0]),
             "t_width": float(metadata_batch["t_width"][0]),
         }
