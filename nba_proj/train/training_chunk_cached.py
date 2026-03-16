@@ -89,58 +89,290 @@ def embed_rep_chunk(rep):
 
     return mean.astype(np.float32)
 
-def build_retrieval_cache(collection, all_chunks, C=300):
+from collections import Counter, defaultdict
+
+def build_retrieval_cache(
+    collection,
+    all_chunks,
+    C=20,
+    query_mult=100,
+    max_per_video=100,  # 10
+    max_global_appearances=5,
+    min_time_gap=0.05,   # 0.1
+):
     cache = {}
 
-    rep_chunks = {}
+    label_lookup = {}
+    for c in all_chunks:
+        key = make_key(c["vid"], c["side"], c["t_center"])
+        # print(key)
+        label_lookup[key] = int(c["label"])
+    
+
+    # group all chunks by (side, coarse_time_bin)
+    bin_chunks = defaultdict(list)
     for c in all_chunks:
         key = (c["side"], coarse_time_bin(c["t_center"]))
-        if key not in rep_chunks:
-            rep_chunks[key] = c
+        bin_chunks[key].append(c)
 
-    print(f"[CACHE] Building retrieval cache for {len(rep_chunks)} bins")
+    print(f"[CACHE] Building retrieval cache for {len(bin_chunks)} bins")
 
-    for (side, bin_id), rep in rep_chunks.items():
+    total_count = collection.count()
+    global_counts = Counter()
+# sig = (vid, side, round(t_center, 4))
+    rep_items = list(bin_chunks.items())
+    random.shuffle(rep_items)
+
+    # soft penalty for globally overused chunks
+    lambda_global = 0.5
+
+    # number of anchors to use per bin
+    num_anchors_per_bin = 3
+
+    nums = []
+    for s in config.TRAIN_VIDS:
+        nums.append(int(s.split('vid')[1]))
+
+    for (side, bin_id), chunks_in_bin in rep_items:
         start = time.perf_counter()
 
-        # ---- FIX: compute anchor embedding ----
-        anchor = embed_rep_chunk(rep)  # (768,)
+        # -----------------------------
+        # choose up to 3 anchors per bin
+        # prefer anchors from different videos
+        # -----------------------------
+        chunks_shuf = list(chunks_in_bin)
+        random.shuffle(chunks_shuf)
+
+        by_vid = defaultdict(list)
+        for c in chunks_shuf:
+            by_vid[int(c["vid"])].append(c)
+
+        candidate_vids = list(by_vid.keys())
+        random.shuffle(candidate_vids)
+
+        anchors = []
+
+        # first pass: one per distinct video
+        for vid in candidate_vids:
+            if len(anchors) >= num_anchors_per_bin:
+                break
+            anchors.append(by_vid[vid][0])
+
+        # second pass: fill remaining from leftover chunks if needed
+        if len(anchors) < num_anchors_per_bin:
+            used_ids = set(id(a) for a in anchors)
+            for c in chunks_shuf:
+                if len(anchors) >= num_anchors_per_bin:
+                    break
+                if id(c) not in used_ids:
+                    anchors.append(c)
+                    used_ids.add(id(c))
+
+        # fallback: if somehow no anchors, create empty cache entry
+        if len(anchors) == 0:
+            cache[(side, bin_id)] = {
+                "embeddings": np.zeros((0, 768), dtype=np.float32),
+                "vid": np.zeros((0,), dtype=np.int32),
+                "side": np.asarray([], dtype=object),
+                "t_center": np.zeros((0,), dtype=np.float32),
+                "label": np.zeros((0,), dtype=np.int32),
+            }
+            print(f"[CACHE] ({side}, {bin_id}) missing=0/0")
+            print(
+                f"[CACHE] ({side}, {bin_id}) "
+                f"raw=0 kept=0 time={time.perf_counter() - start:.2f}s"
+            )
+            continue
+
+        anchor_embs = [embed_rep_chunk(a).tolist() for a in anchors]
+        raw_n = min(query_mult * C, total_count)
 
         result = collection.query(
-            query_embeddings=[anchor.tolist()],
-            n_results=C,
+            query_embeddings=anchor_embs,
+            n_results=raw_n,
             where={
-                "side": side,
+                "$and": [
+                    {"side": {"$eq": side}},
+                    {"vid_num": {"$in": nums}}
+                ]
             },
-            include=["embeddings", "metadatas"]
+            include=["embeddings", "metadatas", "distances"]
         )
+        # print(anchor_embs[0])
+        # input(result)
 
-        embs = np.asarray(result["embeddings"][0], dtype=np.float32)
-        metas = result["metadatas"][0]
+        # -----------------------------------------
+        # merge candidates across all anchors
+        # keep best score per unique chunk signature
+        # -----------------------------------------
+        merged = {}
+
+        n_queries = len(anchor_embs)
+        for q_idx in range(n_queries):
+            raw_embs = np.asarray(result["embeddings"][q_idx], dtype=np.float32)
+            raw_metas = result["metadatas"][q_idx]
+            raw_dists = result.get("distances", [[None] * len(raw_metas) for _ in range(n_queries)])[q_idx]
+
+            for rank, (emb, m, dist) in enumerate(zip(raw_embs, raw_metas, raw_dists)):
+                vid = int(m["vid_num"])
+                t_center = float(m["t_center"])
+                sig = (vid, side, round(t_center, 5))
+
+                lookup_key = make_key(vid, side, t_center)
+                lbl = label_lookup.get(lookup_key, -1)
+
+                if dist is None:
+                    base_score = -float(rank)
+                else:
+                    base_score = -float(dist)
+
+                # keep the best score seen for this candidate across all anchors
+                prev = merged.get(sig)
+                if prev is None or base_score > prev["base_score"]:
+                    merged[sig] = {
+                        "emb": emb,
+                        "vid": vid,
+                        "side": side,
+                        "t_center": t_center,
+                        "sig": sig,
+                        "label": lbl,
+                        "base_score": base_score,
+                    }
+
+        candidates = list(merged.values())
+        candidates.sort(key=lambda x: x["base_score"], reverse=True)
+
+        kept_embs = []
+        kept_vids = []
+        kept_sides = []
+        kept_tcenters = []
+        kept_labels = []
+
+        selected_sigs = set()
+        video_counts = {}
+        video_times = defaultdict(list)
+
+        # greedy selection from merged candidate pool
+        while len(kept_embs) < C:
+            best_idx = None
+            best_score = -1e18
+
+            for i, cand in enumerate(candidates):
+                sig = cand["sig"]
+                vid = cand["vid"]
+                t_center = cand["t_center"]
+
+                if sig in selected_sigs:
+                    continue
+
+                if video_counts.get(vid, 0) >= max_per_video:
+                    continue
+
+                if global_counts[sig] >= max_global_appearances:
+                    continue
+
+                if any(abs(t_center - prev_t) < min_time_gap for prev_t in video_times[vid]):
+                    continue
+
+                adjusted_score = cand["base_score"] - lambda_global * global_counts[sig]
+
+                if adjusted_score > best_score:
+                    best_score = adjusted_score
+                    best_idx = i
+
+            if best_idx is None:
+                break
+
+            cand = candidates[best_idx]
+            sig = cand["sig"]
+            vid = cand["vid"]
+            t_center = cand["t_center"]
+            lbl = cand["label"]
+
+            selected_sigs.add(sig)
+            video_counts[vid] = video_counts.get(vid, 0) + 1
+            video_times[vid].append(t_center)
+            global_counts[sig] += 1
+
+            kept_embs.append(cand["emb"])
+            kept_vids.append(vid)
+            kept_sides.append(side)
+            kept_tcenters.append(t_center)
+            kept_labels.append(lbl)
+
+            if lbl == -1:
+                print("[MISS]", make_key(vid, side, t_center), "raw_t_center=", t_center)
+
+        num_missing = int(np.sum(np.array(kept_labels) == -1))
+        print(f"[CACHE] ({side}, {bin_id}) missing={num_missing}/{len(kept_labels)}")
+
+        if len(candidates) > 0:
+            emb_dim = candidates[0]["emb"].shape[0]
+        else:
+            emb_dim = 768
+
+        kept_embs = np.asarray(kept_embs, dtype=np.float32).reshape(-1, emb_dim)
+        kept_vids = np.asarray(kept_vids, dtype=np.int32)
+        kept_sides = np.asarray(kept_sides)
+        kept_tcenters = np.asarray(kept_tcenters, dtype=np.float32)
+        kept_labels = np.asarray(kept_labels, dtype=np.int32)
 
         cache[(side, bin_id)] = {
-            "embeddings": embs,
-            "vid": np.array([m["vid_num"] for m in metas]),
-            "t_center": np.array([m["t_center"] for m in metas]),
+            "embeddings": kept_embs,
+            "vid": kept_vids,
+            "side": kept_sides,
+            "t_center": kept_tcenters,
+            "label": kept_labels,
         }
 
+        # input(cache[(side, bin_id)])
         print(
             f"[CACHE] ({side}, {bin_id}) "
-            f"size={len(embs)} "
+            f"raw={len(candidates)} kept={len(kept_vids)} "
             f"time={time.perf_counter() - start:.2f}s"
-            f"rep={metas}"
         )
+
+    print("Top global chunk frequencies:")
+    for sig, cnt in global_counts.most_common(30):
+        print(sig, cnt)
 
     return cache
 
 
+USE_GRAYSCALE = False
+
+def to_grayscale_3ch(frames_np):
+    """
+    frames_np: (N, H, W, 3)
+    returns:   (N, H, W, 3) grayscale replicated across channels
+    """
+    # RGB -> grayscale using standard luminance weights
+    gray = (
+        0.2989 * frames_np[..., 0] +
+        0.5870 * frames_np[..., 1] +
+        0.1140 * frames_np[..., 2]
+    )
+    gray = np.clip(gray, 0, 255).astype(np.uint8)
+    gray_3ch = np.stack([gray, gray, gray], axis=-1)
+    return gray_3ch
 
 def hf_vit_embed_batch(frames_np):
     """
     frames_np: (N, 432, 768, 3) uint8 or float32
     Returns (N, 768) numpy embeddings (L2 normalized)
     """
-    frames_np = frames_np.astype(np.float32)
+    # frames_np = frames_np.astype(np.float32)
+
+    # frames_np = frames_np.astype(np.float32)
+
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np, 0, 255).astype(np.uint8)
+
+    if USE_GRAYSCALE:
+        frames_np = to_grayscale_3ch(frames_np)
+    else: 
+        frames_np = frames_np.astype(np.float32)
+        
     frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
     with torch.no_grad():
         inputs = hf_processor(images=frames_list, return_tensors="pt").to(device)
@@ -249,8 +481,55 @@ class Accumulator:
             self.gradients = [tf.zeros_like(v) for v in self.vars]
             self.step = 0
 
-def get_retrieval_cache(B,metadata,retrieval_cache):
+# def get_retrieval_cache(B,metadata,retrieval_cache):
+#     retrieved = []
+#     retrieved_labels = []
+
+#     for i in range(B):
+#         side = metadata["side"][i].numpy().decode()
+#         t_center = float(metadata["t_center"][i].numpy())
+#         t_width  = float(metadata["t_width"][i].numpy())
+#         vid      = int(metadata["vid"][i].numpy())
+
+#         bin_id = coarse_time_bin(t_center)
+#         pool = retrieval_cache[(side, bin_id)]
+
+#         mask = (
+#             (pool["vid"] != vid) &
+#             (np.abs(pool["t_center"] - t_center) <= t_width / 2)
+#         )
+
+#         candidates = pool["embeddings"][mask]
+#         candidate_labels = pool["label"][mask]
+
+#         if len(candidates) >= config.TOP_K:
+#             candidates = candidates[:config.TOP_K]
+#             candidate_labels = candidate_labels[:config.TOP_K]
+#         else:
+#             pad = np.zeros(
+#                 (config.TOP_K - len(candidates), candidates.shape[1]),
+#                 dtype=np.float32
+#             )
+#             candidates = np.vstack([candidates, pad])
+
+#             pad_labels = np.zeros(config.TOP_K - len(candidate_labels))
+#             candidate_labels = np.concatenate([candidate_labels, pad_labels])
+
+#         retrieved.append(candidates)
+#         retrieved_labels.append(candidate_labels)
+
+#     retrieved = tf.nn.l2_normalize(
+#         tf.stop_gradient(tf.convert_to_tensor(np.stack(retrieved), tf.float32)),
+#         axis=2
+#     )
+
+#     retrieved_labels = np.stack(retrieved_labels)
+#     return retrieved, retrieved_labels
+
+def get_retrieval_cache(B, metadata, retrieval_cache, label_lookup):
     retrieved = []
+    retrieved_labels = []
+
     for i in range(B):
         side = metadata["side"][i].numpy().decode()
         t_center = float(metadata["t_center"][i].numpy())
@@ -260,31 +539,89 @@ def get_retrieval_cache(B,metadata,retrieval_cache):
         bin_id = coarse_time_bin(t_center)
         pool = retrieval_cache[(side, bin_id)]
 
-        mask = (
-            (pool["vid"] != vid) &
-            (np.abs(pool["t_center"] - t_center) <= t_width / 2)
-        )
+        mask = (pool["vid"] != vid)
+
+        # mask = (
+        #     (pool["vid"] != vid) &
+        #     (np.abs(pool["t_center"] - t_center) <= t_width / 2)
+        # )
 
         candidates = pool["embeddings"][mask]
+        cand_vids = pool["vid"][mask]
+        cand_tcenters = pool["t_center"][mask]
+
+        cand_labels = []
+        for rv, rt in zip(cand_vids, cand_tcenters):
+            key = make_key(rv, side, rt)
+            cand_labels.append(label_lookup.get(key, -1))  # -1 = missing
+
+        cand_labels = np.array(cand_labels, dtype=np.int32)
 
         if len(candidates) >= config.TOP_K:
             candidates = candidates[:config.TOP_K]
+            cand_labels = cand_labels[:config.TOP_K]
         else:
-            pad = np.zeros(
-                (config.TOP_K - len(candidates), candidates.shape[1]),
-                dtype=np.float32
-            )
-            candidates = np.vstack([candidates, pad])
+            emb_dim = candidates.shape[1] if len(candidates) > 0 else 768
+            pad_n = config.TOP_K - len(candidates)
+
+            if len(candidates) == 0:
+                candidates = np.zeros((config.TOP_K, emb_dim), dtype=np.float32)
+                cand_labels = np.full((config.TOP_K,), -1, dtype=np.int32)
+            else:
+                pad = np.zeros((pad_n, emb_dim), dtype=np.float32)
+                candidates = np.vstack([candidates, pad])
+
+                pad_labels = np.full((pad_n,), -1, dtype=np.int32)
+                cand_labels = np.concatenate([cand_labels, pad_labels])
 
         retrieved.append(candidates)
+        retrieved_labels.append(cand_labels)
 
     retrieved = tf.nn.l2_normalize(
         tf.stop_gradient(tf.convert_to_tensor(np.stack(retrieved), tf.float32)),
         axis=2
     )
-    return retrieved
+
+    retrieved_labels = np.stack(retrieved_labels)
+    return retrieved, retrieved_labels
+
+
+def supervised_contrastive_loss(z, labels, temperature=0.1):
+    """
+    z:      (B, D) L2-normalized embeddings
+    labels: (B,) int or float labels in {0,1}
+    """
+    labels = tf.reshape(tf.cast(labels, tf.int32), [-1])
+    sim = tf.matmul(z, z, transpose_b=True) / temperature   # (B, B)
+
+    # mask out self-comparisons
+    batch_size = tf.shape(z)[0]
+    self_mask = tf.eye(batch_size, dtype=tf.bool)
+
+    # positives = same label, not self
+    label_eq = tf.equal(labels[:, None], labels[None, :])
+    pos_mask = tf.logical_and(label_eq, tf.logical_not(self_mask))
+
+    # for numerical stability
+    sim_max = tf.reduce_max(sim, axis=1, keepdims=True)
+    sim = sim - sim_max
+
+    exp_sim = tf.exp(sim) * tf.cast(tf.logical_not(self_mask), tf.float32)
+    log_prob = sim - tf.math.log(tf.reduce_sum(exp_sim, axis=1, keepdims=True) + 1e-8)
+
+    pos_mask_f = tf.cast(pos_mask, tf.float32)
+    pos_count = tf.reduce_sum(pos_mask_f, axis=1)
+
+    # only average over anchors that have at least one positive
+    mean_log_prob_pos = tf.reduce_sum(pos_mask_f * log_prob, axis=1) / (pos_count + 1e-8)
+
+    valid = pos_count > 0
+    loss = -tf.reduce_mean(tf.boolean_mask(mean_log_prob_pos, valid))
+    return loss
+
+
 def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_fn,
-               frames, metadata, labels, accum,contrastive_coefficient, print_attention):
+               frames, metadata, labels, accum,contrastive_coefficient, print_attention,label_lookup):
 
     B = tf.shape(frames)[0]
     T = tf.shape(frames)[1]
@@ -336,7 +673,8 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         # ----- Retrieval (stop gradient) -----
         start = time.perf_counter()
 
-        retrieved = get_retrieval_cache(B,metadata,retrieval_cache)
+        retrieved, retrieved_labels = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
+        # retrieved = retriever(chunk_embs,metadata)
         
         end = time.perf_counter()
         # print(f'retrieval took: {end - start}')
@@ -365,7 +703,10 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         # print()
         
         cls_to_ret = attn_scores[-1][:, :, 0, 1:]
+        # print(cls_to_ret)
         importance = tf.reduce_mean(cls_to_ret, axis=1)
+
+        
         # print(importance)
 
         # doesnt affect learning: 
@@ -400,6 +741,9 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         z = chunk_embs                           # (B, D)
         z = tf.nn.l2_normalize(z, axis=1)
 
+        labels_flat = tf.reshape(tf.cast(labels, tf.int32), [-1])
+        loss_supcon = supervised_contrastive_loss(z, labels_flat, temperature=0.1)
+
         sim_matrix = tf.matmul(z, z, transpose_b=True)  # (B, B)
 
         batch_size = tf.shape(z)[0]
@@ -416,9 +760,60 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
             relevance * tf.math.log(relevance + 1e-8)
         )
 
+        # labels = labels.numpy().reshape(-1)
+        # agreement = (retrieved_labels == labels[:, None])
+
+        query_labels = labels.numpy().reshape(-1)   # (B,)
+        valid_mask = (retrieved_labels != -1)       # (B, K)
+
+        matches = (retrieved_labels == query_labels[:, None]) & valid_mask
+        agreement = matches.sum() / np.maximum(valid_mask.sum(), 1)
+
+        per_query_agreement = matches.sum(axis=1) / np.maximum(valid_mask.sum(axis=1), 1)
+        mean_agreement = per_query_agreement.mean()
+
+        # agreement = agreement.mean()
+
+        entropy = -tf.reduce_sum(
+            importance * tf.math.log(importance + 1e-8),
+            axis=1
+        )
+        print()
+        print("retrieval attention entropy:", tf.reduce_mean(entropy))
+
+        print(f'TRAIN MEAN agreement: {agreement.mean()} TRAIN PER QUERY MEAN agreement: {mean_agreement}')
+        
+        # (B, D)
+        q = chunk_embs
+
+        # (B, K, D)
+        r = retrieved
+
+        # cosine similarity to retrieved
+        sim_pos = tf.reduce_mean(
+            tf.reduce_sum(q[:, None, :] * r, axis=-1),
+            axis=1
+        )
+
+        # random negatives from batch
+        r_neg = tf.roll(r, shift=1, axis=0)
+
+        sim_neg = tf.reduce_mean(
+            tf.reduce_sum(q[:, None, :] * r_neg, axis=-1),
+            axis=1
+        )
+
+        gap = sim_pos - sim_neg
+        print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
+        print()
+
         # contrastive_coefficient = 0
         # combine them
-        loss = loss_cls + contrastive_coefficient * loss_contrast + 0.1 * loss_ibn +0.1 * loss_entropy       # λ = 0.1 to start
+        loss = (loss_cls 
+                + contrastive_coefficient * 1 * loss_contrast 
+                + 0.1 * 0 * loss_ibn 
+                + 0.1 * 0 * loss_entropy
+                + 0.1 * 0 * loss_supcon)       # λ = 0.1 to start
         # loss = loss_cls +  0.1 * loss_ibn  + 0.1 * loss_entropy      # λ = 0.1 to start
 
     # Get grads for BOTH heads
@@ -429,6 +824,7 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
     accum.accumulate(grads)
     accum.apply(optimizer)
 
+    # agreement = None
     # print(labels)
     # print(logits)
     # input('stop')
@@ -438,12 +834,12 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
     # print(true_acc)
     # input('stop')
     # print("loss:", float(loss), "acc:", float(acc))
-    return float(loss), float(acc)
+    return float(loss), float(acc), agreement
 
 # ---------------------------------------------------------
 # VALIDATION
 # ---------------------------------------------------------
-def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
+def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,label_lookup):
     losses = []
     accs = []
 
@@ -496,7 +892,9 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
         # retrieved_np = retriever(chunk_embs, metadata)
 
         # --- new retriever start ----
-        retrieved = get_retrieval_cache(B,metadata,retrieval_cache)
+        retrieved,retrieved_labels = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
+        
+        # retrieved = retriever(chunk_embs,metadata)
         # ---- new retriever end -----
 
         # logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
@@ -517,7 +915,7 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
         # print()
 
         all_val_logits.append(class_logit.numpy())
-        all_val_labels.append(class_logit.numpy())
+        all_val_labels.append(labels.numpy())
 
         # print()
         # print('eval logits')
@@ -530,6 +928,36 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
         r2 = retrieved[1]
 
 
+
+        # (B, D)
+        q = chunk_embs
+
+        # (B, K, D)
+        r = retrieved
+
+        # cosine similarity to retrieved
+        sim_pos = tf.reduce_mean(
+            tf.reduce_sum(q[:, None, :] * r, axis=-1),
+            axis=1
+        )
+
+        # random negatives from batch
+        r_neg = tf.roll(r, shift=1, axis=0)
+
+        sim_neg = tf.reduce_mean(
+            tf.reduce_sum(q[:, None, :] * r_neg, axis=-1),
+            axis=1
+        )
+
+        gap = sim_pos - sim_neg
+        print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
+
+        # entropy = -tf.reduce_sum(
+        #     importance * tf.math.log(importance + 1e-8),
+        #     axis=1
+        # )
+
+        # print("retrieval attention entropy:", tf.reduce_mean(entropy))
 
         # REAL cosine similarity (correct)
         cos_cls = -tf.keras.losses.cosine_similarity(chunk_embs[0], chunk_embs[1])
@@ -629,6 +1057,23 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
     # print("ROC-AUC:", roc_auc)
 
     val_preds = (val_probs > 0.5).astype(int)
+
+    # labels = labels.numpy().reshape(-1)
+    # agreement = (retrieved_labels == labels[:, None])
+    
+    query_labels = labels.numpy().reshape(-1)   # (B,)
+    valid_mask = (retrieved_labels != -1)       # (B, K)
+
+    matches = (retrieved_labels == query_labels[:, None]) & valid_mask
+    agreement = matches.sum() / np.maximum(valid_mask.sum(), 1)
+
+    per_query_agreement = matches.sum(axis=1) / np.maximum(valid_mask.sum(axis=1), 1)
+    mean_agreement = per_query_agreement.mean()
+
+    # agreement = agreement.mean()
+
+    
+    
     # f1_default = f1_score(all_val_labels, val_preds)
     # print("F1 @ 0.5 threshold:", f1_default)
 
@@ -642,9 +1087,13 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn):
     print(f'MEAN comb sim:  {np.mean(comb_sims):.4f}, MEAN retr sim: {np.mean(retr_sims):.4f}')
     print(f'STDEV comb sim:  {np.std(comb_sims):.4f}, STDEV retr sim: {np.std(retr_sims):.4f}')
     print(f'MEAN c1s:  {np.mean(c1s):.4f}, MEAN c2s: {np.mean(c2s):.4f}')
+    print(f'LABEL agreement: {agreement}, MEAN agreement: {agreement.mean()}')
+    print(f'TEST agreement: {matches[0]}\n MEAN agreement: {agreement.mean()}')
+    print(f'TEST PER QUERY agreement: {per_query_agreement}\n MEAN agreement: {mean_agreement}')
     print("----------------------------------------------------")
 
-
+def make_key(vid, side, t_center, ndigits=5):
+    return (int(vid), str(side), round(float(t_center), ndigits))
 # ---------------------------------------------------------
 # MAIN TRAINING LOOP
 # ---------------------------------------------------------
@@ -655,11 +1104,16 @@ if __name__ == "__main__":
     # ---------------------------------------------
     train_vids = config.TRAIN_VIDS
     train_samples = load_samples(train_vids,stride=1)
-    train_chunk_samples = build_chunks(train_samples, chunk_size=12)
+    train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
+
+    label_lookup = {}
+    for c in train_chunk_samples:
+        key = make_key(c["vid"], c["side"], c["t_center"])
+        label_lookup[key] = int(c["label"])
 
     test_vids = config.TEST_VIDS
     test_samples = load_samples(test_vids,stride=1)
-    test_chunk_samples = build_chunks(test_samples, chunk_size=12)
+    test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE)
 
     random.shuffle(train_samples)
     random.shuffle(test_samples)
@@ -673,6 +1127,9 @@ if __name__ == "__main__":
 
     # train_chunks = chunk_samples[config.START_CHUNK_TRAIN:config.END_CHUNK_TRAIN] #was 2000
     # val_chunks = chunk_samples[config.START_CHUNK_VALID:config.END_CHUNK_VALID]
+
+    # train_chunk_samples = train_chunk_samples[0:100]
+    # test_chunk_samples = test_chunk_samples[0:32]
     print(f"Train chunks: {len(train_chunk_samples)}")
     print(f"Val chunks:   {len(test_chunk_samples)}")
 
@@ -740,7 +1197,7 @@ if __name__ == "__main__":
     accum_steps = config.ACCUM_BATCH_SIZE  # effective batch = physical batch * accum_steps
     accum = Accumulator(ratt_head, proj_head, accum_steps)
 
-    contrastive_coefficient = 0.0
+    contrastive_coefficient = 0.1
     for epoch in range(1,EPOCHS+1):
         disable_cls = False
         # if(epoch < 5):
@@ -750,6 +1207,7 @@ if __name__ == "__main__":
         print(collection.count())
         losses = []
         accs = []
+        agrees = []
         batch_counter = 0
         
         
@@ -777,24 +1235,28 @@ if __name__ == "__main__":
             retrieval_cache = build_retrieval_cache(
                 collection,
                 train_chunk_samples,
-                C=config.SEARCH_K
+                C=config.BUILD_RET_C
             )
             save_retrieval_cache(retrieval_cache, config.CACHE_PATH)
 
+        # input('stop')
+        # retrieval_cache = None
         for frames_batch, metadata_batch, labels_batch in train_dataset:
-            curloss, curacc = train_step(
+            curloss, curacc, curagree = train_step(
                 ratt_head, proj_head, retriever, retrieval_cache,
                 optimizer, bce,
                 frames_batch, metadata_batch, labels_batch,
-                accum,contrastive_coefficient,print_attention
+                accum,contrastive_coefficient,print_attention,
+                label_lookup
             )
 
             batch_counter += 1
             losses.append(curloss)
             accs.append(curacc)
+            agrees.append(curagree)
             if(batch_counter % config.PRINT_EVERY == 0):
                 print(f"EPOCH {epoch} BATCH {batch_counter} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f}")
-        print(f"EPOCH {epoch} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f}")
+        print(f"EPOCH {epoch} TRAIN loss: {np.mean(losses):.4f}, EPOCH {epoch} TRAIN acc: {np.mean(accs):.4f} TRAIN agree: {np.mean(agrees):.4f}")
 
         w = proj_head.trainable_variables[0].numpy()
         print(
@@ -803,15 +1265,17 @@ if __name__ == "__main__":
             float(w.std())
         )
 
+        # CTRLF
         proj_head.save_weights(config.PROJ_WEIGHTS)
         ratt_head.save_weights(config.RATT_WEIGHTS)
         # validation at end of every epoch
-        evaluate(val_dataset, ratt_head, proj_head, retriever, retrieval_cache,bce)
+        evaluate(val_dataset, ratt_head, proj_head, retriever, retrieval_cache,bce,label_lookup)
         # rebuild_db()
         if(epoch % config.ADJUST_CONTRASTIVE_LOSS_EVERY == 0 and epoch >= config.ADJUST_CONTRASTIVE_LOSS_EVERY): 
             contrastive_coefficient += config.INCREMENT_CONTRASTIVE_LOSS_BY
         if((epoch) % config.REBUILD_EVERY == 0 and (epoch) >= config.REBUILD_EVERY): 
-            # rebuild_db()
+            # CTRLF
+            rebuild_db()
             client = PersistentClient(path="./chroma_store")
             collection = client.get_or_create_collection(
                 name=config.CHROMADB_COLLECTION,
@@ -819,9 +1283,10 @@ if __name__ == "__main__":
             )
             retriever = RattChunkRetriever(collection, top_k=config.TOP_K, search_k=config.SEARCH_K)
 
+            # CTRLF
             retrieval_cache = build_retrieval_cache(
                 collection,
                 train_chunk_samples,
-                C=config.SEARCH_K
+                C=config.BUILD_RET_C
             )
             save_retrieval_cache(retrieval_cache, config.CACHE_PATH)
