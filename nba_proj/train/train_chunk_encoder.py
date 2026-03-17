@@ -136,14 +136,14 @@ def main():
     dummy_frame_embs = tf.zeros((2, chunk_size, 768), dtype=tf.float32)
     _ = chunk_encoder(dummy_frame_embs, training=False)
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-5)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
     loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
     best_val_loss = float("inf")
     save_dir = "./chunk_encoder_ckpts"
     os.makedirs(save_dir, exist_ok=True)
 
-    epochs = 10
+    epochs = 100
 
     for epoch in range(epochs):
         print(f"\n===== EPOCH {epoch + 1}/{epochs} =====")
