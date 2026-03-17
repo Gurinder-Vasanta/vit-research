@@ -153,7 +153,7 @@ def frame_index_encoding(idx, total_frames):
 client = PersistentClient(path="./chroma_store")
 # chromadb hnsw metadata keys; search this up and go to the ai overview
 ratt_db = client.get_or_create_collection(
-    name = 'ratt_db_cached_30_clips_ordered_fixed_rebuild_w_labels',
+    name = 'ratt_db_cached_30_clips_ordered_fixed_rebuild_w_labels_24_chunk',
     # name = 'rich_embeddings_7_vids_bs4_cls_rag_temp_12_epochs_rebuild',
     # name='rich_embeddings_7_vids_bs4_cls_rag_12_epochs_rebuild',
     metadata={"hnsw:space":"cosine",
@@ -161,7 +161,7 @@ ratt_db = client.get_or_create_collection(
     )
 
 ratt_db_rel_cls = client.get_or_create_collection(
-    name = 'ratt_db_cached_30_clips_ordered_rel_cls_fixed_rebuild_w_labels',
+    name = 'ratt_db_cached_30_clips_ordered_rel_cls_fixed_rebuild_w_labels_24_chunk',
     # name = 'rich_embeddings_7_vids_bs4_cls_rag_temp_12_epochs_rebuild',
     # name='rich_embeddings_7_vids_bs4_cls_rag_12_epochs_rebuild',
     metadata={"hnsw:space":"cosine",
@@ -176,7 +176,7 @@ ratt_db_rel_cls.delete(where={"vid_num": {"$ne": 'vid0'}})
 vids = config_ratt.VIDS_TO_USE
 
 samples = dataset.load_samples(vids,stride=1,max_clips=config_ratt.NUM_CLIPS_PER_VID)
-chunk_samples = dataset.build_chunks(samples, chunk_size=12)
+chunk_samples = dataset.build_chunks(samples, chunk_size=24)
 pprint.pprint(chunk_samples[0])
 chunked_ds = dataset.build_tf_dataset_chunks(chunk_samples, batch_size=1)
 
@@ -300,189 +300,3 @@ print(f'time it took: {end - start}')
 #  't_width': <tf.Tensor: shape=(1,), dtype=float32, numpy=array([0.04029304], dtype=float32)>,
 #  'vid': <tf.Tensor: shape=(1,), dtype=int32, numpy=array([2], dtype=int32)>}
 
-    # print(raw_chunk)
-    # input(projected)
-
-# batch_cap = 128
-# # nvidia-cudnn-cu12 9.3.0.75
-
-# POOL = Pool(processes=48)
-
-
-# b_embeddings = []
-# b_ids = []
-# b_metadatas = []
-
-# clip_counter = 0
-# start = time.perf_counter()
-# for vid in vids:
-#     all_clips_path = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
-#     clips = sorted(os.listdir(all_clips_path), key=comparator)
-#     clips = clips[:config_ratt.NUM_CLIPS_PER_VID] # should be at least 10
-
-#     for clip in clips:
-#         print("cur clip:", clip)
-#         # input('stop')
-#         clip_counter += 1
-
-#         clip_path = os.path.join(all_clips_path, clip)
-#         frames = sorted(os.listdir(clip_path), key=comparator)
-#         total_frames = len(frames)
-#         clip_num = get_clip_num(clip)
-
-#         tasks = []
-#         for local_i, fname in enumerate(frames, start=1):
-#             full_path = os.path.join(clip_path, fname)
-#             tasks.append((full_path, local_i, total_frames, clip_num))
-
-#         # ---- run CPU preprocessing in parallel ----
-#         preprocessed = POOL.map(worker_prepare_frame, tasks)
-
-#         # unpack
-#         imgs       = [x[0] for x in preprocessed]
-#         t_norms    = [x[1] for x in preprocessed]
-#         sides      = [x[2] for x in preprocessed]
-#         frame_ids  = [x[3] for x in preprocessed]
-#         fnames     = [x[4] for x in preprocessed]
-
-#         # ---- GPU embedding + enrichment (main process only) ----
-#         # embeddings = enrich_embeddings(imgs, t_norms, sides, frame_ids)
-
-#         samples = load_samples(train_vids,stride=1)
-#         chunk_samples = build_chunks(samples, chunk_size=12)
-
-#         b_embeddings.append(embeddings)
-#         b_ids.append(fnames)
-#         b_metadatas.append([
-#                 {
-#                     "side": sides[i],
-#                     "t_norm": t_norms[i],
-#                     "clip_num": clip_num,
-#                     "vid_num": int(fnames[i].split("_")[0][3:])
-#                 }
-#                 for i in range(len(fnames))
-#             ])
-#         if(clip_counter == 10):
-#             t_start = time.perf_counter()
-#             # input(sum(b_ids, []))
-#             ratt_db.upsert(
-#                 embeddings = np.concatenate(b_embeddings, axis=0),
-#                 ids = sum(b_ids, []),
-#                 metadatas = sum(b_metadatas,[])
-#             )
-#             # ragdb_cls_only.upsert(
-#             #     embeddings = np.concatenate(b_embeddings, axis=0), 
-#             #     ids = sum(b_ids, []), 
-#             #     metadatas = sum(b_metadatas, [])
-#             # )
-
-#             # ragdb_cls_rag.upsert(
-#             #     embeddings = np.concatenate(b_embeddings, axis=0), 
-#             #     ids = sum(b_ids, []), 
-#             #     metadatas = sum(b_metadatas, [])
-#             # )
-
-#             b_embeddings = []
-#             b_ids = []
-#             b_metadatas = []
-#             clip_counter = 0
-#             t_end = time.perf_counter()
-#             print(f' clip {clip} upsert: {t_end - t_start}')
-#         # # ---- ChromaDB insert ----
-#         # ragdb.upsert(
-#         #     embeddings=embeddings,
-#         #     ids=fnames,
-#         #     metadatas=[
-#         #         {
-#         #             "side": sides[i],
-#         #             "t_norm": t_norms[i],
-#         #             "clip_num": clip_num,
-#         #             "vid_num": int(fnames[i].split("_")[0][3:])
-#         #         }
-#         #         for i in range(len(fnames))
-#         #     ]
-#         # )
-
-# if(len(b_embeddings) > 0):
-#     ragdb_cls_only.upsert(
-#                 embeddings = np.concatenate(b_embeddings, axis=0), 
-#                 ids = sum(b_ids, []), 
-#                 metadatas = sum(b_metadatas, [])
-#             )
-    
-#     ragdb_cls_rag.upsert(
-#                 embeddings = np.concatenate(b_embeddings, axis=0), 
-#                 ids = sum(b_ids, []), 
-#                 metadatas = sum(b_metadatas, [])
-#             )
-# # ragdb.create_index()
-# # ragdb.rebuild()
-# end = time.perf_counter()
-# print(f'time it took: {end - start}')
-
-# for vid in vids:
-#     all_clips_path = f"/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}"
-#     clips = sorted(os.listdir(all_clips_path), key=comparator)
-#     clips = clips[0:10]
-#     # print(clips)
-
-#     for clip in clips:
-#         print("cur clip:", clip)
-
-#         frames = sorted(os.listdir(os.path.join(all_clips_path, clip)), key=comparator)
-#         total_frames = len(frames)
-#         clip_num = get_clip_num(clip)
-
-#         # batches
-#         batch_imgs, batch_ids, batch_meta = [], [], []
-#         batch_tnorm, batch_side, batch_frame_idx = [], [], []
-
-#         for f_i, fname in enumerate(frames, start=1):
-
-#             full_path = os.path.join(all_clips_path, clip, fname)
-#             batch_imgs.append(im_to_array(full_path))
-#             batch_ids.append(fname)
-
-#             batch_meta.append({
-#                 "side": get_side(clip),
-#                 "t_norm": f_i / total_frames,
-#                 "clip_num": clip_num,
-#                 "vid_num": int(fname.split("_")[0][3:])
-#             })
-
-#             batch_tnorm.append(f_i / total_frames)
-#             batch_side.append(get_side(clip))
-#             batch_frame_idx.append(f_i)
-
-#             if len(batch_imgs) == batch_cap:
-
-#                 embeddings = enrich_embeddings(
-#                     batch_imgs, batch_tnorm, batch_side, batch_frame_idx
-#                 )
-
-#                 ragdb.upsert(
-#                     embeddings=embeddings,
-#                     ids=batch_ids,
-#                     metadatas=batch_meta
-#                 )
-
-#                 # reset
-#                 batch_imgs = []
-#                 batch_ids = []
-#                 batch_meta = []
-
-#                 batch_tnorm = []
-#                 batch_side = []
-#                 batch_frame_idx = []
-
-#         # leftover
-#         if len(batch_imgs) > 0:
-#             embeddings = enrich_embeddings(
-#                 batch_imgs, batch_tnorm, batch_side, batch_frame_idx
-#             )
-
-#             ragdb.upsert(
-#                 embeddings=embeddings,
-#                 ids=batch_ids,
-#                 metadatas=batch_meta
-#             )
