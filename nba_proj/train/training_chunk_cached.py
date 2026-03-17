@@ -1,4 +1,5 @@
 import os
+import pprint
 import random
 import numpy as np
 import tensorflow as tf
@@ -91,54 +92,119 @@ def embed_rep_chunk(rep):
 
 from collections import Counter, defaultdict
 
+import time
+import random
+import numpy as np
+from collections import defaultdict, Counter
+
+
+def greedy_select_candidates(
+    candidates,
+    K,
+    global_counts,
+    max_per_video,
+    max_global_appearances,
+    min_time_gap,
+    lambda_global=0.5,
+):
+    kept = []
+    selected_sigs = set()
+    video_counts = {}
+    video_times = defaultdict(list)
+
+    while len(kept) < K:
+        best_idx = None
+        best_score = -1e18
+
+        for i, cand in enumerate(candidates):
+            sig = cand["sig"]
+            vid = cand["vid"]
+            t_center = cand["t_center"]
+
+            if sig in selected_sigs:
+                continue
+
+            if video_counts.get(vid, 0) >= max_per_video:
+                continue
+
+            if global_counts[sig] >= max_global_appearances:
+                continue
+
+            if any(abs(t_center - prev_t) < min_time_gap for prev_t in video_times[vid]):
+                continue
+
+            adjusted_score = cand["base_score"] - lambda_global * global_counts[sig]
+
+            if adjusted_score > best_score:
+                best_score = adjusted_score
+                best_idx = i
+
+        if best_idx is None:
+            break
+
+        cand = candidates[best_idx]
+        sig = cand["sig"]
+        vid = cand["vid"]
+        t_center = cand["t_center"]
+
+        kept.append(cand)
+        selected_sigs.add(sig)
+        video_counts[vid] = video_counts.get(vid, 0) + 1
+        video_times[vid].append(t_center)
+        global_counts[sig] += 1
+
+    return kept
+
+key_precision = 4
 def build_retrieval_cache(
     collection,
     all_chunks,
     C=20,
     query_mult=100,
-    max_per_video=100,  # 10
+    max_per_video=100,
     max_global_appearances=5,
-    min_time_gap=0.05,   # 0.1
+    min_time_gap=0.01,
+    hard_negative_ratio=0.30,
 ):
     cache = {}
 
+    # -----------------------------
+    # label lookup for retrieved chunks
+    # -----------------------------
     label_lookup = {}
     for c in all_chunks:
         key = make_key(c["vid"], c["side"], c["t_center"])
-        # print(key)
         label_lookup[key] = int(c["label"])
-    
 
-    # group all chunks by (side, coarse_time_bin)
+    # -----------------------------
+    # group chunks by (side, bin, label)
+    # -----------------------------
     bin_chunks = defaultdict(list)
     for c in all_chunks:
-        key = (c["side"], coarse_time_bin(c["t_center"]))
+        key = (c["side"], coarse_time_bin(c["t_center"]), int(c["label"]))
         bin_chunks[key].append(c)
 
-    print(f"[CACHE] Building retrieval cache for {len(bin_chunks)} bins")
+    print(f"[CACHE] Building retrieval cache for {len(bin_chunks)} label-conditioned bins")
 
     total_count = collection.count()
     global_counts = Counter()
-# sig = (vid, side, round(t_center, 4))
+
     rep_items = list(bin_chunks.items())
     random.shuffle(rep_items)
 
-    # soft penalty for globally overused chunks
-    lambda_global = 0.5
-
-    # number of anchors to use per bin
+    lambda_global = 0.1
     num_anchors_per_bin = 3
 
     nums = []
     for s in config.TRAIN_VIDS:
-        nums.append(int(s.split('vid')[1]))
+        nums.append(int(s.split("vid")[1]))
 
-    for (side, bin_id), chunks_in_bin in rep_items:
+    for (side, bin_id, anchor_label), chunks_in_bin in rep_items:
         start = time.perf_counter()
 
         # -----------------------------
-        # choose up to 3 anchors per bin
-        # prefer anchors from different videos
+        # choose anchors from this label-specific bin
+        # prefer different videos
         # -----------------------------
         chunks_shuf = list(chunks_in_bin)
         random.shuffle(chunks_shuf)
@@ -158,7 +224,7 @@ def build_retrieval_cache(
                 break
             anchors.append(by_vid[vid][0])
 
-        # second pass: fill remaining from leftover chunks if needed
+        # second pass: fill remaining slots if needed
         if len(anchors) < num_anchors_per_bin:
             used_ids = set(id(a) for a in anchors)
             for c in chunks_shuf:
@@ -168,19 +234,19 @@ def build_retrieval_cache(
                     anchors.append(c)
                     used_ids.add(id(c))
 
-        # fallback: if somehow no anchors, create empty cache entry
         if len(anchors) == 0:
-            cache[(side, bin_id)] = {
+            cache[(side, bin_id, anchor_label)] = {
                 "embeddings": np.zeros((0, 768), dtype=np.float32),
                 "vid": np.zeros((0,), dtype=np.int32),
                 "side": np.asarray([], dtype=object),
                 "t_center": np.zeros((0,), dtype=np.float32),
                 "label": np.zeros((0,), dtype=np.int32),
+                "is_hard_negative": np.zeros((0,), dtype=np.int32),
             }
-            print(f"[CACHE] ({side}, {bin_id}) missing=0/0")
+            print(f"[CACHE] ({side}, {bin_id}, lbl={anchor_label}) missing=0/0")
             print(
-                f"[CACHE] ({side}, {bin_id}) "
-                f"raw=0 kept=0 time={time.perf_counter() - start:.2f}s"
+                f"[CACHE] ({side}, {bin_id}, lbl={anchor_label}) "
+                f"raw=0 kept=0 pos=0 neg=0 time={time.perf_counter() - start:.2f}s"
             )
             continue
 
@@ -193,30 +259,31 @@ def build_retrieval_cache(
             where={
                 "$and": [
                     {"side": {"$eq": side}},
-                    {"vid_num": {"$in": nums}}
+                    {"vid_num": {"$in": nums}},
                 ]
             },
-            include=["embeddings", "metadatas", "distances"]
+            include=["embeddings", "metadatas", "distances"],
         )
-        # print(anchor_embs[0])
-        # input(result)
 
-        # -----------------------------------------
-        # merge candidates across all anchors
-        # keep best score per unique chunk signature
-        # -----------------------------------------
+        # -----------------------------
+        # merge candidates across anchors
+        # keep best score per unique signature
+        # -----------------------------
         merged = {}
-
         n_queries = len(anchor_embs)
+
         for q_idx in range(n_queries):
             raw_embs = np.asarray(result["embeddings"][q_idx], dtype=np.float32)
             raw_metas = result["metadatas"][q_idx]
-            raw_dists = result.get("distances", [[None] * len(raw_metas) for _ in range(n_queries)])[q_idx]
+            raw_dists = result.get(
+                "distances",
+                [[None] * len(raw_metas) for _ in range(n_queries)]
+            )[q_idx]
 
             for rank, (emb, m, dist) in enumerate(zip(raw_embs, raw_metas, raw_dists)):
                 vid = int(m["vid_num"])
                 t_center = float(m["t_center"])
-                sig = (vid, side, round(t_center, 5))
+                sig = (vid, side, round(t_center, key_precision))
 
                 lookup_key = make_key(vid, side, t_center)
                 lbl = label_lookup.get(lookup_key, -1)
@@ -226,7 +293,6 @@ def build_retrieval_cache(
                 else:
                     base_score = -float(dist)
 
-                # keep the best score seen for this candidate across all anchors
                 prev = merged.get(sig)
                 if prev is None or base_score > prev["base_score"]:
                     merged[sig] = {
@@ -242,69 +308,122 @@ def build_retrieval_cache(
         candidates = list(merged.values())
         candidates.sort(key=lambda x: x["base_score"], reverse=True)
 
+        # -----------------------------
+        # split into positives / hard negatives
+        # positive = same label as anchor_label
+        # hard negative = different label, known label
+        # -----------------------------
+        pos_candidates = []
+        neg_candidates = []
+
+        for cand in candidates:
+            lbl = cand["label"]
+
+            if lbl == -1:
+                continue
+
+            if lbl == anchor_label:
+                pos_candidates.append(cand)
+            else:
+                neg_candidates.append(cand)
+
+        # -----------------------------
+        # quota split
+        # -----------------------------
+        C_neg = max(1, int(round(C * hard_negative_ratio)))
+        C_neg = min(C_neg, C - 1) if C > 1 else 0
+        C_pos = C - C_neg
+
+        kept_pos = greedy_select_candidates(
+            pos_candidates,
+            C_pos,
+            global_counts,
+            max_per_video,
+            max_global_appearances,
+            min_time_gap,
+            lambda_global=lambda_global,
+        )
+
+        kept_neg = greedy_select_candidates(
+            neg_candidates,
+            C_neg,
+            global_counts,
+            max_per_video,
+            max_global_appearances,
+            min_time_gap,
+            lambda_global=lambda_global,
+        )
+
+        # if one side underfills, backfill from the other
+        total_kept = len(kept_pos) + len(kept_neg)
+        if total_kept < C:
+            used_sigs = set([x["sig"] for x in kept_pos] + [x["sig"] for x in kept_neg])
+
+            if len(kept_pos) < C_pos:
+                remaining_pos = [c for c in pos_candidates if c["sig"] not in used_sigs]
+                extra_pos = greedy_select_candidates(
+                    remaining_pos,
+                    C - total_kept,
+                    global_counts,
+                    max_per_video,
+                    max_global_appearances,
+                    min_time_gap,
+                    lambda_global=lambda_global,
+                )
+                kept_pos.extend(extra_pos)
+                used_sigs.update(x["sig"] for x in extra_pos)
+
+            total_kept = len(kept_pos) + len(kept_neg)
+
+            if total_kept < C:
+                remaining_neg = [c for c in neg_candidates if c["sig"] not in used_sigs]
+                extra_neg = greedy_select_candidates(
+                    remaining_neg,
+                    C - total_kept,
+                    global_counts,
+                    max_per_video,
+                    max_global_appearances,
+                    min_time_gap,
+                    lambda_global=lambda_global,
+                )
+                kept_neg.extend(extra_neg)
+
+        kept = kept_pos + kept_neg
+        kept_is_neg = [0] * len(kept_pos) + [1] * len(kept_neg)
+
+        # optional: shuffle so positives always aren't first
+        if len(kept) > 0:
+            perm = np.random.permutation(len(kept))
+            kept = [kept[i] for i in perm]
+            kept_is_neg = [kept_is_neg[i] for i in perm]
+
         kept_embs = []
         kept_vids = []
         kept_sides = []
         kept_tcenters = []
         kept_labels = []
+        kept_hardneg = []
 
-        selected_sigs = set()
-        video_counts = {}
-        video_times = defaultdict(list)
-
-        # greedy selection from merged candidate pool
-        while len(kept_embs) < C:
-            best_idx = None
-            best_score = -1e18
-
-            for i, cand in enumerate(candidates):
-                sig = cand["sig"]
-                vid = cand["vid"]
-                t_center = cand["t_center"]
-
-                if sig in selected_sigs:
-                    continue
-
-                if video_counts.get(vid, 0) >= max_per_video:
-                    continue
-
-                if global_counts[sig] >= max_global_appearances:
-                    continue
-
-                if any(abs(t_center - prev_t) < min_time_gap for prev_t in video_times[vid]):
-                    continue
-
-                adjusted_score = cand["base_score"] - lambda_global * global_counts[sig]
-
-                if adjusted_score > best_score:
-                    best_score = adjusted_score
-                    best_idx = i
-
-            if best_idx is None:
-                break
-
-            cand = candidates[best_idx]
-            sig = cand["sig"]
+        for cand, is_neg in zip(kept, kept_is_neg):
             vid = cand["vid"]
             t_center = cand["t_center"]
             lbl = cand["label"]
-
-            selected_sigs.add(sig)
-            video_counts[vid] = video_counts.get(vid, 0) + 1
-            video_times[vid].append(t_center)
-            global_counts[sig] += 1
 
             kept_embs.append(cand["emb"])
             kept_vids.append(vid)
             kept_sides.append(side)
             kept_tcenters.append(t_center)
             kept_labels.append(lbl)
+            kept_hardneg.append(is_neg)
 
             if lbl == -1:
                 print("[MISS]", make_key(vid, side, t_center), "raw_t_center=", t_center)
 
         num_missing = int(np.sum(np.array(kept_labels) == -1))
-        print(f"[CACHE] ({side}, {bin_id}) missing={num_missing}/{len(kept_labels)}")
+        print(
+            f"[CACHE] ({side}, {bin_id}, lbl={anchor_label}) "
+            f"missing={num_missing}/{len(kept_labels)}"
+        )
 
         if len(candidates) > 0:
             emb_dim = candidates[0]["emb"].shape[0]
@@ -316,19 +435,22 @@ def build_retrieval_cache(
         kept_sides = np.asarray(kept_sides)
         kept_tcenters = np.asarray(kept_tcenters, dtype=np.float32)
         kept_labels = np.asarray(kept_labels, dtype=np.int32)
+        kept_hardneg = np.asarray(kept_hardneg, dtype=np.int32)
 
-        cache[(side, bin_id)] = {
+        cache[(side, bin_id, anchor_label)] = {
             "embeddings": kept_embs,
             "vid": kept_vids,
             "side": kept_sides,
             "t_center": kept_tcenters,
             "label": kept_labels,
+            "is_hard_negative": kept_hardneg,
         }
 
-        # input(cache[(side, bin_id)])
         print(
-            f"[CACHE] ({side}, {bin_id}) "
+            f"[CACHE] ({side}, {bin_id}, lbl={anchor_label}) "
             f"raw={len(candidates)} kept={len(kept_vids)} "
+            f"pos={int(np.sum(kept_hardneg == 0))} "
+            f"neg={int(np.sum(kept_hardneg == 1))} "
             f"time={time.perf_counter() - start:.2f}s"
         )
 
@@ -337,6 +459,7 @@ def build_retrieval_cache(
         print(sig, cnt)
 
     return cache
+
 
 
 USE_GRAYSCALE = False
@@ -456,21 +579,70 @@ def find_best_f1(labels, probs):
 # TRAIN STEP WITH GRADIENT ACCUMULATION
 # ---------------------------------------------------------
 
+# class Accumulator:
+#     def __init__(self, rag_head, proj_head, accum_steps):
+#         self.accum_steps = accum_steps
+#         self.step = 0
+#         self.vars = rag_head.trainable_variables + proj_head.trainable_variables
+#         self.gradients = [tf.zeros_like(v) for v in self.vars]
+
+#     def accumulate(self, grads):
+#         # self.gradients = [g_old + g_new for g_old, g_new in zip(self.gradients, grads)]
+#         new_grads = []
+#         for g_old, g_new in zip(self.gradients, grads):
+#             if g_new is None:
+#                 new_grads.append(g_old)
+#             else:
+#                 new_grads.append(g_old + g_new)
+#         self.gradients = new_grads
+#         self.step += 1
+
+#     def apply(self, optimizer):
+#         if self.step == self.accum_steps:
+#             avg_grads = [g / self.accum_steps for g in self.gradients]
+#             optimizer.apply_gradients(zip(avg_grads, self.vars))
+#             self.gradients = [tf.zeros_like(v) for v in self.vars]
+#             self.step = 0
+
 class Accumulator:
     def __init__(self, rag_head, proj_head, accum_steps):
         self.accum_steps = accum_steps
         self.step = 0
+
+        # Must be called only AFTER both models are built
         self.vars = rag_head.trainable_variables + proj_head.trainable_variables
         self.gradients = [tf.zeros_like(v) for v in self.vars]
 
+    def _dense_grad(self, g):
+        if g is None:
+            return None
+        if isinstance(g, tf.IndexedSlices):
+            return tf.convert_to_tensor(g)
+        return g
+
     def accumulate(self, grads):
-        # self.gradients = [g_old + g_new for g_old, g_new in zip(self.gradients, grads)]
+        if len(grads) != len(self.gradients):
+            raise ValueError(
+                f"Gradient length mismatch: got {len(grads)} grads, "
+                f"but accumulator has {len(self.gradients)} slots."
+            )
+
         new_grads = []
-        for g_old, g_new in zip(self.gradients, grads):
+        for i, (g_old, g_new) in enumerate(zip(self.gradients, grads)):
+            g_new = self._dense_grad(g_new)
+
             if g_new is None:
                 new_grads.append(g_old)
-            else:
-                new_grads.append(g_old + g_new)
+                continue
+
+            if g_old.shape != g_new.shape:
+                raise ValueError(
+                    f"Gradient shape mismatch at slot {i}: "
+                    f"accum={g_old.shape}, new={g_new.shape}, var={self.vars[i].name}"
+                )
+
+            new_grads.append(g_old + g_new)
+
         self.gradients = new_grads
         self.step += 1
 
@@ -480,6 +652,7 @@ class Accumulator:
             optimizer.apply_gradients(zip(avg_grads, self.vars))
             self.gradients = [tf.zeros_like(v) for v in self.vars]
             self.step = 0
+
 
 # def get_retrieval_cache(B,metadata,retrieval_cache):
 #     retrieved = []
@@ -526,40 +699,43 @@ class Accumulator:
 #     retrieved_labels = np.stack(retrieved_labels)
 #     return retrieved, retrieved_labels
 
-def get_retrieval_cache(B, metadata, retrieval_cache, label_lookup):
+def get_retrieval_cache(B, metadata, retrieval_cache, label_lookup=None):
     retrieved = []
     retrieved_labels = []
+    retrieved_is_hard_negative = []
 
     for i in range(B):
+        # input(metadata)
         side = metadata["side"][i].numpy().decode()
         t_center = float(metadata["t_center"][i].numpy())
         t_width  = float(metadata["t_width"][i].numpy())
         vid      = int(metadata["vid"][i].numpy())
 
-        bin_id = coarse_time_bin(t_center)
-        pool = retrieval_cache[(side, bin_id)]
+        # anchor chunk label must be available in metadata
+        anchor_label = int(metadata["label"][i].numpy())
 
+        bin_id = coarse_time_bin(t_center)
+
+        # new label-conditioned cache key
+        pool = retrieval_cache[(side, bin_id, anchor_label)]
+
+        # exclude same-video retrievals
         mask = (pool["vid"] != vid)
 
+        # if you want to re-enable local temporal filtering later:
         # mask = (
         #     (pool["vid"] != vid) &
         #     (np.abs(pool["t_center"] - t_center) <= t_width / 2)
         # )
 
         candidates = pool["embeddings"][mask]
-        cand_vids = pool["vid"][mask]
-        cand_tcenters = pool["t_center"][mask]
-
-        cand_labels = []
-        for rv, rt in zip(cand_vids, cand_tcenters):
-            key = make_key(rv, side, rt)
-            cand_labels.append(label_lookup.get(key, -1))  # -1 = missing
-
-        cand_labels = np.array(cand_labels, dtype=np.int32)
+        cand_labels = pool["label"][mask]
+        cand_is_hard_negative = pool["is_hard_negative"][mask]
 
         if len(candidates) >= config.TOP_K:
             candidates = candidates[:config.TOP_K]
             cand_labels = cand_labels[:config.TOP_K]
+            cand_is_hard_negative = cand_is_hard_negative[:config.TOP_K]
         else:
             emb_dim = candidates.shape[1] if len(candidates) > 0 else 768
             pad_n = config.TOP_K - len(candidates)
@@ -567,6 +743,7 @@ def get_retrieval_cache(B, metadata, retrieval_cache, label_lookup):
             if len(candidates) == 0:
                 candidates = np.zeros((config.TOP_K, emb_dim), dtype=np.float32)
                 cand_labels = np.full((config.TOP_K,), -1, dtype=np.int32)
+                cand_is_hard_negative = np.full((config.TOP_K,), -1, dtype=np.int32)
             else:
                 pad = np.zeros((pad_n, emb_dim), dtype=np.float32)
                 candidates = np.vstack([candidates, pad])
@@ -574,8 +751,12 @@ def get_retrieval_cache(B, metadata, retrieval_cache, label_lookup):
                 pad_labels = np.full((pad_n,), -1, dtype=np.int32)
                 cand_labels = np.concatenate([cand_labels, pad_labels])
 
+                pad_is_neg = np.full((pad_n,), -1, dtype=np.int32)
+                cand_is_hard_negative = np.concatenate([cand_is_hard_negative, pad_is_neg])
+
         retrieved.append(candidates)
         retrieved_labels.append(cand_labels)
+        retrieved_is_hard_negative.append(cand_is_hard_negative)
 
     retrieved = tf.nn.l2_normalize(
         tf.stop_gradient(tf.convert_to_tensor(np.stack(retrieved), tf.float32)),
@@ -583,7 +764,10 @@ def get_retrieval_cache(B, metadata, retrieval_cache, label_lookup):
     )
 
     retrieved_labels = np.stack(retrieved_labels)
-    return retrieved, retrieved_labels
+    retrieved_is_hard_negative = np.stack(retrieved_is_hard_negative)
+
+    return retrieved, retrieved_labels, retrieved_is_hard_negative
+
 
 
 def supervised_contrastive_loss(z, labels, temperature=0.1):
@@ -620,9 +804,60 @@ def supervised_contrastive_loss(z, labels, temperature=0.1):
     return loss
 
 
+def retrieval_margin_loss(
+    anchor_embs,
+    retrieved_embs,
+    retrieved_is_hard_negative,
+    margin=0.2,
+    eps=1e-8,
+):
+    """
+    anchor_embs: (B, D)
+    retrieved_embs: (B, K, D)
+    retrieved_is_hard_negative: (B, K)
+        0 = positive
+        1 = hard negative
+       -1 = padding
+    """
+
+    # normalize for cosine similarity
+    anchor_embs = tf.math.l2_normalize(anchor_embs, axis=-1)         # (B, D)
+    retrieved_embs = tf.math.l2_normalize(retrieved_embs, axis=-1)   # (B, K, D)
+
+    # cosine sim between anchor and each retrieved token
+    sims = tf.reduce_sum(anchor_embs[:, None, :] * retrieved_embs, axis=-1)  # (B, K)
+
+    pos_mask = tf.cast(tf.equal(retrieved_is_hard_negative, 0), tf.float32)
+    neg_mask = tf.cast(tf.equal(retrieved_is_hard_negative, 1), tf.float32)
+
+    pos_count = tf.reduce_sum(pos_mask, axis=1)  # (B,)
+    neg_count = tf.reduce_sum(neg_mask, axis=1)  # (B,)
+
+    pos_score = tf.reduce_sum(sims * pos_mask, axis=1) / tf.maximum(pos_count, 1.0)
+    neg_score = tf.reduce_sum(sims * neg_mask, axis=1) / tf.maximum(neg_count, 1.0)
+
+    # only keep samples that have at least one pos and one neg
+    valid = tf.logical_and(pos_count > 0, neg_count > 0)
+    valid = tf.cast(valid, tf.float32)
+
+    per_sample_loss = tf.nn.relu(margin - pos_score + neg_score)
+    per_sample_loss = per_sample_loss * valid
+
+    loss = tf.reduce_sum(per_sample_loss) / tf.maximum(tf.reduce_sum(valid), 1.0)
+
+    return loss, {
+        "ret_pos_score": tf.reduce_sum(pos_score * valid) / tf.maximum(tf.reduce_sum(valid), 1.0),
+        "ret_neg_score": tf.reduce_sum(neg_score * valid) / tf.maximum(tf.reduce_sum(valid), 1.0),
+        "ret_valid_frac": tf.reduce_mean(valid),
+    }
+
 def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_fn,
                frames, metadata, labels, accum,contrastive_coefficient, print_attention,label_lookup):
 
+    # print(metadata)
+    # print(frames)
+    # print(labels)
+    # input('stop')
     B = tf.shape(frames)[0]
     T = tf.shape(frames)[1]
 
@@ -673,9 +908,16 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         # ----- Retrieval (stop gradient) -----
         start = time.perf_counter()
 
-        retrieved, retrieved_labels = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
+        metadata['label'] = labels
+        # print(metadata)
+        # input('stop')
+        retrieved, retrieved_labels, retrieved_is_hard_negative = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
         # retrieved = retriever(chunk_embs,metadata)
-        
+        # print(retrieved)
+        # print(retrieved_labels)
+        # print(retrieved_is_hard_negative)
+        # input('stop')
+
         end = time.perf_counter()
         # print(f'retrieval took: {end - start}')
         # print()
@@ -687,8 +929,16 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         #     chunk_embs = tf.zeros_like(chunk_embs)
         # logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=disable_cls, training=True)
         
-        class_logit, relevance_logit, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=disable_cls, training=True)
+        # class_logit, relevance_logit, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=disable_cls, training=True)
 
+        class_logit, relevance_logit, fused_cls, attn_scores = rag_head(
+            chunk_embs,
+            retrieved,
+            retrieved_is_hard_negative=retrieved_is_hard_negative,
+            disable_cls=disable_cls,
+            training=True
+        )
+        
         # print()
         # print('-------- raw class then relevance logits ----------')
         # print(class_logit)
@@ -760,6 +1010,15 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
             relevance * tf.math.log(relevance + 1e-8)
         )
 
+        loss_ret, ret_metrics = retrieval_margin_loss(
+            anchor_embs=chunk_embs,
+            retrieved_embs=retrieved,
+            retrieved_is_hard_negative=retrieved_is_hard_negative,
+            margin=0.2,
+        )
+        
+        pprint.pprint(ret_metrics)
+        print()
         # labels = labels.numpy().reshape(-1)
         # agreement = (retrieved_labels == labels[:, None])
 
@@ -803,6 +1062,9 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
             axis=1
         )
 
+        
+
+
         gap = sim_pos - sim_neg
         print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
         print()
@@ -813,9 +1075,21 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
                 + contrastive_coefficient * 1 * loss_contrast 
                 + 0.1 * 0 * loss_ibn 
                 + 0.1 * 0 * loss_entropy
-                + 0.1 * 0 * loss_supcon)       # λ = 0.1 to start
+                + 0.1 * 0 * loss_supcon
+                + 0.1 * 1 * loss_ret)       # λ = 0.1 to start
         # loss = loss_cls +  0.1 * loss_ibn  + 0.1 * loss_entropy      # λ = 0.1 to start
 
+        print()
+        print()
+        pprint.pprint({
+            "loss_total": float(loss.numpy()),
+            "loss_cls": float(loss_cls.numpy()),
+            "loss_ret": float(loss_ret.numpy()),
+            "weighted_ret": float((0.1 * loss_ret).numpy()),
+            "ret_pos": float(ret_metrics["ret_pos_score"].numpy()),
+            "ret_neg": float(ret_metrics["ret_neg_score"].numpy()),
+            "ret_gap": float((ret_metrics["ret_pos_score"] - ret_metrics["ret_neg_score"]).numpy()),
+        })
     # Get grads for BOTH heads
     grads = tape.gradient(loss,
             rag_head.trainable_variables + proj_head.trainable_variables)
@@ -891,15 +1165,24 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,la
         
         # retrieved_np = retriever(chunk_embs, metadata)
 
+        metadata['label'] = labels
         # --- new retriever start ----
-        retrieved,retrieved_labels = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
+        retrieved, retrieved_labels, retrieved_is_hard_negative = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
         
         # retrieved = retriever(chunk_embs,metadata)
         # ---- new retriever end -----
 
         # logits, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
 
-        class_logit, relevance_logit, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
+        # class_logit, relevance_logit, fused_cls, attn_scores = rag_head(chunk_embs, retrieved, disable_cls=False, training=False)
+
+        class_logit, relevance_logit, fused_cls, attn_scores = rag_head(
+            chunk_embs,
+            retrieved,
+            retrieved_is_hard_negative=retrieved_is_hard_negative,
+            disable_cls=disable_cls,
+            training=True
+        )
 
         # print()
         # print('-------- raw class then relevance logits ----------')
@@ -1092,7 +1375,7 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,la
     print(f'TEST PER QUERY agreement: {per_query_agreement}\n MEAN agreement: {mean_agreement}')
     print("----------------------------------------------------")
 
-def make_key(vid, side, t_center, ndigits=5):
+def make_key(vid, side, t_center, ndigits=key_precision):
     return (int(vid), str(side), round(float(t_center), ndigits))
 # ---------------------------------------------------------
 # MAIN TRAINING LOOP
@@ -1165,7 +1448,8 @@ if __name__ == "__main__":
 
     dummy_chunk = tf.zeros((1, 768))
     dummy_retrieved = tf.zeros((1, 10, 768))
-    _ = ratt_head(dummy_chunk, dummy_retrieved, disable_cls=False, training=False)
+    dummy_types = tf.zeros((1, 10), dtype=tf.int32)
+    _ = ratt_head(dummy_chunk, dummy_retrieved, dummy_types, disable_cls=False, training=False)
     # rag_head.save_weights(config.RAG_WEIGHTS)
     # rag_head.load_weights('rag_head_5vid_new_v2.weights.h5')
 

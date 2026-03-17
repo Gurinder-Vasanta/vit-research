@@ -251,7 +251,7 @@ def rebuild_db():
             "vid_num": int(metadata_batch["vid"][0]),
             "clip_num": int(metadata_batch["clip"][0]),
             "side": metadata_batch["side"][0].numpy().decode(),
-            'label': int(metadata_batch['label'][0]),
+            'label': int(labels_batch.numpy()[0]),
             "t_center": float(metadata_batch["t_center"][0]),
             "t_width": float(metadata_batch["t_width"][0]),
         }
