@@ -23,6 +23,8 @@ from sklearn.metrics import roc_auc_score
 from sklearn.metrics import f1_score
 import pickle
 
+from models.chunk_encoder import ChunkEncoder
+
 def save_retrieval_cache(cache, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
@@ -67,12 +69,11 @@ np.random.seed(1234)
 def coarse_time_bin(t_center):
     return int(t_center // config.DELTA_T_NORM)
 
-def embed_rep_chunk(rep):
+def embed_rep_chunk(rep, chunk_encoder, proj_head=None):
     """
-    rep: one chunk dict (like the one you printed)
-    Returns: (768,) numpy embedding
+    rep: one chunk dict
+    returns: (768,) numpy embedding in the SAME space used by stage2
     """
-    # load frames
     frames = []
     for fp in rep["frames"]:
         img = tf.keras.utils.load_img(fp, target_size=(224, 224))
@@ -81,14 +82,18 @@ def embed_rep_chunk(rep):
 
     frames = np.stack(frames, axis=0)  # (T, H, W, 3)
 
-    # HF ViT embedding (already normalized)
     frame_embs = hf_vit_embed_batch(frames)  # (T, 768)
+    frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)  # (1, T, 768)
 
-    # pool to chunk embedding (match training semantics)
-    mean = frame_embs.mean(axis=0)
-    mean = mean / (np.linalg.norm(mean) + 1e-8)
+    stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)  # (1, 768)
 
-    return mean.astype(np.float32)
+    if proj_head is not None:
+        stage2_chunk_emb = proj_head(stage1_chunk_emb, training=False)  # (1, 768)
+        out = stage2_chunk_emb[0].numpy()
+    else:
+        out = stage1_chunk_emb[0].numpy()
+
+    return out.astype(np.float32)
 
 from collections import Counter, defaultdict
 
@@ -155,8 +160,10 @@ def greedy_select_candidates(
 
     return kept
 
-key_precision = 4
+key_precision = 5
 def build_retrieval_cache(
+    chunk_encoder,
+    proj_head,
     collection,
     all_chunks,
     C=20,
@@ -250,7 +257,8 @@ def build_retrieval_cache(
             )
             continue
 
-        anchor_embs = [embed_rep_chunk(a).tolist() for a in anchors]
+        # anchor_embs = [embed_rep_chunk(a).tolist() for a in anchors]
+        anchor_embs = [embed_rep_chunk(a, chunk_encoder, proj_head).tolist() for a in anchors]
         raw_n = min(query_mult * C, total_count)
 
         result = collection.query(
@@ -851,7 +859,28 @@ def retrieval_margin_loss(
         "ret_valid_frac": tf.reduce_mean(valid),
     }
 
-def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_fn,
+
+def build_stage1_chunk_embs(frames, chunk_encoder):
+    """
+    frames: (B, T, H, W, 3)
+    returns: (B, 768)
+    """
+    B = tf.shape(frames)[0]
+    T = tf.shape(frames)[1]
+
+    frames_np = tf.numpy_function(
+        hf_vit_embed_batch,
+        [tf.reshape(frames, (-1, 432, 768, 3))],
+        tf.float32
+    )
+    frame_embs = tf.reshape(frames_np, (B, T, 768))
+    frame_embs.set_shape([None, None, 768])
+
+    stage1_chunk_embs, _ = chunk_encoder(frame_embs, training=False)
+    return stage1_chunk_embs
+
+
+def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_fn,
                frames, metadata, labels, accum,contrastive_coefficient, print_attention,label_lookup):
 
     # print(metadata)
@@ -872,7 +901,7 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
     end = time.perf_counter()
     # print(f'embed took: {end-start}')
     frame_embs = tf.reshape(frames_np, (B, T, 768))
-    deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
+    # deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
 
     # ----- Raw chunk pool -----
     # raw_chunk = tf.reduce_mean(frame_embs, axis=1)
@@ -885,22 +914,25 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
     
     # for 
     # try this next 
-    mean = tf.reduce_mean(frame_embs, axis=1)
-    mean_deltas = tf.reduce_mean(deltas, axis=1)
-    std_deltas = tf.math.reduce_std(deltas, axis=1)
+    # mean = tf.reduce_mean(frame_embs, axis=1)
+    # mean_deltas = tf.reduce_mean(deltas, axis=1)
+    # std_deltas = tf.math.reduce_std(deltas, axis=1)
 
     # std  = tf.math.reduce_std(frame_embs, axis=1)
     # max_ = tf.reduce_max(frame_embs, axis=1)
 
     # raw_chunk = tf.concat([mean, std, max_], axis=-1)
-    raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
-    raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
+    # raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
+    # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
     
     # input(raw_chunk)
     # ----- Forward projection (learnable) -----
     with tf.GradientTape() as tape:
-        chunk_embs = proj_head(raw_chunk, training=True)
-        chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
+        stage1_chunk_embs = build_stage1_chunk_embs(frames, chunk_encoder)
+
+        # chunk_embs = proj_head(stage1_chunk_embs, training=True)
+        chunk_embs = stage1_chunk_embs
+        # chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
 
         # print()
         # print('chunk embds')
@@ -1072,11 +1104,11 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
         # contrastive_coefficient = 0
         # combine them
         loss = (loss_cls 
-                + contrastive_coefficient * 1 * loss_contrast 
+                + contrastive_coefficient * 0 * loss_contrast 
                 + 0.1 * 0 * loss_ibn 
                 + 0.1 * 0 * loss_entropy
                 + 0.1 * 0 * loss_supcon
-                + 0.1 * 1 * loss_ret)       # λ = 0.1 to start
+                + 0.1 * 0 * loss_ret)       # λ = 0.1 to start
         # loss = loss_cls +  0.1 * loss_ibn  + 0.1 * loss_entropy      # λ = 0.1 to start
 
         print()
@@ -1113,7 +1145,7 @@ def train_step(rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_
 # ---------------------------------------------------------
 # VALIDATION
 # ---------------------------------------------------------
-def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,label_lookup):
+def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,label_lookup):
     losses = []
     accs = []
 
@@ -1133,12 +1165,12 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,la
 
         # input(frames)
 
-        frames_np = tf.numpy_function(
-            hf_vit_embed_batch,
-            [tf.reshape(frames, (-1, 432, 768, 3))],
-            tf.float32
-        )
-        frame_embs = tf.reshape(frames_np, (B, T, 768))
+        # frames_np = tf.numpy_function(
+        #     hf_vit_embed_batch,
+        #     [tf.reshape(frames, (-1, 432, 768, 3))],
+        #     tf.float32
+        # )
+        # frame_embs = tf.reshape(frames_np, (B, T, 768))
 
         # ---- chunk pooling ----
         # chunk_embs = tf.reduce_max(frame_embs, axis=1)  # (B, 768) #TODO: reduce to max
@@ -1150,18 +1182,21 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,la
         # std  = tf.math.reduce_std(frame_embs, axis=1)
         # max_ = tf.reduce_max(frame_embs, axis=1)
 
-        deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
+        # deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
 
-        mean = tf.reduce_mean(frame_embs, axis=1)
-        mean_deltas = tf.reduce_mean(deltas, axis=1)
-        std_deltas = tf.math.reduce_std(deltas, axis=1)
+        # mean = tf.reduce_mean(frame_embs, axis=1)
+        # mean_deltas = tf.reduce_mean(deltas, axis=1)
+        # std_deltas = tf.math.reduce_std(deltas, axis=1)
 
         # raw_chunk = tf.concat([mean, std, max_], axis=-1)
-        raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
-        raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
+        # raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
+        # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
 
-        chunk_embs = proj_head(raw_chunk, training=False)
-        chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
+        stage1_chunk_embs = build_stage1_chunk_embs(frames, chunk_encoder)
+        # chunk_embs = proj_head(stage1_chunk_embs, training=False)
+        chunk_embs = stage1_chunk_embs
+        # chunk_embs = proj_head(raw_chunk, training=False)
+        # chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
         
         # retrieved_np = retriever(chunk_embs, metadata)
 
@@ -1181,7 +1216,7 @@ def evaluate(val_ds, rag_head, proj_head, retriever, retrieval_cache, loss_fn,la
             retrieved,
             retrieved_is_hard_negative=retrieved_is_hard_negative,
             disable_cls=disable_cls,
-            training=True
+            training=False
         )
 
         # print()
@@ -1432,7 +1467,7 @@ if __name__ == "__main__":
     # RAG head (trainable)
     ratt_head = RATTHead(hidden_size=768, num_queries=config.NUM_QUERIES, num_layers=config.NUM_LAYERS,num_heads=config.NUM_HEADS)
 
-    proj_head = ProjectionHead(input_dim=2304, hidden_dim=768*8, proj_dim=768)
+    proj_head = ProjectionHead(input_dim=768, hidden_dim=768*8, proj_dim=768)
 
     # proj_head.load_weights("projection_head.weights.h5")
     
@@ -1453,11 +1488,26 @@ if __name__ == "__main__":
     # rag_head.save_weights(config.RAG_WEIGHTS)
     # rag_head.load_weights('rag_head_5vid_new_v2.weights.h5')
 
-    dummy = tf.zeros((1, 2304), dtype=tf.float32)
+    dummy = tf.zeros((1, 768), dtype=tf.float32)
     _ = proj_head(dummy)   # builds variables
     # proj_head.save_weights(config.PROJ_WEIGHTS)
     # proj_head.load_weights("projection_head_5vid_new_v2.weights.h5")
 
+    chunk_encoder = ChunkEncoder(
+        hidden_size=768,
+        num_layers=3,
+        num_heads=8,
+        max_frames=config.CHUNK_SIZE
+    )
+
+    dummy_frame_embs = tf.zeros((1, config.CHUNK_SIZE, 768), dtype=tf.float32)
+    _ = chunk_encoder(dummy_frame_embs, training=False)
+
+    chunk_encoder.load_weights("./chunk_encoder_ckpts_cached/chunk_encoder_best.weights.h5")
+    print("[STAGE1] Loaded chunk encoder weights")
+
+    chunk_encoder.trainable = False
+    print("[STAGE1] Chunk encoder frozen")
     # ---------------------------------------------
     # 4. Optimizer / loss
     # ---------------------------------------------
@@ -1517,6 +1567,8 @@ if __name__ == "__main__":
             retrieval_cache = load_retrieval_cache(config.CACHE_PATH)
         else:
             retrieval_cache = build_retrieval_cache(
+                chunk_encoder,
+                proj_head,
                 collection,
                 train_chunk_samples,
                 C=config.BUILD_RET_C
@@ -1527,7 +1579,7 @@ if __name__ == "__main__":
         # retrieval_cache = None
         for frames_batch, metadata_batch, labels_batch in train_dataset:
             curloss, curacc, curagree = train_step(
-                ratt_head, proj_head, retriever, retrieval_cache,
+                chunk_encoder, ratt_head, proj_head, retriever, retrieval_cache,
                 optimizer, bce,
                 frames_batch, metadata_batch, labels_batch,
                 accum,contrastive_coefficient,print_attention,
@@ -1553,13 +1605,13 @@ if __name__ == "__main__":
         proj_head.save_weights(config.PROJ_WEIGHTS)
         ratt_head.save_weights(config.RATT_WEIGHTS)
         # validation at end of every epoch
-        evaluate(val_dataset, ratt_head, proj_head, retriever, retrieval_cache,bce,label_lookup)
+        evaluate(chunk_encoder, val_dataset, ratt_head, proj_head, retriever, retrieval_cache,bce,label_lookup)
         # rebuild_db()
         if(epoch % config.ADJUST_CONTRASTIVE_LOSS_EVERY == 0 and epoch >= config.ADJUST_CONTRASTIVE_LOSS_EVERY): 
             contrastive_coefficient += config.INCREMENT_CONTRASTIVE_LOSS_BY
         if((epoch) % config.REBUILD_EVERY == 0 and (epoch) >= config.REBUILD_EVERY): 
             # CTRLF
-            rebuild_db()
+            # rebuild_db()
             client = PersistentClient(path="./chroma_store")
             collection = client.get_or_create_collection(
                 name=config.CHROMADB_COLLECTION,
@@ -1568,9 +1620,11 @@ if __name__ == "__main__":
             retriever = RattChunkRetriever(collection, top_k=config.TOP_K, search_k=config.SEARCH_K)
 
             # CTRLF
-            retrieval_cache = build_retrieval_cache(
-                collection,
-                train_chunk_samples,
-                C=config.BUILD_RET_C
-            )
-            save_retrieval_cache(retrieval_cache, config.CACHE_PATH)
+            # retrieval_cache = build_retrieval_cache(
+            #     chunk_encoder,
+            #     proj_head,
+            #     collection,
+            #     train_chunk_samples,
+            #     C=config.BUILD_RET_C
+            # )
+            # save_retrieval_cache(retrieval_cache, config.CACHE_PATH)
