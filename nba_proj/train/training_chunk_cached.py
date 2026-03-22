@@ -879,6 +879,14 @@ def build_stage1_chunk_embs(frames, chunk_encoder):
     stage1_chunk_embs, _ = chunk_encoder(frame_embs, training=False)
     return stage1_chunk_embs
 
+def build_stage1_chunk_embs_from_frame_embs(frame_embs, chunk_encoder):
+    """
+    frame_embs: (B, T, 768)
+    returns: (B, 768)
+    """
+    frame_embs.set_shape([None, None, 768])
+    stage1_chunk_embs, _ = chunk_encoder(frame_embs, training=False)
+    return stage1_chunk_embs
 
 def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, optimizer, loss_fn,
                frames, metadata, labels, accum,contrastive_coefficient, print_attention,label_lookup):
@@ -892,43 +900,17 @@ def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, op
 
     # print([B,T])
     
-    start = time.perf_counter()
     frames_np = tf.numpy_function(
         hf_vit_embed_batch,
         [tf.reshape(frames, (-1, 432, 768, 3))],
         tf.float32
     )
-    end = time.perf_counter()
-    # print(f'embed took: {end-start}')
     frame_embs = tf.reshape(frames_np, (B, T, 768))
-    # deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
-
-    # ----- Raw chunk pool -----
-    # raw_chunk = tf.reduce_mean(frame_embs, axis=1)
-    # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1) 
-    # raw_chunk = tf.stop_gradient(raw_chunk)
-
-    # print()
-    # print('frame embds')
-    # input(frame_embs)
+    frame_embs.set_shape([None, None, 768])
     
-    # for 
-    # try this next 
-    # mean = tf.reduce_mean(frame_embs, axis=1)
-    # mean_deltas = tf.reduce_mean(deltas, axis=1)
-    # std_deltas = tf.math.reduce_std(deltas, axis=1)
-
-    # std  = tf.math.reduce_std(frame_embs, axis=1)
-    # max_ = tf.reduce_max(frame_embs, axis=1)
-
-    # raw_chunk = tf.concat([mean, std, max_], axis=-1)
-    # raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
-    # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
-    
-    # input(raw_chunk)
-    # ----- Forward projection (learnable) -----
     with tf.GradientTape() as tape:
-        stage1_chunk_embs = build_stage1_chunk_embs(frames, chunk_encoder)
+        # stage1_chunk_embs = build_stage1_chunk_embs(frames, chunk_encoder)
+        stage1_chunk_embs = build_stage1_chunk_embs_from_frame_embs(frame_embs, chunk_encoder)
 
         # chunk_embs = proj_head(stage1_chunk_embs, training=True)
         chunk_embs = stage1_chunk_embs
@@ -1049,8 +1031,8 @@ def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, op
             margin=0.2,
         )
         
-        pprint.pprint(ret_metrics)
-        print()
+        # pprint.pprint(ret_metrics)
+        # print()
         # labels = labels.numpy().reshape(-1)
         # agreement = (retrieved_labels == labels[:, None])
 
@@ -1069,8 +1051,8 @@ def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, op
             importance * tf.math.log(importance + 1e-8),
             axis=1
         )
-        print()
-        print("retrieval attention entropy:", tf.reduce_mean(entropy))
+        # print()
+        # print("retrieval attention entropy:", tf.reduce_mean(entropy))
 
         print(f'TRAIN MEAN agreement: {agreement.mean()} TRAIN PER QUERY MEAN agreement: {mean_agreement}')
         
@@ -1098,8 +1080,24 @@ def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, op
 
 
         gap = sim_pos - sim_neg
-        print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
-        print()
+        # print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
+        # print()
+
+
+        valid = (retrieved_labels != -1)
+        matches = (retrieved_labels == query_labels[:, None]) & valid
+        nonmatches = (retrieved_labels != query_labels[:, None]) & valid
+
+        pos_mass = (importance * matches).sum(axis=1)
+        neg_mass = (importance * nonmatches).sum(axis=1)
+
+        pos_avg = pos_mass / np.maximum(matches.sum(axis=1), 1)
+        neg_avg = neg_mass / np.maximum(nonmatches.sum(axis=1), 1)
+
+        print("mean pos attn/token:", pos_avg.mean())
+        print("mean neg attn/token:", neg_avg.mean())
+        print("mean pos mass:", pos_mass.mean())
+        print("mean neg mass:", neg_mass.mean())
 
         # contrastive_coefficient = 0
         # combine them
@@ -1108,7 +1106,7 @@ def train_step(chunk_encoder,rag_head, proj_head, retriever, retrieval_cache, op
                 + 0.1 * 0 * loss_ibn 
                 + 0.1 * 0 * loss_entropy
                 + 0.1 * 0 * loss_supcon
-                + 0.1 * 0 * loss_ret)       # λ = 0.1 to start
+                + 0.1 * 1 * loss_ret)       # λ = 0.1 to start
         # loss = loss_cls +  0.1 * loss_ibn  + 0.1 * loss_entropy      # λ = 0.1 to start
 
         print()
@@ -1163,36 +1161,15 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
         B = tf.shape(frames)[0]
         T = tf.shape(frames)[1]  # 60
 
-        # input(frames)
+        frames_np = tf.numpy_function(
+            hf_vit_embed_batch,
+            [tf.reshape(frames, (-1, 432, 768, 3))],
+            tf.float32
+        )
+        frame_embs = tf.reshape(frames_np, (B, T, 768))
+        frame_embs.set_shape([None, None, 768])
 
-        # frames_np = tf.numpy_function(
-        #     hf_vit_embed_batch,
-        #     [tf.reshape(frames, (-1, 432, 768, 3))],
-        #     tf.float32
-        # )
-        # frame_embs = tf.reshape(frames_np, (B, T, 768))
-
-        # ---- chunk pooling ----
-        # chunk_embs = tf.reduce_max(frame_embs, axis=1)  # (B, 768) #TODO: reduce to max
-        # raw_chunk = tf.reduce_mean(frame_embs, axis=1)
-        # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=-1)
-
-        # try this next 
-        # mean = tf.reduce_mean(frame_embs, axis=1)
-        # std  = tf.math.reduce_std(frame_embs, axis=1)
-        # max_ = tf.reduce_max(frame_embs, axis=1)
-
-        # deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
-
-        # mean = tf.reduce_mean(frame_embs, axis=1)
-        # mean_deltas = tf.reduce_mean(deltas, axis=1)
-        # std_deltas = tf.math.reduce_std(deltas, axis=1)
-
-        # raw_chunk = tf.concat([mean, std, max_], axis=-1)
-        # raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
-        # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
-
-        stage1_chunk_embs = build_stage1_chunk_embs(frames, chunk_encoder)
+        stage1_chunk_embs = build_stage1_chunk_embs_from_frame_embs(frame_embs, chunk_encoder)
         # chunk_embs = proj_head(stage1_chunk_embs, training=False)
         chunk_embs = stage1_chunk_embs
         # chunk_embs = proj_head(raw_chunk, training=False)
@@ -1203,6 +1180,7 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
         metadata['label'] = labels
         # --- new retriever start ----
         retrieved, retrieved_labels, retrieved_is_hard_negative = get_retrieval_cache(B,metadata,retrieval_cache,label_lookup)
+        
         
         # retrieved = retriever(chunk_embs,metadata)
         # ---- new retriever end -----
@@ -1219,6 +1197,10 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
             training=False
         )
 
+        cls_to_ret = attn_scores[-1][:, :, 0, 1:]
+        # print(cls_to_ret)
+        importance = tf.reduce_mean(cls_to_ret, axis=1).numpy()
+        
         # print()
         # print('-------- raw class then relevance logits ----------')
         # print(class_logit)
@@ -1268,7 +1250,7 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
         )
 
         gap = sim_pos - sim_neg
-        print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
+        # print(f"retrieval similarity gap: {tf.reduce_mean(gap)}")
 
         # entropy = -tf.reduce_sum(
         #     importance * tf.math.log(importance + 1e-8),
@@ -1284,7 +1266,7 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
 
         # Retrieved similarity (REAL)
         cos_retr = -tf.reduce_mean(tf.keras.losses.cosine_similarity(r1, r2))
-        print("Retrieved true cosine similarity:", float(cos_retr))
+        # print("Retrieved true cosine similarity:", float(cos_retr))
         retr_sims.append(cos_retr)
 
         # # --- combined feature similarity (optional) ---
@@ -1293,7 +1275,7 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
 
         # Combined similarity (REAL)
         cos_comb = -tf.keras.losses.cosine_similarity(z1, z2)
-        print("Combined true cosine similarity:", float(cos_comb))
+        # print("Combined true cosine similarity:", float(cos_comb))
         comb_sims.append(cos_comb)
 
         q1 = chunk_embs[0]
@@ -1306,7 +1288,7 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
             tf.keras.losses.cosine_similarity(q2[None, :], r2)
         )
 
-        print(f'C1 retrieval purity: {cos_qr1}, C2 retrieval purity: {cos_qr2}')
+        # print(f'C1 retrieval purity: {cos_qr1}, C2 retrieval purity: {cos_qr2}')
         c1s.append(cos_qr1)
         c2s.append(cos_qr2)
         # val_probs = 1 / (1 + np.exp(-logits))  # sigmoid
@@ -1361,6 +1343,29 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
         # loss = loss + 0.01 * loss_entropy
         acc = compute_accuracy(labels, class_logit)
 
+        query_labels = labels.numpy().reshape(-1)   # (B,)
+        valid_mask = (retrieved_labels != -1)       # (B, K)
+
+        matches = (retrieved_labels == query_labels[:, None]) & valid_mask
+        agreement = matches.sum() / np.maximum(valid_mask.sum(), 1)
+
+        per_query_agreement = matches.sum(axis=1) / np.maximum(valid_mask.sum(axis=1), 1)
+        mean_agreement = per_query_agreement.mean()
+
+        valid = (retrieved_labels != -1)
+        matches = (retrieved_labels == query_labels[:, None]) & valid
+        nonmatches = (retrieved_labels != query_labels[:, None]) & valid
+
+        pos_mass = (importance * matches).sum(axis=1)
+        neg_mass = (importance * nonmatches).sum(axis=1)
+
+        pos_avg = pos_mass / np.maximum(matches.sum(axis=1), 1)
+        neg_avg = neg_mass / np.maximum(nonmatches.sum(axis=1), 1)
+
+        print("mean pos attn/token:", pos_avg.mean())
+        print("mean neg attn/token:", neg_avg.mean())
+        print("mean pos mass:", pos_mass.mean())
+        print("mean neg mass:", neg_mass.mean())
         print(f"val batch loss: {loss:.4f}, val batch acc: {acc:.4f}")
         print()
 
@@ -1379,14 +1384,14 @@ def evaluate(chunk_encoder, val_ds, rag_head, proj_head, retriever, retrieval_ca
     # labels = labels.numpy().reshape(-1)
     # agreement = (retrieved_labels == labels[:, None])
     
-    query_labels = labels.numpy().reshape(-1)   # (B,)
-    valid_mask = (retrieved_labels != -1)       # (B, K)
+    # query_labels = labels.numpy().reshape(-1)   # (B,)
+    # valid_mask = (retrieved_labels != -1)       # (B, K)
 
-    matches = (retrieved_labels == query_labels[:, None]) & valid_mask
-    agreement = matches.sum() / np.maximum(valid_mask.sum(), 1)
+    # matches = (retrieved_labels == query_labels[:, None]) & valid_mask
+    # agreement = matches.sum() / np.maximum(valid_mask.sum(), 1)
 
-    per_query_agreement = matches.sum(axis=1) / np.maximum(valid_mask.sum(axis=1), 1)
-    mean_agreement = per_query_agreement.mean()
+    # per_query_agreement = matches.sum(axis=1) / np.maximum(valid_mask.sum(axis=1), 1)
+    # mean_agreement = per_query_agreement.mean()
 
     # agreement = agreement.mean()
 
@@ -1604,6 +1609,7 @@ if __name__ == "__main__":
         # CTRLF
         proj_head.save_weights(config.PROJ_WEIGHTS)
         ratt_head.save_weights(config.RATT_WEIGHTS)
+        print(f'SAVED RATT WEIGHTS AT {config.RATT_WEIGHTS}')
         # validation at end of every epoch
         evaluate(chunk_encoder, val_dataset, ratt_head, proj_head, retriever, retrieval_cache,bce,label_lookup)
         # rebuild_db()
