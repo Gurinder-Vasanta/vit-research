@@ -87,7 +87,7 @@ class ChunkEncoder(tf_keras.Model):
 
         # CLS output is the chunk embedding
         chunk_emb = x[:, 0, :]                                    # (B, D)
-        chunk_emb = tf.nn.l2_normalize(chunk_emb, axis=-1)
+        # chunk_emb = tf.nn.l2_normalize(chunk_emb, axis=-1)
 
         class_logit = self.class_head(chunk_emb, training=training)
 

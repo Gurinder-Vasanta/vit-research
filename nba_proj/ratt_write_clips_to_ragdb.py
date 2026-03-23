@@ -1,302 +1,430 @@
+import os
+import gc
+import time
 import pprint
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+from PIL import Image
 import chromadb
 from chromadb import PersistentClient
 
-# REMOVE tensorflow ViT
-# from official.vision.modeling.backbones import vit
-import tensorflow as tf, tf_keras
+import tensorflow as tf
+import tensorflow.keras as tf_keras
 
-import cv2
-import numpy as np
-import os
-
-# NEW: PyTorch + transformers imports
 import torch
 from transformers import ViTModel, ViTImageProcessor
-from multiprocessing import Pool
-import functools
-import time
-# import config_exp as config
-import config_chunks_cached as config_ratt
-import dataset
-from models.projection_head import ProjectionHead
- 
-# ------------------------------
-# GLOBAL CONFIG
-# ------------------------------
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3,4,5,6,7"
 
-HIDDEN = 768
-ENRICH_DIM = 768
-SIDE_DIM = 1
-TOTAL_DIM = 2 * HIDDEN + ENRICH_DIM + SIDE_DIM 
-np.random.seed(42)
+import dataset
+import config_chunks_cached as config_ratt
+from models.chunk_encoder import ChunkEncoder
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+CACHE_DIR = "./frame_cache_vit"
+STORE_NAME = "train_val_frames" #train_val_frames_all_vids
+FRAME_BATCH_SIZE = 1024
+NUM_LOAD_WORKERS = 16
+
+HIDDEN_SIZE = 768
+NUM_LAYERS = 3
+NUM_HEADS = 8
+
+# set this to your trained chunk encoder checkpoint
+CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_cached/chunk_encoder_best.weights.h5"
+
+
+# Chroma
+CHROMA_PATH = "./chroma_store"
+COLLECTION_NAME = "ratt_db_chunk_encoder_all_vids_new"
+COLLECTION_NAME_RELCLS = "ratt_db_chunk_encoder_all_vids_relcls_new"
+
+UPSERT_SIZE = 512
+SEED = 42
+
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ------------------------------
+# ============================================================
 # LOAD PRETRAINED GOOGLE VIT
-# ------------------------------
-# Automatically handles resizing + center cropping.
+# ============================================================
 processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
 vit_model = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
 vit_model.eval()
 
-projector = ProjectionHead(input_dim = 2304, hidden_dim=768, proj_dim=768)
-projector.build((None, 2304))
-projector.load_weights(config_ratt.PROJ_WEIGHTS)
 
-_ = projector(tf.zeros((1, 2304), dtype=tf.float32))
-projector.call = tf.function(projector.call)
-
-# time it took: 421.1687158672139
-
-# ------------------------------
+# ============================================================
 # HELPERS
-# ------------------------------
-def comparator(fname):
-    splitted = fname.split('_')
-    vid_num = int(splitted[0][3:])
-    frame_num = int(splitted[2].split('.')[0])
-    return (vid_num, frame_num)
-
-def get_clip_num(name):
-    return int(name.split('_')[2])
-
-def get_side(name):
-    return name.split('_')[3]
+# ============================================================
+def resolve_all_vids():
+    if hasattr(config_ratt, "TRAIN_VIDS") and hasattr(config_ratt, "TEST_VIDS"):
+        vids = sorted(set(list(config_ratt.TRAIN_VIDS) + list(config_ratt.TEST_VIDS)))
+    elif hasattr(config_ratt, "VIDS_TO_USE"):
+        vids = list(config_ratt.VIDS_TO_USE)
+    else:
+        raise ValueError("Could not find TRAIN_VIDS/TEST_VIDS or VIDS_TO_USE in config_chunks_cached.")
+    return vids
 
 
-# ------------------------------
+def make_chunk_id(c):
+    return f"vid{int(c['vid'])}_clip_{int(c['clip'])}_t_{float(c['t_center']):.3f}"
+
+
+# ============================================================
+# DATA PREP
+# ============================================================
+def build_all_chunk_samples():
+    vids = resolve_all_vids()
+    print("Using vids:", vids)
+
+    max_clips = getattr(config_ratt, "NUM_CLIPS_PER_VID", None)
+    samples = dataset.load_samples(vids, stride=1, max_clips=max_clips)
+
+    chunk_samples = dataset.build_chunks(
+        samples,
+        chunk_size=config_ratt.CHUNK_SIZE
+    )
+
+    print(f"Total chunks: {len(chunk_samples)}")
+    print("Example chunk:")
+    pprint.pprint(chunk_samples[0])
+
+    return chunk_samples
+
+
+def collect_unique_frame_paths(chunk_samples):
+    seen = set()
+    ordered = []
+
+    for c in chunk_samples:
+        for fp in c["frames"]:
+            if fp not in seen:
+                seen.add(fp)
+                ordered.append(fp)
+
+    return ordered
+
+
+# ============================================================
 # IMAGE LOADING
-# ------------------------------
-def im_to_array(frame_path):
-    """
-    Return resized numpy image as (432,768,3).
-    Google ViT processor will handle final 224x224 transform internally.
-    """
-    im = cv2.imread(frame_path)
-    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-    return im
-    # return cv2.resize(im, (768, 432), interpolation=cv2.INTER_AREA)
+# ============================================================
+def load_one_image(path):
+    img = Image.open(path).convert("RGB")
+    return np.array(img, dtype=np.uint8)
 
-def worker_prepare_frame(args):
-    frame_path, local_idx, total_frames, clip_num = args
 
-    img = im_to_array(frame_path)
+def load_frame_batch_parallel(frame_paths, executor):
+    imgs = list(executor.map(load_one_image, frame_paths))
+    return np.stack(imgs, axis=0)
 
-    # frame_idx the global frame number from filename, but we don't use it for t_norm
-    fname = os.path.basename(frame_path)
-    global_frame_idx = int(fname.split("_")[2].split('.')[0])
 
-    clip_folder = os.path.basename(os.path.dirname(frame_path))
-    side = get_side(clip_folder)
-
-    # Correct t_norm:
-    t_norm = local_idx / total_frames   # local_idx is 1..N
-
-    return (img, t_norm, side, local_idx, fname)
-
+# ============================================================
+# VIT EMBEDDING
+# ============================================================
 def hf_vit_embed_batch(frames_np):
     """
-    frames_np: (N, 432, 768, 3) uint8 or float32
-    Returns (N, 768) numpy embeddings (L2 normalized)
+    frames_np: (N, H, W, 3) uint8 or float32
+    returns: (N, 768) float32
     """
-    frames_np = frames_np.astype(np.float32)
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np, 0, 255).astype(np.uint8)
+
     frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
+
     with torch.no_grad():
-        inputs = processor(images=frames_list, return_tensors="pt",do_rescale=False).to(device)
+        inputs = processor(images=frames_list, return_tensors="pt").to(device)
         out = vit_model(**inputs)
-        cls = out.last_hidden_state[:, 0, :]  # (N,768)
+        cls = out.last_hidden_state[:, 0, :]   # (N, 768)
         cls = cls.cpu().numpy()
+
+        # keep same normalization convention as your cached store
         cls = cls / (np.linalg.norm(cls, axis=1, keepdims=True) + 1e-8)
-        return cls.astype(np.float32)
+        cls = cls.astype(np.float32)
 
-# ------------------------------
-# ENRICHMENT FUNCTIONS (unchanged)
-# ------------------------------
-def temporal_encoding(t_norm):
-    # higher, nonlinear, randomized phase encoding
-    freqs = np.linspace(5, 300, ENRICH_DIM)       # FAST oscillation
-    phases = np.random.uniform(0, 2*np.pi, ENRICH_DIM)
+    del inputs, out
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    # nonlinear time warp
-    t = t_norm ** 1.5
-
-    return np.sin(2 * np.pi * freqs * t + phases)
-    # freqs = np.linspace(5, 300, ENRICH_DIM)
-    # return np.sin(2 * np.pi * freqs * t_norm)
-
-def side_mask(side_str):
-    return np.ones(SIDE_DIM) if side_str == "left" else -np.ones(SIDE_DIM)
-
-def frame_index_encoding(idx, total_frames):
-    t = idx / total_frames
-    freqs = np.linspace(1, 16, ENRICH_DIM)
-    return np.cos(2 * np.pi * freqs * t)
+    return cls
 
 
-# ------------------------------
-# FIXED PROJECTION MATRIX
-# ------------------------------
-
-
-
-# ------------------------------
-# MAIN ENRICH EMBEDDING FN
-# ------------------------------
-   
-# ------------------------------
-# CHROMA CLIENT
-# ------------------------------
-client = PersistentClient(path="./chroma_store")
-# chromadb hnsw metadata keys; search this up and go to the ai overview
-ratt_db = client.get_or_create_collection(
-    name = 'ratt_db_cached_30_clips_ordered_fixed_rebuild_w_labels_24_chunk',
-    # name = 'rich_embeddings_7_vids_bs4_cls_rag_temp_12_epochs_rebuild',
-    # name='rich_embeddings_7_vids_bs4_cls_rag_12_epochs_rebuild',
-    metadata={"hnsw:space":"cosine",
-              }
-    )
-
-ratt_db_rel_cls = client.get_or_create_collection(
-    name = 'ratt_db_cached_30_clips_ordered_rel_cls_fixed_rebuild_w_labels_24_chunk',
-    # name = 'rich_embeddings_7_vids_bs4_cls_rag_temp_12_epochs_rebuild',
-    # name='rich_embeddings_7_vids_bs4_cls_rag_12_epochs_rebuild',
-    metadata={"hnsw:space":"cosine",
-              }
-    )
-
-ratt_db.delete(where={"vid_num": {"$ne": 'vid0'}})
-ratt_db_rel_cls.delete(where={"vid_num": {"$ne": 'vid0'}})
-# ------------------------------
-# PROCESS VIDEOS (unchanged)
-# ------------------------------
-vids = config_ratt.VIDS_TO_USE
-
-samples = dataset.load_samples(vids,stride=1,max_clips=config_ratt.NUM_CLIPS_PER_VID)
-chunk_samples = dataset.build_chunks(samples, chunk_size=24)
-pprint.pprint(chunk_samples[0])
-chunked_ds = dataset.build_tf_dataset_chunks(chunk_samples, batch_size=1)
-
-b_embeddings = []
-b_ids = []
-b_metadatas = []
-
-upsert_size = 512
-# input(len(chunked_ds))
-start = time.perf_counter()
-for frames_batch, metadata_batch, labels_batch in chunked_ds:
-    B = tf.shape(frames_batch)[0]
-    T = tf.shape(frames_batch)[1]
-    # pprint.pprint(metadata_batch) metadata batch has clip, frame paths, label, side, tcenter, twidth, vid
-    # pprint.pprint(labels_batch)
-    # input('stop')
-    # print(
-    #     tf.reduce_min(frames_batch),
-    #     tf.reduce_max(frames_batch),
-    #     tf.reduce_mean(frames_batch)
-    # )
-    # input('stop')
-    # input(frames_batch)
-    frames_np = tf.numpy_function(
-        hf_vit_embed_batch,
-        [tf.reshape(frames_batch, (-1, 432, 768, 3))],
-        tf.float32
-    )
-    frame_embs = tf.reshape(frames_np, (B, T, 768))
-    
-    
-    deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
-    
-    mean = tf.reduce_mean(frame_embs, axis=1)
-    mean_deltas = tf.reduce_mean(deltas, axis=1)
-    std_deltas = tf.math.reduce_std(deltas, axis=1)
-
-    raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
-
-    # thirds = tf.split(frame_embs, 3, axis=1)
-
-    # early = tf.reduce_mean(thirds[0], axis=1)
-    # mid   = tf.reduce_mean(thirds[1], axis=1)
-    # late  = tf.reduce_mean(thirds[2], axis=1)
-
-    # raw_chunk = tf.concat([early, mid, late], axis=-1)
-
-
-    # raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
-
-    projected = projector(tf.convert_to_tensor(raw_chunk, dtype=tf.float32)).numpy()
-
-    b_embeddings.append(projected)
-
-    # print()
-    # print(metadata_batch)
-    # print(labels_batch.numpy())
-    cur_chunk_id = f"vid{int(metadata_batch['vid'][0])}_clip_{int(metadata_batch['clip'][0])}_t_{float(metadata_batch['t_center'][0]):.3f}"
-    print(f'upserting id: {cur_chunk_id}')
-    b_ids.append(cur_chunk_id)
-    meta = {
-        "vid_num": int(metadata_batch["vid"][0]),
-        "clip_num": int(metadata_batch["clip"][0]),
-        "side": metadata_batch["side"][0].numpy().decode(),
-        'label': int(labels_batch.numpy()[0]),
-        "t_center": float(metadata_batch["t_center"][0]),
-        "t_width": float(metadata_batch["t_width"][0]),
+# ============================================================
+# FRAME STORE BUILD / LOAD
+# ============================================================
+def get_store_paths(store_name):
+    return {
+        "emb": os.path.join(CACHE_DIR, f"{store_name}_emb.dat"),
+        "paths": os.path.join(CACHE_DIR, f"{store_name}_paths.npy"),
+        "meta": os.path.join(CACHE_DIR, f"{store_name}_meta.npz"),
     }
 
-    b_metadatas.append(meta)
+
+def frame_store_exists(store_name):
+    paths = get_store_paths(store_name)
+    return (
+        os.path.exists(paths["emb"]) and
+        os.path.exists(paths["paths"]) and
+        os.path.exists(paths["meta"])
+    )
 
 
-    if(len(b_embeddings) == upsert_size): 
-        embeddings = np.concatenate(b_embeddings, axis=0)
-        ids = b_ids
-        metadatas = b_metadatas
-        start = time.perf_counter()
-        
+def build_frame_store(frame_paths, batch_size=512, num_workers=16, store_name="train_val_frames"):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    paths = get_store_paths(store_name)
+    n = len(frame_paths)
+
+    emb_mm = np.memmap(
+        paths["emb"],
+        dtype="float32",
+        mode="w+",
+        shape=(n, 768),
+    )
+
+    t_total0 = time.perf_counter()
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_paths = frame_paths[start:end]
+
+            t0 = time.perf_counter()
+            batch_imgs = load_frame_batch_parallel(batch_paths, executor)
+            t_load = time.perf_counter() - t0
+
+            t1 = time.perf_counter()
+            batch_embs = hf_vit_embed_batch(batch_imgs)
+            t_embed = time.perf_counter() - t1
+
+            emb_mm[start:end] = batch_embs
+
+            if ((start // batch_size) + 1) % 10 == 0 or end == n:
+                emb_mm.flush()
+
+            t_batch = time.perf_counter() - t0
+            print(f"[frame cache] wrote {end}/{n} in {t_batch:.2f}s")
+            print(f"load={t_load:.2f}s embed={t_embed:.2f}s total={t_batch:.2f}s")
+
+            del batch_imgs, batch_embs
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    emb_mm.flush()
+    np.save(paths["paths"], np.array(frame_paths, dtype=object))
+    np.savez_compressed(paths["meta"], n_frames=n, emb_dim=768)
+
+    total_elapsed = time.perf_counter() - t_total0
+    print(f"[frame cache] done in {total_elapsed:.2f}s")
+    print(f"[frame cache] saved embeddings to {paths['emb']}")
+    print(f"[frame cache] saved paths to      {paths['paths']}")
+    print(f"[frame cache] saved meta to       {paths['meta']}")
+
+
+def load_frame_store(store_name="train_val_frames"):
+    paths = get_store_paths(store_name)
+    meta = np.load(paths["meta"])
+
+    n_frames = int(meta["n_frames"])
+    emb_dim = int(meta["emb_dim"])
+
+    emb_mm = np.memmap(
+        paths["emb"],
+        dtype="float32",
+        mode="r",
+        shape=(n_frames, emb_dim),
+    )
+
+    frame_paths = np.load(paths["paths"], allow_pickle=True).tolist()
+    path_to_idx = {p: i for i, p in enumerate(frame_paths)}
+
+    print(f"[frame cache] loaded store '{store_name}'")
+    print(f"[frame cache] shape = ({n_frames}, {emb_dim})")
+
+    return emb_mm, frame_paths, path_to_idx
+
+
+# ============================================================
+# CHUNK GATHER
+# ============================================================
+def gather_chunk_embedding_batch(frame_emb_mm, chunk_indices_batch):
+    return frame_emb_mm[chunk_indices_batch].astype(np.float32)
+
+
+def build_chunk_index_array(chunk_samples, path_to_idx):
+    chunk_size = len(chunk_samples[0]["frames"])
+
+    X_idx = np.empty((len(chunk_samples), chunk_size), dtype=np.int32)
+    y = np.empty((len(chunk_samples),), dtype=np.float32)
+
+    for i, c in enumerate(chunk_samples):
+        X_idx[i] = [path_to_idx[p] for p in c["frames"]]
+        y[i] = np.float32(c["label"])
+
+    return X_idx, y
+
+
+# ============================================================
+# CHUNK ENCODER LOAD
+# ============================================================
+def load_chunk_encoder():
+    chunk_encoder = ChunkEncoder(
+        hidden_size=HIDDEN_SIZE,
+        num_layers=NUM_LAYERS,
+        num_heads=NUM_HEADS,
+        max_frames=config_ratt.CHUNK_SIZE,
+    )
+
+    dummy = tf.zeros((2, config_ratt.CHUNK_SIZE, HIDDEN_SIZE), dtype=tf.float32)
+    _ = chunk_encoder(dummy, training=False)
+
+    chunk_encoder.load_weights(CHUNK_ENCODER_WEIGHTS)
+    print(f"[chunk encoder] loaded weights from {CHUNK_ENCODER_WEIGHTS}")
+    return chunk_encoder
+
+
+# ============================================================
+# CHROMA
+# ============================================================
+def make_collections():
+    client = PersistentClient(path=CHROMA_PATH)
+
+    ratt_db = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+    ratt_db_relcls = client.get_or_create_collection(
+        name=COLLECTION_NAME_RELCLS,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+    return ratt_db, ratt_db_relcls
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    t0_all = time.perf_counter()
+
+    chunk_samples = build_all_chunk_samples()
+    all_frame_paths = collect_unique_frame_paths(chunk_samples)
+    print("unique frames:", len(all_frame_paths))
+
+    # Build or load frame store
+    if not frame_store_exists(STORE_NAME):
+        build_frame_store(
+            all_frame_paths,
+            batch_size=FRAME_BATCH_SIZE,
+            num_workers=NUM_LOAD_WORKERS,
+            store_name=STORE_NAME,
+        )
+    else:
+        print(f"[frame cache] store '{STORE_NAME}' already exists, checking coverage")
+
+    frame_emb_mm, frame_paths, path_to_idx = load_frame_store(STORE_NAME)
+
+    missing = [p for p in all_frame_paths if p not in path_to_idx]
+    if missing:
+        print(f"[frame cache] existing store missing {len(missing)} frames, rebuilding")
+        paths = get_store_paths(STORE_NAME)
+        for k in ("emb", "paths", "meta"):
+            if os.path.exists(paths[k]):
+                os.remove(paths[k])
+
+        build_frame_store(
+            all_frame_paths,
+            batch_size=FRAME_BATCH_SIZE,
+            num_workers=NUM_LOAD_WORKERS,
+            store_name=STORE_NAME,
+        )
+        frame_emb_mm, frame_paths, path_to_idx = load_frame_store(STORE_NAME)
+
+    chunk_indices, labels = build_chunk_index_array(chunk_samples, path_to_idx)
+    print("chunk_indices:", chunk_indices.shape)
+    print("labels:       ", labels.shape)
+
+    if chunk_indices.shape[1] != config_ratt.CHUNK_SIZE:
+        raise ValueError(
+            f"config CHUNK_SIZE={config_ratt.CHUNK_SIZE}, "
+            f"but chunk_indices width={chunk_indices.shape[1]}"
+        )
+
+    chunk_encoder = load_chunk_encoder()
+    ratt_db, ratt_db_relcls = make_collections()
+
+    # clear current contents if you want a full rebuild
+    ratt_db.delete(where={"vid_num": {"$gte": 0}})
+    ratt_db_relcls.delete(where={"vid_num": {"$gte": 0}})
+
+    b_embeddings = []
+    b_ids = []
+    b_metadatas = []
+
+    n_chunks = len(chunk_samples)
+    print(f"[populate] starting upserts for {n_chunks} chunks")
+
+    for start in range(0, n_chunks, UPSERT_SIZE):
+        end = min(start + UPSERT_SIZE, n_chunks)
+
+        idx_batch = chunk_indices[start:end]
+        label_batch = labels[start:end]
+        chunk_batch = chunk_samples[start:end]
+
+        frame_embs_batch = gather_chunk_embedding_batch(frame_emb_mm, idx_batch)
+        frame_embs_batch = tf.convert_to_tensor(frame_embs_batch, dtype=tf.float32)
+
+        chunk_embs, class_logits = chunk_encoder(frame_embs_batch, training=False)
+        chunk_embs = chunk_embs.numpy().astype(np.float32)
+        class_logits = class_logits.numpy().reshape(-1).astype(np.float32)
+
+        # optional: l2 normalize for cosine search
+        chunk_embs = chunk_embs / (np.linalg.norm(chunk_embs, axis=1, keepdims=True) + 1e-8)
+
+        for i, c in enumerate(chunk_batch):
+            cur_id = make_chunk_id(c)
+            b_ids.append(cur_id)
+            b_embeddings.append(chunk_embs[i:i+1])
+
+            meta = {
+                "vid_num": int(c["vid"]),
+                "clip_num": int(c["clip"]),
+                "side": str(c["side"]),
+                "label": int(label_batch[i]),
+                "t_center": float(c["t_center"]),
+                "t_width": float(c["t_width"]),
+                "class_logit": float(class_logits[i]),
+            }
+            b_metadatas.append(meta)
+
+        embeddings_np = np.concatenate(b_embeddings, axis=0)
+
+        t_up = time.perf_counter()
         ratt_db.upsert(
-                embeddings = np.concatenate(b_embeddings, axis=0), 
-                ids = b_ids, 
-                metadatas = b_metadatas
-            )
-        
-        ratt_db_rel_cls.upsert(
-                embeddings = np.concatenate(b_embeddings, axis=0), 
-                ids = b_ids, 
-                metadatas = b_metadatas
-            )
-        end = time.perf_counter() - start
-        print(f'upserted batch took {end} seconds')
+            embeddings=embeddings_np,
+            ids=b_ids,
+            metadatas=b_metadatas
+        )
+        ratt_db_relcls.upsert(
+            embeddings=embeddings_np,
+            ids=b_ids,
+            metadatas=b_metadatas
+        )
+        t_up = time.perf_counter() - t_up
+
+        print(f"[populate] upserted {end}/{n_chunks} chunks in {t_up:.2f}s")
+
         b_embeddings = []
         b_ids = []
         b_metadatas = []
 
-if(len(b_embeddings) != 0):
-        print(len(b_embeddings))
-        embeddings = np.concatenate(b_embeddings, axis=0)
-        ids = b_ids
-        metadatas = b_metadatas
-        
-        ratt_db.upsert(
-                embeddings = np.concatenate(b_embeddings, axis=0), 
-                ids = b_ids, 
-                metadatas = b_metadatas
-            )
-        
-        ratt_db_rel_cls.upsert(
-                embeddings = np.concatenate(b_embeddings, axis=0), 
-                ids = b_ids, 
-                metadatas = b_metadatas
-            )
-        print('upserted leftover batch')
-end = time.perf_counter()
-print(f'time it took: {end - start}')
-    # input('stop')
-    # metadata: 
-#     {'clip': <tf.Tensor: shape=(1,), dtype=int32, numpy=array([2], dtype=int32)>,
-#  'side': <tf.Tensor: shape=(1,), dtype=string, numpy=array([b'left'], dtype=object)>,
-#  't_center': <tf.Tensor: shape=(1,), dtype=float32, numpy=array([0.41941392], dtype=float32)>,
-#  't_width': <tf.Tensor: shape=(1,), dtype=float32, numpy=array([0.04029304], dtype=float32)>,
-#  'vid': <tf.Tensor: shape=(1,), dtype=int32, numpy=array([2], dtype=int32)>}
+    print(f"[done] total time: {time.perf_counter() - t0_all:.2f}s")
 
+
+if __name__ == "__main__":
+    main()

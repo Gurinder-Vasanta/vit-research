@@ -17,18 +17,21 @@ def comparator(fname):
     frame_num = int(splitted[2].split('.')[0])
     return (vid_num, frame_num)
 
-def load_samples(train_vids, stride = 1, max_clips = 10):
+def load_samples(train_vids, stride = 1, max_clips = 30):
     already_labelled = pd.read_csv("clips_label.csv")
     
     samples = []
 
+    print(train_vids)
     for vid in train_vids:
         # clip_root = f"/home/.../clips_finalized_{vid}"
 
-        clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}'
+        print(vid)
+        # clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}'
+        clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_{vid}_smart'
         clips = sorted(os.listdir(clip_root),key=comparator) 
     
-        clips = clips[0:max_clips]
+        clips = clips[0:max_clips] #this should change to 50:50+max_clips (because first 50 will get added )
         for clip in clips:
             clip_path = os.path.join(clip_root, clip)
             frames = sorted(os.listdir(clip_path),key=comparator) 
@@ -170,7 +173,36 @@ def parse_chunk(chunk, img_size=(432,768)):
     # label = tf.constant(label, dtype=tf.int32)
     return imgs, metadata, label
 
-def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_workers=16):
+# chunk_samples.append({
+#                 "frames": frame_paths,    # list of image paths (length chunk_size)
+#                 "label": label,
+#                 "side": side,
+#                 "vid": vid,
+#                 "clip": clip,
+#                 "t_center": t_center,
+#                 "t_width": t_width, #max(t_width, 0.4)
+#             })
+# {'frames': ['/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19754.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19755.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19756.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19757.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19758.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19759.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19760.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19761.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19762.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19763.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19764.jpg', 
+#             '/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_vid3_smart/vid3_clip_4_left/vid3_frame_19765.jpg'], 
+#  'label': 1, 
+#  'side': 'left', 
+#  'vid': 3, 
+#  'clip': 4, 
+#  't_center': 0.11796536796536798, 
+#  't_width': 0.023809523809523794}
+
+def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_workers=16, training = False):
+    # vids 8 and 10 are test vids
     def gen():
         for sample in chunk_samples:
             yield sample
@@ -188,7 +220,7 @@ def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_w
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
 
     # shuffle dataset order
-    ds = ds.shuffle(len(chunk_samples), reshuffle_each_iteration=True)
+    ds = ds.shuffle(len(chunk_samples), reshuffle_each_iteration=True) # 2048 was len(chunk_samples)
 
     # map to parsed tensors (loads images, builds metadata dict)
     ds = ds.map(lambda chunk: parse_chunk(chunk, img_size),
