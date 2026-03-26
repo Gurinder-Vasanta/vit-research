@@ -35,7 +35,8 @@ PHASE_2_LEARNING_RATE = 1e-3
 
 CACHE_PATH = f"./cache/retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_chunk_encoded_temporal.pkl" #temporary_new_way
 STAGE3_CACHE_PATH = f"./cache/stage3_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_chunk_encoded_new.pkl"
-STAGE2_CACHE_PATH = f"./cache/stage2_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}.pkl"
+STAGE2_CACHE_PATH = f"./cache/stage2_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_all_train_videos.pkl"
+# STAGE2_CACHE_PATH = f"./cache/stage2_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_all_train_videos_faster_cache.pkl"
 ENCODED_EMBEDDINGS = f"./cache/encoded_embeddings.pkl"
 
 NUM_QUERIES = TOP_K #was 16
@@ -57,8 +58,8 @@ PRINT_EVERY = 1
 NUM_CLIPS_PER_VID = 30
 # VIDS_TO_USE = ['vid3','vid4','vid6']
 VIDS_TO_USE = ["vid2", 'vid3','vid4','vid5','vid6','vid7','vid8','vid10']
-# TRAIN_VIDS = ['vid2','vid3','vid4','vid5','vid6','vid7','vid8']
-TRAIN_VIDS = ['vid2']
+TRAIN_VIDS = ['vid2','vid3','vid4','vid5','vid6','vid7','vid8']
+# TRAIN_VIDS = ['vid2']
 TEST_VIDS = ['vid10']
 
 
@@ -90,12 +91,13 @@ TEMPORAL_EXPAND_WINDOW = 0.50
 # -----------------------------
 # config
 # -----------------------------
-K_SIM = 20
-K_CONTRAST = 20
-K_TEMPORAL = 20
+K_SIM = 2
+K_CONTRAST = 2
+K_TEMPORAL = 2
 
 SEARCH_K_CONTENT = 500
 SEARCH_K_TEMPORAL = 500
 
 FUTURE_CHUNK_STEP = 5
+POS_WEIGHT = 2
 # VIDS_TO_USE = ['vid3']

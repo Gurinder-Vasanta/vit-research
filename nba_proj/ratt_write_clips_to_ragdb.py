@@ -29,17 +29,18 @@ FRAME_BATCH_SIZE = 1024
 NUM_LOAD_WORKERS = 16
 
 HIDDEN_SIZE = 768
-NUM_LAYERS = 3
+NUM_LAYERS = 4
 NUM_HEADS = 8
 
 # set this to your trained chunk encoder checkpoint
-CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_cached/chunk_encoder_best.weights.h5"
+# CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_cached/chunk_encoder_best_v3.weights.h5"
+CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_chunk12_stride4/chunk_encoder_best_v3.weights.h5"
 
 
 # Chroma
 CHROMA_PATH = "./chroma_store"
-COLLECTION_NAME = "ratt_db_chunk_encoder_all_vids_new"
-COLLECTION_NAME_RELCLS = "ratt_db_chunk_encoder_all_vids_relcls_new"
+COLLECTION_NAME = "ratt_db_chunk_encoder_all_vids_overlap_chunks"
+COLLECTION_NAME_RELCLS = "ratt_db_chunk_encoder_all_vids_relcls_overlap_chunks"
 
 UPSERT_SIZE = 512
 SEED = 42
@@ -390,7 +391,6 @@ def main():
             cur_id = make_chunk_id(c)
             b_ids.append(cur_id)
             b_embeddings.append(chunk_embs[i:i+1])
-
             meta = {
                 "vid_num": int(c["vid"]),
                 "clip_num": int(c["clip"]),
@@ -399,6 +399,8 @@ def main():
                 "t_center": float(c["t_center"]),
                 "t_width": float(c["t_width"]),
                 "class_logit": float(class_logits[i]),
+                "start_idx": int(c['start_idx']),
+                "end_idx": int(c['end_idx'])
             }
             b_metadatas.append(meta)
 
