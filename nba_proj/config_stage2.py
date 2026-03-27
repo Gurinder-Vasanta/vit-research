@@ -20,9 +20,11 @@ BUILD_RET_C = 75 #this was a 100
 TOP_K = 32
 SEARCH_K = 100#750
 
-EPOCHS = 12
+EPOCHS = 3
 REBUILD_EVERY = 3
-ACCUM_BATCH_SIZE = 1
+CHUNK_BATCH_SIZE = 32
+PRINT_EVERY = 1
+ACCUM_BATCH_SIZE = 3
 
 ADJUST_CONTRASTIVE_LOSS_EVERY = 2
 # INCREMENT_CONTRASTIVE_LOSS_BY = 0.025
@@ -35,7 +37,7 @@ PHASE_2_LEARNING_RATE = 1e-3
 
 CACHE_PATH = f"./cache/retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_chunk_encoded_temporal.pkl" #temporary_new_way
 STAGE3_CACHE_PATH = f"./cache/stage3_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_chunk_encoded_new.pkl"
-STAGE2_CACHE_PATH = f"./cache/stage2_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_all_train_videos.pkl"
+STAGE2_CACHE_PATH = f"./cache/stage2_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_all_train_videos_topk10.pkl"
 # STAGE2_CACHE_PATH = f"./cache/stage2_retrieval_cache_{CHROMADB_COLLECTION}_searchk_{SEARCH_K}_all_train_videos_faster_cache.pkl"
 ENCODED_EMBEDDINGS = f"./cache/encoded_embeddings.pkl"
 
@@ -51,9 +53,6 @@ END_CHUNK_TRAIN = 3750
 
 START_CHUNK_VALID = 4000
 END_CHUNK_VALID = 4100
-
-CHUNK_BATCH_SIZE = 16
-PRINT_EVERY = 1
 
 NUM_CLIPS_PER_VID = 30
 # VIDS_TO_USE = ['vid3','vid4','vid6']
@@ -91,9 +90,9 @@ TEMPORAL_EXPAND_WINDOW = 0.50
 # -----------------------------
 # config
 # -----------------------------
-K_SIM = 2
-K_CONTRAST = 2
-K_TEMPORAL = 2
+K_SIM = 3
+K_CONTRAST = 3
+K_TEMPORAL = 3
 
 SEARCH_K_CONTENT = 500
 SEARCH_K_TEMPORAL = 500

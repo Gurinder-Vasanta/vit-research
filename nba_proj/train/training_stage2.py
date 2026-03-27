@@ -29,11 +29,16 @@ import pickle
 from models.chunk_encoder import ChunkEncoder
 from models.ratt_v2 import RATTHeadV2
 
+import gc 
+
 # support_reranker = CandidateReranker(...)
 # contrast_reranker = CandidateReranker(...)
 # temporal_reranker = CandidateReranker(...)
 
 # ratt_head = RATTHeadV2(...)
+
+tf.keras.backend.clear_session()
+gc.collect()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -43,6 +48,19 @@ hf_vit = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
 hf_vit.eval()
 
 layers = tf_keras.layers
+
+SEED = 12
+
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+try:
+    tf.config.experimental.enable_op_determinism()
+except Exception:
+    pass
 
 def make_chunk_key(chunk, precision=6):
     # pprint.pprint(chunk)
@@ -493,164 +511,6 @@ def build_retrieval_cache(
     # build cache
     # -----------------------------
 
-    print("[CACHE] Building retrieval cache...")
-    cache = {}
-
-    pad_meta_template = {
-        "label": -1,
-        "side": "PAD",
-        "vid": -1,
-        "clip": -1,
-        "t_center": -1.0,
-        "t_width": -1.0,
-        "start_idx": -1,
-        "end_idx": -1,
-    }
-
-    QUERY_BATCH_SIZE = 16   # try 64 / 128 / 256
-
-    for batch_start in range(0, len(all_chunks), QUERY_BATCH_SIZE):
-        batch_chunks = all_chunks[batch_start: batch_start + QUERY_BATCH_SIZE]
-
-        batch_keys = []
-        batch_query_embs = []
-        batch_future_embs = []
-        batch_query_meta = []
-
-        # -------------------------
-        # gather this batch's query/future data
-        # -------------------------
-        for chunk in batch_chunks:
-            key = make_chunk_key(chunk)
-            query_emb = chunk_emb_lookup[key]
-            query_meta = meta_lookup[key]
-
-            next_key = future_key_lookup[key]
-            if next_key is None:
-                future_emb = np.zeros_like(query_emb)
-            else:
-                future_emb = chunk_emb_lookup[next_key]
-
-            batch_keys.append(key)
-            batch_query_embs.append(query_emb)
-            batch_future_embs.append(future_emb)
-            batch_query_meta.append(query_meta)
-
-        # -------------------------
-        # do batched ANN queries
-        # -------------------------
-        batch_content_candidates = query_collection_batch(
-            batch_query_embs, collection, config.SEARCH_K_CONTENT
-        )
-
-        batch_temporal_candidates = query_collection_batch(
-            batch_future_embs, collection, config.SEARCH_K_TEMPORAL
-        )
-
-        # -------------------------
-        # per-item filtering / packing
-        # -------------------------
-        for j, key in enumerate(batch_keys):
-            query_emb = batch_query_embs[j]
-            future_emb = batch_future_embs[j]
-            query_meta = batch_query_meta[j]
-
-            # ----- content: sim + contrast
-            content_candidates = batch_content_candidates[j]
-
-            sim_items = []
-            contrast_items = []
-            seen_sim = set()
-            seen_contrast = set()
-
-            for cand in content_candidates:
-                cand_meta = cand["meta"]
-
-                if same_chunk_meta(query_meta, cand_meta):
-                    continue
-
-                if cand_meta["side"] != query_meta["side"]:
-                    continue
-
-                sig = dedup_signature(cand_meta)
-
-                if (
-                    cand_meta["label"] == query_meta["label"]
-                    and sig not in seen_sim
-                    and len(sim_items) < config.K_SIM
-                ):
-                    sim_items.append(cand)
-                    seen_sim.add(sig)
-
-                if (
-                    cand_meta["label"] != query_meta["label"]
-                    and sig not in seen_contrast
-                    and len(contrast_items) < config.K_CONTRAST
-                ):
-                    contrast_items.append(cand)
-                    seen_contrast.add(sig)
-
-                if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
-                    break
-
-            sim_embs, sim_meta = pad_or_trim(
-                sim_items, config.K_SIM, emb_dim, pad_meta_template
-            )
-            contrast_embs, contrast_meta = pad_or_trim(
-                contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
-            )
-
-            # ----- temporal
-            temporal_candidates = batch_temporal_candidates[j]
-
-            temporal_items = []
-            seen_temporal = set()
-
-            for cand in temporal_candidates:
-                cand_meta = cand["meta"]
-
-                if same_chunk_meta(query_meta, cand_meta):
-                    continue
-
-                if cand_meta["side"] != query_meta["side"]:
-                    continue
-
-                sig = dedup_signature(cand_meta)
-                if sig in seen_temporal:
-                    continue
-
-                temporal_items.append(cand)
-                seen_temporal.add(sig)
-
-                if len(temporal_items) >= config.K_TEMPORAL:
-                    break
-
-            temporal_embs, temporal_meta = pad_or_trim(
-                temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
-            )
-
-            # ----- save entry
-            cache[key] = {
-                "query_emb": query_emb,
-                "future_emb": future_emb,
-                "query_meta": query_meta,
-
-                "sim_embs": sim_embs,
-                "sim_meta": sim_meta,
-
-                "contrast_embs": contrast_embs,
-                "contrast_meta": contrast_meta,
-
-                "temporal_embs": temporal_embs,
-                "temporal_meta": temporal_meta,
-            }
-
-        built_so_far = min(batch_start + QUERY_BATCH_SIZE, len(all_chunks))
-        print(f"[CACHE] built {built_so_far}/{len(all_chunks)}")
-
-        if built_so_far % 1000 == 0 or built_so_far == len(all_chunks):
-            print("[CACHE] saving cache checkpoint")
-            save_retrieval_cache(cache, config.STAGE2_CACHE_PATH)
     # print("[CACHE] Building retrieval cache...")
     # cache = {}
 
@@ -665,127 +525,285 @@ def build_retrieval_cache(
     #     "end_idx": -1,
     # }
 
-    # for i, chunk in enumerate(all_chunks):
-    #     key = make_chunk_key(chunk)
-    #     query_emb = chunk_emb_lookup[key]
-    #     query_meta = meta_lookup[key]
+    # QUERY_BATCH_SIZE = 16   # try 64 / 128 / 256
+
+    # for batch_start in range(0, len(all_chunks), QUERY_BATCH_SIZE):
+    #     batch_chunks = all_chunks[batch_start: batch_start + QUERY_BATCH_SIZE]
+
+    #     batch_keys = []
+    #     batch_query_embs = []
+    #     batch_future_embs = []
+    #     batch_query_meta = []
 
     #     # -------------------------
-    #     # future_emb = literal next chunk in same (vid, clip)
+    #     # gather this batch's query/future data
     #     # -------------------------
-    #     next_key = future_key_lookup[key]
-    #     if next_key is None:
-    #         future_emb = np.zeros_like(query_emb)
-    #     else:
-    #         future_emb = chunk_emb_lookup[next_key]
+    #     for chunk in batch_chunks:
+    #         key = make_chunk_key(chunk)
+    #         query_emb = chunk_emb_lookup[key]
+    #         query_meta = meta_lookup[key]
+
+    #         next_key = future_key_lookup[key]
+    #         if next_key is None:
+    #             future_emb = np.zeros_like(query_emb)
+    #         else:
+    #             future_emb = chunk_emb_lookup[next_key]
+
+    #         batch_keys.append(key)
+    #         batch_query_embs.append(query_emb)
+    #         batch_future_embs.append(future_emb)
+    #         batch_query_meta.append(query_meta)
 
     #     # -------------------------
-    #     # content query: sim + contrast
+    #     # do batched ANN queries
     #     # -------------------------
-    #     content_candidates = query_collection(query_emb, collection, config.SEARCH_K_CONTENT)
+    #     batch_content_candidates = query_collection_batch(
+    #         batch_query_embs, collection, config.SEARCH_K_CONTENT
+    #     )
 
-    #     sim_items = []
-    #     contrast_items = []
+    #     batch_temporal_candidates = query_collection_batch(
+    #         batch_future_embs, collection, config.SEARCH_K_TEMPORAL
+    #     )
 
-    #     seen_sim = set()
-    #     seen_contrast = set()
+    #     # -------------------------
+    #     # per-item filtering / packing
+    #     # -------------------------
+    #     for j, key in enumerate(batch_keys):
+    #         query_emb = batch_query_embs[j]
+    #         future_emb = batch_future_embs[j]
+    #         query_meta = batch_query_meta[j]
 
-    #     for cand in content_candidates:
-    #         cand_meta = cand["meta"]
+    #         # ----- content: sim + contrast
+    #         content_candidates = batch_content_candidates[j]
 
-    #         # skip exact self
-    #         if same_chunk_meta(query_meta, cand_meta):
-    #             continue
+    #         sim_items = []
+    #         contrast_items = []
+    #         seen_sim = set()
+    #         seen_contrast = set()
 
-    #         # same side only
-    #         if cand_meta["side"] != query_meta["side"]:
-    #             continue
-            
-    #         sig = dedup_signature(cand_meta)
+    #         for cand in content_candidates:
+    #             cand_meta = cand["meta"]
 
-    #         # SIM
-    #         if (
-    #             cand_meta['label'] == query_meta['label']
-    #             and sig not in seen_sim 
-    #             and len(sim_items) < config.K_SIM
+    #             if same_chunk_meta(query_meta, cand_meta):
+    #                 continue
+
+    #             if cand_meta["side"] != query_meta["side"]:
+    #                 continue
+
+    #             sig = dedup_signature(cand_meta)
+
+    #             if (
+    #                 cand_meta["label"] == query_meta["label"]
+    #                 and sig not in seen_sim
+    #                 and len(sim_items) < config.K_SIM
     #             ):
-    #             sim_items.append(cand)
-    #             seen_sim.add(sig)
+    #                 sim_items.append(cand)
+    #                 seen_sim.add(sig)
 
-    #         # CONTRAST
-    #         if (
-    #             cand_meta["label"] != query_meta["label"]
-    #             and sig not in seen_contrast
-    #             and len(contrast_items) < config.K_CONTRAST
-    #         ):
-    #             contrast_items.append(cand)
-    #             seen_contrast.add(sig)
+    #             if (
+    #                 cand_meta["label"] != query_meta["label"]
+    #                 and sig not in seen_contrast
+    #                 and len(contrast_items) < config.K_CONTRAST
+    #             ):
+    #                 contrast_items.append(cand)
+    #                 seen_contrast.add(sig)
 
-    #         if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
-    #             break
+    #             if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
+    #                 break
 
-    #     sim_embs, sim_meta = pad_or_trim(sim_items, config.K_SIM, emb_dim, pad_meta_template)
-    #     contrast_embs, contrast_meta = pad_or_trim(
-    #         contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
-    #     )
+    #         sim_embs, sim_meta = pad_or_trim(
+    #             sim_items, config.K_SIM, emb_dim, pad_meta_template
+    #         )
+    #         contrast_embs, contrast_meta = pad_or_trim(
+    #             contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
+    #         )
 
-    #     # -------------------------
-    #     # temporal query: use future_emb
-    #     # -------------------------
-    #     temporal_candidates = query_collection(future_emb, collection, config.SEARCH_K_TEMPORAL)
+    #         # ----- temporal
+    #         temporal_candidates = batch_temporal_candidates[j]
 
-    #     temporal_items = []
-    #     seen_temporal = set()
+    #         temporal_items = []
+    #         seen_temporal = set()
 
-    #     for cand in temporal_candidates:
-    #         cand_meta = cand["meta"]
+    #         for cand in temporal_candidates:
+    #             cand_meta = cand["meta"]
 
-    #         # skip exact self
-    #         if same_chunk_meta(query_meta, cand_meta):
-    #             continue
+    #             if same_chunk_meta(query_meta, cand_meta):
+    #                 continue
 
-    #         # same side only
-    #         if cand_meta["side"] != query_meta["side"]:
-    #             continue
+    #             if cand_meta["side"] != query_meta["side"]:
+    #                 continue
 
-    #         sig = dedup_signature(cand_meta)
-    #         if sig in seen_temporal:
-    #             continue
+    #             sig = dedup_signature(cand_meta)
+    #             if sig in seen_temporal:
+    #                 continue
 
-    #         temporal_items.append(cand)
-    #         seen_temporal.add(sig)
+    #             temporal_items.append(cand)
+    #             seen_temporal.add(sig)
 
-    #         if len(temporal_items) >= config.K_TEMPORAL:
-    #             break
+    #             if len(temporal_items) >= config.K_TEMPORAL:
+    #                 break
 
-    #     temporal_embs, temporal_meta = pad_or_trim(
-    #         temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
-    #     )
+    #         temporal_embs, temporal_meta = pad_or_trim(
+    #             temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
+    #         )
 
-    #     # -------------------------
-    #     # save entry
-    #     # -------------------------
-    #     cache[key] = {
-    #         "query_emb": query_emb,
-    #         "future_emb": future_emb,
-    #         "query_meta": query_meta,
+    #         # ----- save entry
+    #         cache[key] = {
+    #             "query_emb": query_emb,
+    #             "future_emb": future_emb,
+    #             "query_meta": query_meta,
 
-    #         "sim_embs": sim_embs,
-    #         "sim_meta": sim_meta,
+    #             "sim_embs": sim_embs,
+    #             "sim_meta": sim_meta,
 
-    #         "contrast_embs": contrast_embs,
-    #         "contrast_meta": contrast_meta,
+    #             "contrast_embs": contrast_embs,
+    #             "contrast_meta": contrast_meta,
 
-    #         "temporal_embs": temporal_embs,
-    #         "temporal_meta": temporal_meta,
-    #     }
+    #             "temporal_embs": temporal_embs,
+    #             "temporal_meta": temporal_meta,
+    #         }
 
-    #     if (i + 1) % 10 == 0 or (i + 1) == len(all_chunks):
-    #         print(f"[CACHE] built {i+1}/{len(all_chunks)}")
-    #     if (i + 1) % 100 == 0:
-    #         print(f"[CACHE] saving cache checkpoint")
-    #         save_retrieval_cache(cache,config.STAGE2_CACHE_PATH)
-    # return cache
+    #     built_so_far = min(batch_start + QUERY_BATCH_SIZE, len(all_chunks))
+    #     print(f"[CACHE] built {built_so_far}/{len(all_chunks)}")
+
+    #     if built_so_far % 1000 == 0 or built_so_far == len(all_chunks):
+    #         print("[CACHE] saving cache checkpoint")
+    #         save_retrieval_cache(cache, config.STAGE2_CACHE_PATH)
+    print("[CACHE] Building retrieval cache...")
+    cache = {}
+
+    pad_meta_template = {
+        "label": -1,
+        "side": "PAD",
+        "vid": -1,
+        "clip": -1,
+        "t_center": -1.0,
+        "t_width": -1.0,
+        "start_idx": -1,
+        "end_idx": -1,
+    }
+
+    for i, chunk in enumerate(all_chunks):
+        key = make_chunk_key(chunk)
+        query_emb = chunk_emb_lookup[key]
+        query_meta = meta_lookup[key]
+
+        # -------------------------
+        # future_emb = literal next chunk in same (vid, clip)
+        # -------------------------
+        next_key = future_key_lookup[key]
+        if next_key is None:
+            future_emb = np.zeros_like(query_emb)
+        else:
+            future_emb = chunk_emb_lookup[next_key]
+
+        # -------------------------
+        # content query: sim + contrast
+        # -------------------------
+        content_candidates = query_collection(query_emb, collection, config.SEARCH_K_CONTENT)
+
+        sim_items = []
+        contrast_items = []
+
+        seen_sim = set()
+        seen_contrast = set()
+
+        for cand in content_candidates:
+            cand_meta = cand["meta"]
+
+            # skip exact self
+            if same_chunk_meta(query_meta, cand_meta):
+                continue
+
+            # same side only
+            if cand_meta["side"] != query_meta["side"]:
+                continue
+            
+            sig = dedup_signature(cand_meta)
+
+            # SIM
+            if (
+                cand_meta['label'] == query_meta['label']
+                and sig not in seen_sim 
+                and len(sim_items) < config.K_SIM
+                ):
+                sim_items.append(cand)
+                seen_sim.add(sig)
+
+            # CONTRAST
+            if (
+                cand_meta["label"] != query_meta["label"]
+                and sig not in seen_contrast
+                and len(contrast_items) < config.K_CONTRAST
+            ):
+                contrast_items.append(cand)
+                seen_contrast.add(sig)
+
+            if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
+                break
+
+        sim_embs, sim_meta = pad_or_trim(sim_items, config.K_SIM, emb_dim, pad_meta_template)
+        contrast_embs, contrast_meta = pad_or_trim(
+            contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
+        )
+
+        # -------------------------
+        # temporal query: use future_emb
+        # -------------------------
+        temporal_candidates = query_collection(future_emb, collection, config.SEARCH_K_TEMPORAL)
+
+        temporal_items = []
+        seen_temporal = set()
+
+        for cand in temporal_candidates:
+            cand_meta = cand["meta"]
+
+            # skip exact self
+            if same_chunk_meta(query_meta, cand_meta):
+                continue
+
+            # same side only
+            if cand_meta["side"] != query_meta["side"]:
+                continue
+
+            sig = dedup_signature(cand_meta)
+            if sig in seen_temporal:
+                continue
+
+            temporal_items.append(cand)
+            seen_temporal.add(sig)
+
+            if len(temporal_items) >= config.K_TEMPORAL:
+                break
+
+        temporal_embs, temporal_meta = pad_or_trim(
+            temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
+        )
+
+        # -------------------------
+        # save entry
+        # -------------------------
+        cache[key] = {
+            "query_emb": query_emb,
+            "future_emb": future_emb,
+            "query_meta": query_meta,
+
+            "sim_embs": sim_embs,
+            "sim_meta": sim_meta,
+
+            "contrast_embs": contrast_embs,
+            "contrast_meta": contrast_meta,
+
+            "temporal_embs": temporal_embs,
+            "temporal_meta": temporal_meta,
+        }
+
+        if (i + 1) % 10 == 0 or (i + 1) == len(all_chunks):
+            print(f"[CACHE] built {i+1}/{len(all_chunks)}")
+        if (i + 1) % 100 == 0:
+            print(f"[CACHE] saving cache checkpoint")
+            save_retrieval_cache(cache,config.STAGE2_CACHE_PATH)
+    return cache
 
 def save_retrieval_cache(cache, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1088,12 +1106,12 @@ def eval_step(
 
     class_logits, cls_out, aux = ratt_head(
         chunk_embs=query_embs,
-        # support_tokens=support_tokens,
-        # contrast_tokens=contrast_tokens,
-        # temporal_tokens=temporal_tokens,
-        support_tokens=zeros_support,
-        contrast_tokens=zeros_contrast,
-        temporal_tokens=zeros_temporal,
+        support_tokens=support_tokens,
+        contrast_tokens=contrast_tokens,
+        temporal_tokens=temporal_tokens,
+        # support_tokens=zeros_support,
+        # contrast_tokens=zeros_contrast,
+        # temporal_tokens=zeros_temporal,
         training=False,
     )
 
@@ -1294,6 +1312,7 @@ if __name__ == "__main__":
     frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
     if(os.path.exists(config.STAGE2_CACHE_PATH)):
         cache = load_retrieval_cache(config.STAGE2_CACHE_PATH)
+        # print(cache)
         print("[CACHE] loaded cache")
     else:
         cache = build_retrieval_cache(
@@ -1321,6 +1340,9 @@ if __name__ == "__main__":
         num_heads=8,
         num_layers=2,
     )
+
+    for v in ratt_head.trainable_variables[:5]:
+        print(v.name, float(tf.reduce_mean(v).numpy()), float(tf.math.reduce_std(v).numpy()))
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
 

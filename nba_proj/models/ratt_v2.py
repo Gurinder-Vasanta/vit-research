@@ -10,11 +10,32 @@ class RATTHeadV2(tf_keras.Model):
     def __init__(self, hidden_size=768, num_heads=8, num_layers=2, mlp_dim=128):
         super().__init__()
         self.hidden_size = hidden_size
+        SEED = 1234
+        # self.support_proj = layers.Dense(hidden_size, name="support_proj")
+        # self.contrast_proj = layers.Dense(hidden_size, name="contrast_proj")
+        # self.temporal_proj = layers.Dense(hidden_size, name="temporal_proj",activation='relu')
 
-        self.support_proj = layers.Dense(hidden_size, name="support_proj",activation='relu')
-        self.contrast_proj = layers.Dense(hidden_size, name="contrast_proj")
-        self.temporal_proj = layers.Dense(hidden_size, name="temporal_proj")
+        self.support_proj = layers.Dense(
+            hidden_size,
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=SEED + 1),
+            bias_initializer="zeros",
+            name="support_proj",
+        )
 
+        self.contrast_proj = layers.Dense(
+            hidden_size,
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=SEED + 2),
+            bias_initializer="zeros",
+            name="contrast_proj",
+        )
+
+        self.temporal_proj = layers.Dense(
+            hidden_size,
+            activation='relu',
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=SEED + 3),
+            bias_initializer="zeros",
+            name="temporal_proj",
+        )
         self.transformer_blocks = []
         for _ in range(num_layers):
             block = nn_blocks.TransformerEncoderBlock(
@@ -38,27 +59,55 @@ class RATTHeadV2(tf_keras.Model):
         self.cls_token = self.add_weight(
             name="cls_token",
             shape=(1, 1, hidden_size),
-            initializer="random_normal",
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.02, seed=SEED + 1),
             trainable=True,
         )
         self.support_token = self.add_weight(
             name="support_token",
             shape=(1, 1, hidden_size),
-            initializer="random_normal",
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.02, seed=SEED + 2),
             trainable=True,
         )
         self.contrast_token = self.add_weight(
             name="contrast_token",
             shape=(1, 1, hidden_size),
-            initializer="random_normal",
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.02, seed=SEED + 3),
             trainable=True,
         )
         self.temporal_token = self.add_weight(
             name="temporal_token",
             shape=(1, 1, hidden_size),
-            initializer="random_normal",
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.02, seed=SEED + 4),
             trainable=True,
         )
+        # self.cls_token = self.add_weight(
+        #     name="cls_token",
+        #     shape=(1, 1, hidden_size),
+        #     # initializer="random_normal",
+        #     initializer='zeros',
+        #     trainable=True,
+        # )
+        # self.support_token = self.add_weight(
+        #     name="support_token",
+        #     shape=(1, 1, hidden_size),
+        #     # initializer="random_normal",
+        #     initializer='zeros',
+        #     trainable=True,
+        # )
+        # self.contrast_token = self.add_weight(
+        #     name="contrast_token",
+        #     shape=(1, 1, hidden_size),
+        #     # initializer="random_normal",
+        #     initializer='zeros',
+        #     trainable=True,
+        # )
+        # self.temporal_token = self.add_weight(
+        #     name="temporal_token",
+        #     shape=(1, 1, hidden_size),
+        #     # initializer="random_normal",
+        #     initializer='zeros',
+        #     trainable=True,
+        # )
 
         # type embeddings
         self.type_cls = self.add_weight(
