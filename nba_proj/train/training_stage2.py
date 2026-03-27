@@ -1186,7 +1186,8 @@ def compute_pos_weight(chunk_samples):
     if num_neg == 0:
         raise ValueError("No negative examples found.")
     # print(float(num_neg / num_pos))
-    return float(num_neg / num_pos)
+    print(np.sqrt(num_neg / num_pos))
+    return float(np.sqrt(num_neg / num_pos))
 
 def run_val_epoch(
     val_ds,
