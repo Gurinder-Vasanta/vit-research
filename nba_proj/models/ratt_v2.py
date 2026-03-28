@@ -302,10 +302,11 @@ class RATTHeadV2(tf_keras.Model):
     def __init__(self, hidden_size=768, num_heads=8, num_layers=2, mlp_dim=128):
         super().__init__()
         self.hidden_size = hidden_size
-
+        self.num_layers = num_layers
         def make_proj(name):
             return tf.keras.Sequential([
                 layers.Dense(self.hidden_size * 2, activation='relu'),
+                # layers.Dropout(0.2),
                 layers.Dense(self.hidden_size),
             ], name=name)
         
@@ -322,8 +323,27 @@ class RATTHeadV2(tf_keras.Model):
         # self.temporal_proj = layers.Dense(hidden_size, name="temporal_proj",activation='relu')
 
 
+        # self.transformer_blocks = []
+        # for _ in range(num_layers):
+        #     block = nn_blocks.TransformerEncoderBlock(
+        #         inner_activation=activations.gelu,
+        #         num_attention_heads=num_heads,
+        #         inner_dim=hidden_size * 4,
+        #         output_dropout=0.1,
+        #         attention_dropout=0.1,
+        #         kernel_regularizer=None,
+        #         kernel_initializer="glorot_uniform",
+        #         norm_first=True,
+        #         stochastic_depth_drop_rate=0.0,
+        #         norm_epsilon=1e-6,
+        #         layer_scale_init_value=0.0,
+        #         transformer_partition_dims=None,
+        #         return_attention_scores=True,
+        #     )
+        #     self.transformer_blocks.append(block)
+
         self.transformer_blocks = []
-        for _ in range(num_layers):
+        for i in range(num_layers):
             block = nn_blocks.TransformerEncoderBlock(
                 inner_activation=activations.gelu,
                 num_attention_heads=num_heads,
@@ -339,7 +359,8 @@ class RATTHeadV2(tf_keras.Model):
                 transformer_partition_dims=None,
                 return_attention_scores=True,
             )
-            self.transformer_blocks.append(block)
+            setattr(self, f"transformer_block_{i}", block)
+            # self.transformer_blocks.append(block)
 
         # learned special tokens
         self.cls_token = self.add_weight(
@@ -432,6 +453,91 @@ class RATTHeadV2(tf_keras.Model):
             layers.Dropout(0.2),
             layers.Dense(1),
         ])
+
+    def debug_forward(
+        self,
+        chunk_embs,
+        support_tokens,
+        contrast_tokens,
+        temporal_tokens,
+        training=False,
+    ):
+        B = tf.shape(chunk_embs)[0]
+        Ks = tf.shape(support_tokens)[1]
+        Kc = tf.shape(contrast_tokens)[1]
+        Kt = tf.shape(temporal_tokens)[1]
+
+        q_raw = tf.expand_dims(chunk_embs, axis=1)
+        q_proj = self.query_proj(q_raw)
+        local = q_raw + q_proj
+
+        support_proj = self.support_proj(support_tokens)
+        contrast_proj = self.contrast_proj(contrast_tokens)
+        temporal_proj = self.temporal_proj(temporal_tokens)
+
+        cls = tf.repeat(self.cls_token, repeats=B, axis=0)
+        sup_summary = tf.repeat(self.support_token, repeats=B, axis=0)
+        con_summary = tf.repeat(self.contrast_token, repeats=B, axis=0)
+        tmp_summary = tf.repeat(self.temporal_token, repeats=B, axis=0)
+
+        x = tf.concat(
+            [
+                cls,
+                sup_summary,
+                support_proj,
+                con_summary,
+                contrast_proj,
+                tmp_summary,
+                temporal_proj,
+                local,
+            ],
+            axis=1,
+        )
+
+        type_parts = [
+            tf.repeat(self.type_cls, repeats=B, axis=0),
+            tf.repeat(self.type_support_summary, repeats=B, axis=0),
+            tf.repeat(self.type_support, repeats=B, axis=0) + tf.zeros((B, Ks, self.hidden_size)),
+            tf.repeat(self.type_contrast_summary, repeats=B, axis=0),
+            tf.repeat(self.type_contrast, repeats=B, axis=0) + tf.zeros((B, Kc, self.hidden_size)),
+            tf.repeat(self.type_temporal_summary, repeats=B, axis=0),
+            tf.repeat(self.type_temporal, repeats=B, axis=0) + tf.zeros((B, Kt, self.hidden_size)),
+            tf.repeat(self.type_local, repeats=B, axis=0),
+        ]
+        type_embs = tf.concat(type_parts, axis=1)
+        x_plus_type = x + type_embs
+
+        block_outs = []
+        attn_outs = []
+        x_block = x_plus_type
+        for block in self.transformer_blocks:
+            x_block, attn = block(x_block, training=training)
+            block_outs.append(x_block)
+            attn_outs.append(attn)
+
+        x_norm = self.norm(x_block)
+
+        idx_cls = 0
+        idx_local = 4 + Ks + Kc + Kt
+
+        cls_out = x_norm[:, idx_cls, :]
+        local_out = x_norm[:, idx_local, :]
+        fused_out = tf.concat([cls_out, 5 * local_out], axis=-1)
+        logits = self.classifier(fused_out, training=training)
+
+        return {
+            "q_proj": q_proj,
+            "local": local,
+            "support_proj": support_proj,
+            "contrast_proj": contrast_proj,
+            "temporal_proj": temporal_proj,
+            "x_plus_type": x_plus_type,
+            "block_outs": block_outs,
+            "attn_outs": attn_outs,
+            "x_norm": x_norm,
+            "fused_out": fused_out,
+            "logits": logits,
+        }
 
     def call(
         self,
@@ -531,11 +637,17 @@ class RATTHeadV2(tf_keras.Model):
 
         x = x + type_embs
 
+        # attn_scores_all = []
+
+        # for block in self.transformer_blocks:
+        #     x, attn = block(x, training=training)
+        #     attn_scores_all.append(attn)
+
         attn_scores_all = []
-        for block in self.transformer_blocks:
+        for i in range(self.num_layers):
+            block = getattr(self, f"transformer_block_{i}")
             x, attn = block(x, training=training)
             attn_scores_all.append(attn)
-
         x = self.norm(x)
 
         # fixed positions

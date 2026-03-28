@@ -507,168 +507,6 @@ def build_retrieval_cache(
 
             future_key_lookup[cur_key] = future_key
 
-    # -----------------------------
-    # build cache
-    # -----------------------------
-
-    # print("[CACHE] Building retrieval cache...")
-    # cache = {}
-
-    # pad_meta_template = {
-    #     "label": -1,
-    #     "side": "PAD",
-    #     "vid": -1,
-    #     "clip": -1,
-    #     "t_center": -1.0,
-    #     "t_width": -1.0,
-    #     "start_idx": -1,
-    #     "end_idx": -1,
-    # }
-
-    # QUERY_BATCH_SIZE = 16   # try 64 / 128 / 256
-
-    # for batch_start in range(0, len(all_chunks), QUERY_BATCH_SIZE):
-    #     batch_chunks = all_chunks[batch_start: batch_start + QUERY_BATCH_SIZE]
-
-    #     batch_keys = []
-    #     batch_query_embs = []
-    #     batch_future_embs = []
-    #     batch_query_meta = []
-
-    #     # -------------------------
-    #     # gather this batch's query/future data
-    #     # -------------------------
-    #     for chunk in batch_chunks:
-    #         key = make_chunk_key(chunk)
-    #         query_emb = chunk_emb_lookup[key]
-    #         query_meta = meta_lookup[key]
-
-    #         next_key = future_key_lookup[key]
-    #         if next_key is None:
-    #             future_emb = np.zeros_like(query_emb)
-    #         else:
-    #             future_emb = chunk_emb_lookup[next_key]
-
-    #         batch_keys.append(key)
-    #         batch_query_embs.append(query_emb)
-    #         batch_future_embs.append(future_emb)
-    #         batch_query_meta.append(query_meta)
-
-    #     # -------------------------
-    #     # do batched ANN queries
-    #     # -------------------------
-    #     batch_content_candidates = query_collection_batch(
-    #         batch_query_embs, collection, config.SEARCH_K_CONTENT
-    #     )
-
-    #     batch_temporal_candidates = query_collection_batch(
-    #         batch_future_embs, collection, config.SEARCH_K_TEMPORAL
-    #     )
-
-    #     # -------------------------
-    #     # per-item filtering / packing
-    #     # -------------------------
-    #     for j, key in enumerate(batch_keys):
-    #         query_emb = batch_query_embs[j]
-    #         future_emb = batch_future_embs[j]
-    #         query_meta = batch_query_meta[j]
-
-    #         # ----- content: sim + contrast
-    #         content_candidates = batch_content_candidates[j]
-
-    #         sim_items = []
-    #         contrast_items = []
-    #         seen_sim = set()
-    #         seen_contrast = set()
-
-    #         for cand in content_candidates:
-    #             cand_meta = cand["meta"]
-
-    #             if same_chunk_meta(query_meta, cand_meta):
-    #                 continue
-
-    #             if cand_meta["side"] != query_meta["side"]:
-    #                 continue
-
-    #             sig = dedup_signature(cand_meta)
-
-    #             if (
-    #                 cand_meta["label"] == query_meta["label"]
-    #                 and sig not in seen_sim
-    #                 and len(sim_items) < config.K_SIM
-    #             ):
-    #                 sim_items.append(cand)
-    #                 seen_sim.add(sig)
-
-    #             if (
-    #                 cand_meta["label"] != query_meta["label"]
-    #                 and sig not in seen_contrast
-    #                 and len(contrast_items) < config.K_CONTRAST
-    #             ):
-    #                 contrast_items.append(cand)
-    #                 seen_contrast.add(sig)
-
-    #             if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
-    #                 break
-
-    #         sim_embs, sim_meta = pad_or_trim(
-    #             sim_items, config.K_SIM, emb_dim, pad_meta_template
-    #         )
-    #         contrast_embs, contrast_meta = pad_or_trim(
-    #             contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
-    #         )
-
-    #         # ----- temporal
-    #         temporal_candidates = batch_temporal_candidates[j]
-
-    #         temporal_items = []
-    #         seen_temporal = set()
-
-    #         for cand in temporal_candidates:
-    #             cand_meta = cand["meta"]
-
-    #             if same_chunk_meta(query_meta, cand_meta):
-    #                 continue
-
-    #             if cand_meta["side"] != query_meta["side"]:
-    #                 continue
-
-    #             sig = dedup_signature(cand_meta)
-    #             if sig in seen_temporal:
-    #                 continue
-
-    #             temporal_items.append(cand)
-    #             seen_temporal.add(sig)
-
-    #             if len(temporal_items) >= config.K_TEMPORAL:
-    #                 break
-
-    #         temporal_embs, temporal_meta = pad_or_trim(
-    #             temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
-    #         )
-
-    #         # ----- save entry
-    #         cache[key] = {
-    #             "query_emb": query_emb,
-    #             "future_emb": future_emb,
-    #             "query_meta": query_meta,
-
-    #             "sim_embs": sim_embs,
-    #             "sim_meta": sim_meta,
-
-    #             "contrast_embs": contrast_embs,
-    #             "contrast_meta": contrast_meta,
-
-    #             "temporal_embs": temporal_embs,
-    #             "temporal_meta": temporal_meta,
-    #         }
-
-    #     built_so_far = min(batch_start + QUERY_BATCH_SIZE, len(all_chunks))
-    #     print(f"[CACHE] built {built_so_far}/{len(all_chunks)}")
-
-    #     if built_so_far % 1000 == 0 or built_so_far == len(all_chunks):
-    #         print("[CACHE] saving cache checkpoint")
-    #         save_retrieval_cache(cache, config.STAGE2_CACHE_PATH)
     print("[CACHE] Building retrieval cache...")
     cache = {}
 
@@ -1061,10 +899,13 @@ def train_step(batch, cache, ratt_head, optimizer, pos_weight):
     del tape
 
     probs = tf.sigmoid(class_logits)
-
+# ctrlf
     train_loss_metric.update_state(loss)
     train_acc_metric.update_state(labels, probs)
 
+    batch_preds = tf.cast(probs >= 0.5, tf.float32)
+    batch_acc = tf.reduce_mean(tf.cast(tf.equal(batch_preds, labels), tf.float32))
+    print(f"batch acc={batch_acc:.6f}")
     return {
         "loss": float(loss.numpy()),
         "acc": float(train_acc_metric.result().numpy()),
@@ -1100,18 +941,20 @@ def eval_step(
         path_to_idx=path_to_idx,
     )
 
+    zeros_query = tf.zeros_like(query_embs)
     zeros_support = tf.zeros_like(support_tokens)
     zeros_contrast = tf.zeros_like(contrast_tokens)
     zeros_temporal = tf.zeros_like(temporal_tokens)
 
     class_logits, cls_out, aux = ratt_head(
-        chunk_embs=query_embs,
+        # chunk_embs=query_embs,
         support_tokens=support_tokens,
         contrast_tokens=contrast_tokens,
         temporal_tokens=temporal_tokens,
         # support_tokens=zeros_support,
         # contrast_tokens=zeros_contrast,
         # temporal_tokens=zeros_temporal,
+        chunk_embs=zeros_query,
         training=False,
     )
 
@@ -1247,7 +1090,7 @@ if __name__ == "__main__":
     train_vids = config.TRAIN_VIDS
     train_samples = load_samples(train_vids,stride=1)
     train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
-
+    train_chunk_samples = train_chunk_samples[0:100]
     # label_lookup = {}
     # for c in train_chunk_samples:
     #     key = make_key(c["vid"], c["side"], c["t_center"])
@@ -1256,7 +1099,7 @@ if __name__ == "__main__":
     test_vids = config.TEST_VIDS
     test_samples = load_samples(test_vids,stride=1)
     test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE)
-
+    test_chunk_samples = train_chunk_samples[0:32]
     random.shuffle(train_samples)
     random.shuffle(test_samples)
 
@@ -1400,9 +1243,20 @@ if __name__ == "__main__":
     # -------------------------
     # save weights
     # -------------------------
+    # =============================================
+    # SAVE WEIGHTS
+    # =============================================
+
     ratt_head.save_weights(config.RATT_WEIGHTS)
     print(f"[MAIN] saved weights to {config.RATT_WEIGHTS}")
 
+    os.makedirs("rag_weights", exist_ok=True)
+
+    for i in range(2):
+        block = getattr(ratt_head, f"transformer_block_{i}")
+        with open(f"rag_weights/transformer_block_{i}.pkl", "wb") as f:
+            pickle.dump(block.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[MAIN] saved transformer block {i} weights")
 
     # print(len(cache))
     # pprint.pprint(list(cache.keys()))
