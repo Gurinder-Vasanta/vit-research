@@ -78,7 +78,12 @@ RUN_ID = (
     f"{RUN_UID}"
 )
 
-RATT_WEIGHTS = f"rag_weights/{RUN_ID}.weights.h5" 
+# RATT_WEIGHTS = f"rag_weights/{RUN_ID}.weights.h5" 
+RATT_WEIGHTS = "rag_weights/20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b.weights.h5"
+# RATT_WEIGHTS = "rag_weights/20260329-100502_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_4e2b.weights.h5"
+# RATT_WEIGHTS = "rag_weights/20260328-222443_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_0087.weights.h5"
+# RATT_WEIGHTS = "rag_weights/20260328-183548_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_2619.weights.h5"
+# RATT_WEIGHTS = 'rag_weights/20260328-175331_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L12H8Q32_bs16_acc1_e1_lr1e-03to1e-03_reb3_e4ee.weights.h5'
 # RATT_WEIGHTS = "rag_weights/20260328-100733_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L12H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_a8be.weights.h5"
 PROJ_WEIGHTS = 'proj_weights/ratt_proj_ordered.weights.h5' 
 RANKER_WEIGHTS = f'ranker_weights/{RUN_ID}.weights.h5'

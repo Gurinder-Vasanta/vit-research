@@ -748,11 +748,18 @@ def fetch_live_batch(
 
     for i in range(batch_size):
         key = make_chunk_key_from_meta(metadata, i)
-
+        # key = (7, 'left', 6, 24, 35) 
         chunk = chunk_lookup[key]
         future_key = future_key_lookup[key]
         future_chunk = chunk_lookup[future_key]
 
+        # print(f"key: {key} "
+        #       f"future key: {future_key} "
+        #       f"future chunk: {future_chunk} ")
+        
+        # q = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+        # print(q[:20])
+        # print(np.linalg.norm(q))
         entry = build_live_entry(
             chunk=chunk,
             future_chunk=future_chunk,
@@ -766,6 +773,14 @@ def fetch_live_batch(
             k_contrast=config.K_CONTRAST,
             k_temporal=config.K_TEMPORAL,
         )
+
+        # print('--------------------------------')
+        # pprint.pprint(entry["sim_meta"][:5])
+        # print()
+        # pprint.pprint(entry["contrast_meta"][:5])
+        # print()
+        # pprint.pprint(entry["temporal_meta"][:5])
+        # print('***********************************')
 
         query_embs.append(entry["query_emb"])
         support_tokens.append(entry["sim_embs"])
@@ -834,16 +849,33 @@ def weighted_bce_with_logits(labels, logits, pos_weight):
 #         "aux": aux,
 #     }
 
-def train_step(batch, cache, ratt_head, optimizer, pos_weight):
+def train_step(batch,
+    ratt_head,
+    train_chunk_lookup,
+    train_future_key_lookup,
+    collection,
+    chunk_encoder,
+    frame_emb_mm,
+    path_to_idx,
+    pos_weight):
     metadata, labels = batch[1], batch[2]
 
     labels = tf.cast(labels, tf.float32)
     labels = tf.reshape(labels, (-1, 1))
 
-    query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_cache_batch(
-        metadata, cache
+    # query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_cache_batch(
+    #     metadata, cache
+    # )
+    query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
+        metadata=metadata,
+        chunk_lookup=train_chunk_lookup,
+        future_key_lookup=train_future_key_lookup,
+        collection=collection,
+        chunk_encoder=chunk_encoder,
+        frame_emb_mm=frame_emb_mm,
+        path_to_idx=path_to_idx,
     )
-
+    zeros_query = tf.zeros_like(query_embs)
     def grad_rms(g):
         if g is None:
             return 0.0
@@ -866,7 +898,8 @@ def train_step(batch, cache, ratt_head, optimizer, pos_weight):
 
 
         class_logits, cls_out, aux = ratt_head(
-            chunk_embs=query_embs,
+            # chunk_embs=query_embs,
+            chunk_embs=zeros_query,
             support_tokens=support_tokens,
             contrast_tokens=contrast_tokens,
             temporal_tokens=temporal_tokens,
@@ -979,12 +1012,30 @@ def eval_step(
     }
 
 
-def run_train_epoch(train_ds, cache, ratt_head, optimizer, pos_weight):
+def run_train_epoch(train_ds,
+    ratt_head,
+    train_chunk_lookup,
+    train_future_key_lookup,
+    collection,
+    chunk_encoder,
+    frame_emb_mm,
+    path_to_idx,
+    pos_weight):
     train_loss_metric.reset_state()
     train_acc_metric.reset_state()
 
     for step, batch in enumerate(train_ds):
-        out = train_step(batch, cache, ratt_head, optimizer, pos_weight)
+        out = train_step(
+            batch=batch,
+            ratt_head=ratt_head,
+            train_chunk_lookup=train_chunk_lookup,
+            train_future_key_lookup=train_future_key_lookup,
+            collection=collection,
+            chunk_encoder=chunk_encoder,
+            frame_emb_mm=frame_emb_mm,
+            path_to_idx=path_to_idx,
+            pos_weight=pos_weight
+        )
 
         if step % 1 == 0:
             print(
@@ -1084,13 +1135,24 @@ def run_val_epoch(
 
 if __name__ == "__main__":
 
+    print("SEARCH_K_CONTENT", config.SEARCH_K_CONTENT)
+    print("SEARCH_K_TEMPORAL", config.SEARCH_K_TEMPORAL)
+    print("K_SIM", config.K_SIM)
+    print("K_CONTRAST", config.K_CONTRAST)
+    print("K_TEMPORAL", config.K_TEMPORAL)
+    print("FUTURE_CHUNK_STEP", config.FUTURE_CHUNK_STEP)
+    print("CHUNK_SIZE", config.CHUNK_SIZE)
+    print("CHROMADB_COLLECTION", config.CHROMADB_COLLECTION)
+    print("STAGE1_WEIGHTS", config.STAGE1_WEIGHTS)
+    print("RATT_WEIGHTS", config.RATT_WEIGHTS)
+
     # ---------------------------------------------
     # 1. Load samples -> chunkify
     # ---------------------------------------------
     train_vids = config.TRAIN_VIDS
     train_samples = load_samples(train_vids,stride=1)
     train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
-    train_chunk_samples = train_chunk_samples[0:100]
+    # train_chunk_samples = train_chunk_samples[0:100]
     # label_lookup = {}
     # for c in train_chunk_samples:
     #     key = make_key(c["vid"], c["side"], c["t_center"])
@@ -1099,7 +1161,7 @@ if __name__ == "__main__":
     test_vids = config.TEST_VIDS
     test_samples = load_samples(test_vids,stride=1)
     test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE)
-    test_chunk_samples = train_chunk_samples[0:32]
+    # test_chunk_samples = train_chunk_samples[0:32]
     random.shuffle(train_samples)
     random.shuffle(test_samples)
 
@@ -1147,6 +1209,13 @@ if __name__ == "__main__":
     _ = chunk_encoder(dummy_frame_embs, training=False)
 
     chunk_encoder.load_weights(config.STAGE1_WEIGHTS)
+
+    for i in range(chunk_encoder.num_layers):
+        block = getattr(chunk_encoder, f"transformer_block_{i}")
+        with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
+            weights = pickle.load(f)
+        block.set_weights(weights)
+
     print("[STAGE1] Loaded chunk encoder weights")
 
     chunk_encoder.trainable = False
@@ -1182,7 +1251,7 @@ if __name__ == "__main__":
     ratt_head = RATTHeadV2(
         hidden_size=768,
         num_heads=8,
-        num_layers=2,
+        num_layers=config.NUM_LAYERS,
     )
 
     for v in ratt_head.trainable_variables[:5]:
@@ -1191,6 +1260,9 @@ if __name__ == "__main__":
     optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
 
     query_embs, support, contrast, temporal = fetch_cache_batch(batch[1], cache)
+
+    train_chunk_lookup = {make_chunk_key(c): c for c in train_chunk_samples}
+    train_future_key_lookup = build_future_key_lookup(train_chunk_samples, future_step=5)
 
     val_chunk_lookup = {make_chunk_key(c): c for c in test_chunk_samples}
     val_future_key_lookup = build_future_key_lookup(test_chunk_samples, future_step=5)
@@ -1216,10 +1288,14 @@ if __name__ == "__main__":
 
         train_loss, train_acc = run_train_epoch(
             train_ds=train_dataset,
-            cache=cache,
             ratt_head=ratt_head,
-            optimizer=optimizer,
-            pos_weight=pos_weight,
+            train_chunk_lookup=train_chunk_lookup,
+            train_future_key_lookup=train_future_key_lookup,
+            collection=collection,
+            chunk_encoder=chunk_encoder,
+            frame_emb_mm=frame_emb_mm,
+            path_to_idx=path_to_idx,
+            pos_weight=pos_weight
         )
 
         val_loss, val_acc = run_val_epoch(
@@ -1252,32 +1328,9 @@ if __name__ == "__main__":
 
     os.makedirs("rag_weights", exist_ok=True)
 
-    for i in range(2):
+    for i in range(config.NUM_LAYERS):
         block = getattr(ratt_head, f"transformer_block_{i}")
-        with open(f"rag_weights/transformer_block_{i}.pkl", "wb") as f:
+        with open(f"rag_weights/{config.RUN_ID}_transformer_block_{i}.pkl", "wb") as f:
             pickle.dump(block.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"[MAIN] saved transformer block {i} weights")
 
-    # print(len(cache))
-    # pprint.pprint(list(cache.keys()))
-
-    
-
-
-
-    # print(cache[list(cache.keys())[1438]])
-    # print(cache)
-    # # ---------------------------------------------
-    # # 3. Build models
-    # # ---------------------------------------------
-    
-    
-
-    # # proj_head.load_weights("projection_head.weights.h5")
-    
-    # # Retrieval DB
-    # client = PersistentClient(path="./chroma_store")
-    # collection = client.get_or_create_collection(
-    #     name=config.CHROMADB_COLLECTION,
-    #     metadata={"hnsw:space": "cosine"}
-    # )

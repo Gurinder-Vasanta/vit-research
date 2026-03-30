@@ -1,43 +1,83 @@
 import os
+import json
+from collections import defaultdict
+import pickle
 import pprint
+import random
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import tensorflow.keras as tf_keras
-from collections import defaultdict
-
 from chromadb import PersistentClient
-from models.ratt_head import RATTHead
-from models.projection_head import ProjectionHead
-import config_chunks_cached as config
 
-from transformers import ViTModel, ViTImageProcessor
-import torch
-import time
+from dataset import load_samples, build_chunks, build_tf_dataset_chunks
+from models.chunk_encoder import ChunkEncoder
+from models.ratt_v2 import RATTHeadV2
+import config_stage3 as config
+import gc
 
-# -----------------------
-# DEVICE + VIT
-# -----------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# reuse these from your current stage2 file
+# load_frame_store
+# fetch_live_batch
+# build_future_key_lookup
+# make_chunk_key
 
-hf_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
-hf_processor.do_rescale = False
-hf_vit = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
-hf_vit.eval()
+tf.keras.backend.clear_session()
+gc.collect()
 
-# -----------------------
-# HELPERS
-# -----------------------
-def hf_vit_embed_batch(frames_np):
-    frames_np = frames_np.astype(np.float32)
-    frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
-    with torch.no_grad():
-        inputs = hf_processor(images=frames_list, return_tensors="pt").to(device)
-        out = hf_vit(**inputs)
-        cls = out.last_hidden_state[:, 0, :]
-        cls = cls.cpu().numpy()
-        cls = cls / (np.linalg.norm(cls, axis=1, keepdims=True) + 1e-8)
-        return cls.astype(np.float32)
+SEED = 12
+
+os.environ["PYTHONHASHSEED"] = str(SEED)
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+try:
+    tf.config.experimental.enable_op_determinism()
+except Exception:
+    pass
+
+def _to_py_scalar(x):
+    if hasattr(x, "numpy"):
+        x = x.numpy()
+    if isinstance(x, np.ndarray):
+        if x.ndim == 0:
+            x = x.item()
+        else:
+            raise ValueError(f"Expected scalar, got array shape {x.shape}")
+    if isinstance(x, bytes):
+        x = x.decode("utf-8")
+    return x
+
+def make_chunk_key(chunk, precision=6):
+    return (
+        int(chunk["vid"]),
+        str(chunk["side"]),
+        int(chunk["clip"]),
+        int(chunk["start_idx"]),
+        int(chunk["end_idx"]),
+    )
+
+def build_future_key_lookup(all_chunks, future_step=5):
+    grouped = defaultdict(list)
+
+    for chunk in all_chunks:
+        grouped[(int(chunk["vid"]), int(chunk["clip"]))].append(chunk)
+
+    future_key_lookup = {}
+
+    for _, group in grouped.items():
+        group_sorted = sorted(group, key=lambda c: int(c["start_idx"]))
+        last_idx = len(group_sorted) - 1
+
+        for idx, chunk in enumerate(group_sorted):
+            cur_key = make_chunk_key(chunk)
+            fut_idx = min(idx + future_step, last_idx)
+            fut_key = make_chunk_key(group_sorted[fut_idx])
+            future_key_lookup[cur_key] = fut_key
+
+    return future_key_lookup
 
 def z_normalize(x):
     x = np.asarray(x, dtype=np.float32)
@@ -45,379 +85,630 @@ def z_normalize(x):
         return x
     return (x - x.mean()) / (x.std() + 1e-6)
 
-def coarse_time_bin(t_center):
-    return int(t_center // config.DELTA_T_NORM)
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
 
-# -----------------------
-# DATASET BUILDING
-# -----------------------
-def load_and_preprocess_image(path, img_size=(432, 768)):
-    img = tf.io.read_file(path)
-    img = tf.image.decode_jpeg(img, channels=3)
-    img = tf.image.convert_image_dtype(img, tf.float32)
-    img = tf.image.resize(img, img_size)
-    return img
+CACHE_DIR = "./frame_cache_vit"
 
-def parse_chunk(chunk, img_size=(432,768)):
-    frames = tf.map_fn(
-        lambda p: load_and_preprocess_image(p, img_size),
-        chunk["frames"],
-        fn_output_signature=tf.float32
-    )
-    return frames, chunk
-
-def build_tf_dataset_chunks(chunk_samples, batch_size, num_workers=8):
-    def gen():
-        for s in chunk_samples:
-            yield s
-
-    output_signature = {
-        "frames": tf.TensorSpec(shape=(None,), dtype=tf.string),
-        "side": tf.TensorSpec(shape=(), dtype=tf.string),
-        "vid": tf.TensorSpec(shape=(), dtype=tf.int32),
-        "clip": tf.TensorSpec(shape=(), dtype=tf.int32),
-        "t_center": tf.TensorSpec(shape=(), dtype=tf.float32),
-        "t_width": tf.TensorSpec(shape=(), dtype=tf.float32),
+def get_store_paths(store_name):
+    return {
+        "emb": os.path.join(CACHE_DIR, f"{store_name}_emb.dat"),
+        "paths": os.path.join(CACHE_DIR, f"{store_name}_paths.npy"),
+        "meta": os.path.join(CACHE_DIR, f"{store_name}_meta.npz"),
     }
 
-    ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
-    ds = ds.map(parse_chunk, num_parallel_calls=num_workers)
-    ds = ds.batch(batch_size, drop_remainder=False)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
+def load_frame_store(store_name="train_val_frames"):
+    paths = get_store_paths(store_name)
+    meta = np.load(paths["meta"])
 
-# -----------------------
-# RETRIEVAL CACHE
-# -----------------------
-def embed_rep_chunk(rep):
-    frames = []
-    for fp in rep["frames"]:
-        img = tf.keras.utils.load_img(fp, target_size=(224, 224))
-        img = tf.keras.utils.img_to_array(img)
-        frames.append(img)
-    frames = np.stack(frames, axis=0)
-    embs = hf_vit_embed_batch(frames)
-    mean = embs.mean(axis=0)
-    return mean / (np.linalg.norm(mean) + 1e-8)
+    n_frames = int(meta["n_frames"])
+    emb_dim = int(meta["emb_dim"])
 
-def build_retrieval_cache(collection, chunks, C):
-    cache = {}
-    bins = {}
+    emb_mm = np.memmap(
+        paths["emb"],
+        dtype="float32",
+        mode="r",
+        shape=(n_frames, emb_dim),
+    )
 
-    for c in chunks:
-        key = (c["side"], coarse_time_bin(c["t_center"]))
-        if key not in bins:
-            bins[key] = c
+    frame_paths = np.load(paths["paths"], allow_pickle=True).tolist()
+    path_to_idx = {p: i for i, p in enumerate(frame_paths)}
 
-    for (side, bin_id), rep in bins.items():
-        start = time.perf_counter()
-        anchor = embed_rep_chunk(rep)
-        res = collection.query(
-            query_embeddings=[anchor.tolist()],
-            n_results=C,
-            where={"side": side},
+    print(f"[frame cache] loaded store '{store_name}'")
+    print(f"[frame cache] shape = ({n_frames}, {emb_dim})")
+
+    return emb_mm, frame_paths, path_to_idx
+
+def encode_chunk(chunk, chunk_encoder, frame_emb_mm,path_to_idx):
+    # pprint.pprint(chunk)
+    idxs = [path_to_idx[p] for p in chunk["frames"]]          # length T
+    frame_embs = frame_emb_mm[idxs].astype(np.float32)        # (T, 768)
+    frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)  # (1, T, 768)
+
+    stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)  # (1, 768)
+    return stage1_chunk_emb[0].numpy().astype(np.float32)
+
+def pad_or_trim(items, k, emb_dim, pad_meta_template):
+    """
+    items: list of {"emb": ..., "meta": ...}
+    returns (embs, metas)
+    """
+    if len(items) >= k:
+        items = items[:k]
+    else:
+        pad_count = k - len(items)
+        zero_emb = np.zeros((emb_dim,), dtype=np.float32)
+        for _ in range(pad_count):
+            items.append(
+                {
+                    "emb": zero_emb.copy(),
+                    "meta": dict(pad_meta_template),
+                }
+            )
+
+    embs = np.stack([x["emb"] for x in items], axis=0)
+    metas = [x["meta"] for x in items]
+    return embs, metas
+
+def extract_meta(chunk):
+    return {
+        "label": int(chunk["label"]),
+        "side": str(chunk["side"]),
+        "vid": int(chunk["vid"]),
+        "clip": int(chunk["clip"]),
+        "t_center": float(chunk["t_center"]),
+        "t_width": float(chunk["t_width"]),
+        "start_idx": int(chunk["start_idx"]),
+        "end_idx": int(chunk["end_idx"]),
+    }
+
+def query_collection(query_emb, collection, n_results):
+        results = collection.query(
+            query_embeddings=[query_emb.tolist()],
+            n_results=n_results,
             include=["embeddings", "metadatas"]
         )
-        cache[(side, bin_id)] = {
-            "embeddings": np.asarray(res["embeddings"][0], np.float32),
-            "vid": np.array([m["vid_num"] for m in res["metadatas"][0]]),
-            "t_center": np.array([m["t_center"] for m in res["metadatas"][0]])
-        }
 
-        embs = np.asarray(res["embeddings"][0], dtype=np.float32)
-        metas = res["metadatas"][0]
-        print(
-            f"[CACHE] ({side}, {bin_id}) "
-            f"size={len(embs)} "
-            f"time={time.perf_counter() - start:.2f}s"
-            f"rep={metas}"
-        )
-    return cache
+        raw_embs = results["embeddings"][0]
+        raw_meta = results["metadatas"][0]
 
-def get_retrieved(metadata, cache):
-    retrieved = []
-    B = len(metadata["vid"])
-    for i in range(B):
-        side = metadata["side"][i].numpy().decode()
-        t_center = float(metadata["t_center"][i])
-        t_width  = float(metadata["t_width"][i].numpy())
-        vid = int(metadata["vid"][i])
+        out = []
+        for emb, meta in zip(raw_embs, raw_meta):
+            # pprint.pprint(meta)
+            out.append(
+                {
+                    "emb": np.asarray(emb, dtype=np.float32),
+                    "meta": {
+                        "label": int(meta["label"]),
+                        "side": str(meta["side"]),
+                        "vid": int(meta["vid_num"]),
+                        "clip": int(meta["clip_num"]),
+                        "t_center": float(meta["t_center"]),
+                        "t_width": float(meta["t_width"]),
+                        "start_idx": int(meta["start_idx"]),
+                        "end_idx": int(meta["end_idx"]),
+                        "class_logit": float(meta["class_logit"])
+                    },
+                }
+            )
+        return out
 
-        pool = cache[(side, coarse_time_bin(t_center))]
-        # mask = pool["vid"] != vid
-        mask = (
-            (pool["vid"] != vid) &
-            (np.abs(pool["t_center"] - t_center) <= t_width / 2)
-        )
-        embs = pool["embeddings"][mask][:config.TOP_K]
-
-        if len(embs) < config.TOP_K:
-            pad = np.zeros((config.TOP_K - len(embs), embs.shape[1]), np.float32)
-            embs = np.vstack([embs, pad])
-
-        retrieved.append(embs)
-
-    # retrieved = tf.convert_to_tensor(np.stack(retrieved), tf.float32)
-    # return tf.nn.l2_normalize(tf.stop_gradient(retrieved), axis=2)
-    retrieved = tf.nn.l2_normalize(
-        tf.stop_gradient(tf.convert_to_tensor(np.stack(retrieved), tf.float32)),
-        axis=2
+def same_chunk_meta(meta_a, meta_b):
+    return (
+        int(meta_a["vid"]) == int(meta_b["vid"])
+        and str(meta_a["side"]) == str(meta_b["side"])
+        and int(meta_a["clip"]) == int(meta_b["clip"])
+        and int(meta_a["start_idx"]) == int(meta_b["start_idx"])
+        and int(meta_a["end_idx"]) == int(meta_b["end_idx"])
     )
-    return retrieved
 
-def comparator(fname):
-    splitted = fname.split('_')
-    vid_num = int(splitted[0][3::])
-    frame_num = int(splitted[2].split('.')[0])
-    return (vid_num, frame_num)
+def dedup_signature(meta):
+    return (
+        int(meta["vid"]),
+        str(meta["side"]),
+        int(meta["clip"]),
+        int(meta["start_idx"]),
+        int(meta["end_idx"]),
+    )
 
-def load_samples(train_vids, stride = 1, max_clips = 20):
-    already_labelled = pd.read_csv("clips_label.csv")
-    
-    samples = []
+def make_chunk_key_from_meta(metadata, i, precision=6):
+    vid = _to_py_scalar(metadata["vid"][i])
+    side = _to_py_scalar(metadata["side"][i])
+    clip = _to_py_scalar(metadata["clip"][i])
+    t_center = _to_py_scalar(metadata["t_center"][i])
+    start_idx = _to_py_scalar(metadata["start_idx"][i])
+    end_idx = _to_py_scalar(metadata["end_idx"][i])
 
-    print(train_vids)
-    for vid in train_vids:
-        # clip_root = f"/home/.../clips_finalized_{vid}"
+    return (
+        int(vid),
+        str(side),
+        int(clip),
+        # round(float(t_center), precision),
+        int(start_idx),
+        int(end_idx),
+    )
 
-        print(vid)
-        # clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/clips_finalized_{vid}'
-        clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_{vid}_smart'
-        clips = sorted(os.listdir(clip_root),key=comparator) 
-        # print(clips)
-        clips = clips[30:40] # get 10 completely new clips  max_clips:max_clips+10
+def build_live_entry(
+    chunk,
+    future_chunk,
+    collection,
+    chunk_encoder,
+    frame_emb_mm,
+    path_to_idx,
+    search_k_content,
+    search_k_temporal,
+    k_sim,
+    k_contrast,
+    k_temporal,
+):
+    query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+    future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
 
-        for clip in clips:
-            clip_path = os.path.join(clip_root, clip)
-            print(clip_path)
-            frames = sorted(os.listdir(clip_path),key=comparator) 
-            
-            # find label
-            # label_row = already_labelled[
-            #     already_labelled["clip_path"] == clip_path
-            # ]
-            # print(len(np.array(label_row)[0]))
-            # if label_row.empty or pd.isna(label_row['label'].iloc[0]):
-            #     continue
-            # clip_label = int(label_row["label"].iloc[0])
+    query_meta = extract_meta(chunk)
+    future_meta = extract_meta(future_chunk)
 
-            num_frames = len(frames)
-            stride_counter = 0
-            for i, f in enumerate(frames, start=1):
-                fpath = os.path.join(clip_path, f)
-                
-                temp_tnorm = i / num_frames
-                # if(temp_tnorm < 0.7):
-                #     continue
+    emb_dim = query_emb.shape[0]
 
-                stride_counter += 1
-
-                if(stride_counter == stride):
-                    samples.append({
-                        "pth": fpath,
-                        "side": clip.split("_")[3],
-                        "t_norm": i / num_frames,
-                        "clip_num": int(clip.split("_")[2]),
-                        "vid_num": int(f.split("_")[0][3:]),
-                        # "label": clip_label
-                    })
-
-                    stride_counter = 0
-    # input(np.array(samples))
-    return samples
-
-def build_chunks(frame_samples, chunk_size=60):
-    """
-    frame_samples: list of dictionaries (one per frame)
-    chunk_size: number of frames to group into one chunk
-
-    Returns: list of chunk dictionaries
-    """
-
-    # --- Group frames by clip ---
-    clips = {}
-    for s in frame_samples:
-        key = (s["vid_num"], s["clip_num"])
-        if key not in clips:
-            clips[key] = []
-        clips[key].append(s)
-
-    # --- Sort frames within each clip ---
-    for key in clips:
-        clips[key].sort(key=lambda x: x["t_norm"])
-
-    # --- Build chunks ---
-    chunk_samples = []
-
-    for (vid, clip), frames in clips.items():
-        total_frames = len(frames)
-        #label = frames[0]["label"]     # all frames share the clip label
-        side = frames[0]["side"]       # same within a clip
-
-        # slide with step = chunk_size (no overlap for now)
-        for i in range(0, total_frames, chunk_size):
-            sub = frames[i : i + chunk_size]
-            if len(sub) < chunk_size:
-                # OPTIONAL: skip incomplete chunk
-                continue
-
-            # frame paths
-            frame_paths = [f["pth"] for f in sub]
-
-            # compute temporal window
-            t_vals = [f["t_norm"] for f in sub]
-            t_center = float(sum(t_vals) / len(t_vals))
-            t_width = float(max(t_vals) - min(t_vals))  # ~60 frames worth
-
-            chunk_samples.append({
-                "frames": frame_paths,    # list of image paths (length chunk_size)
-                #"label": label,
-                "side": side,
-                "vid": vid,
-                "clip": clip,
-                "t_center": t_center,
-                "t_width": t_width, #max(t_width, 0.4)
-            })
-
-    return chunk_samples
-
-def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_workers=16):
-    def gen():
-        for sample in chunk_samples:
-            yield sample
-
-    output_signature = {
-        "frames": tf.TensorSpec(shape=(None,), dtype=tf.string),  # list of frame paths
-        # "label": tf.TensorSpec(shape=(), dtype=tf.int32),
-        "side":  tf.TensorSpec(shape=(), dtype=tf.string),
-        "vid":   tf.TensorSpec(shape=(), dtype=tf.int32),
-        "clip":  tf.TensorSpec(shape=(), dtype=tf.int32),
-        "t_center": tf.TensorSpec(shape=(), dtype=tf.float32),
-        "t_width":  tf.TensorSpec(shape=(), dtype=tf.float32),
+    pad_meta_template = {
+        "label": -1,
+        "side": "PAD",
+        "vid": -1,
+        "clip": -1,
+        "t_center": -1.0,
+        "t_width": -1.0,
+        "start_idx": -1,
+        "end_idx": -1,
     }
 
-    ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
+    # -------------------------
+    # content retrieval: sim + contrast
+    # -------------------------
+    content_candidates = query_collection(query_emb, collection, search_k_content)
 
-    # shuffle dataset order
-    # ds = ds.shuffle(2048, reshuffle_each_iteration=True) # 2048 was len(chunk_samples)
+    sim_items = []
+    contrast_items = []
+    used_content = set()
 
-    # map to parsed tensors (loads images, builds metadata dict)
-    ds = ds.map(lambda chunk: parse_chunk(chunk, img_size),
-                num_parallel_calls=num_workers)
+    for cand in content_candidates:
+        cand_meta = cand["meta"]
+        sig = dedup_signature(cand_meta)
 
-    # batching & prefetch
-    ds = ds.batch(batch_size, drop_remainder=True)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
+        if same_chunk_meta(query_meta, cand_meta):
+            continue
+        if cand_meta["side"] != query_meta["side"]:
+            continue
 
-    return ds
+        if (
+            cand_meta["label"] == query_meta["label"]
+            and sig not in used_content
+            and len(sim_items) < k_sim
+        ):
+            sim_items.append(cand)
+            used_content.add(sig)
+            continue
 
-# -----------------------
-# MAIN
-# -----------------------
-if __name__ == "__main__":
+        if (
+            cand_meta["label"] != query_meta["label"]
+            and sig not in used_content
+            and len(contrast_items) < k_contrast
+        ):
+            contrast_items.append(cand)
+            used_content.add(sig)
+            continue
 
-    # ---- load labels ----
-    # labels_df = pd.read_csv("clips_label.csv")
-    # LABELS = {}
+        if len(sim_items) >= k_sim and len(contrast_items) >= k_contrast:
+            break
 
-    # for _, row in labels_df.iterrows():
-    #     if pd.isna(row.label):
-    #         continue  # skip unlabeled clips
-    #     LABELS[row.clip_path.rstrip("/")] = int(row.label)
-
-    # ---- load chunks (YOUR EXISTING METHOD) ----
-    # from dataset import load_samples, build_chunks
-    samples = load_samples(config.VIDS_TO_USE, stride=1)
-    chunks = build_chunks(samples, chunk_size=12)
-
-    dataset = build_tf_dataset_chunks(chunks, batch_size=config.CHUNK_BATCH_SIZE)
-
-    # ---- models ----
-    ratt_head = RATTHead(
-        hidden_size=768,
-        num_queries=config.NUM_QUERIES,
-        num_layers=config.NUM_LAYERS,
-        num_heads=config.NUM_HEADS
+    sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+    contrast_embs, contrast_meta = pad_or_trim(
+        contrast_items, k_contrast, emb_dim, pad_meta_template
     )
-    _ = ratt_head(tf.zeros((1,768)), tf.zeros((1,10,768)), training=False)
-    ratt_head.load_weights(config.RATT_WEIGHTS)
 
-    proj_head = ProjectionHead(2304, 768*8, 768)
-    _ = proj_head(tf.zeros((1,2304)))
-    proj_head.load_weights(config.PROJ_WEIGHTS)
+    # -------------------------
+    # temporal retrieval
+    # -------------------------
+    temporal_candidates = query_collection(future_emb, collection, search_k_temporal)
 
-    # ---- retrieval ----
-    client = PersistentClient(path="./chroma_store")
-    collection = client.get_collection(config.CHROMADB_COLLECTION)
-    retrieval_cache = build_retrieval_cache(collection, chunks, config.SEARCH_K)
+    temporal_items = []
+    seen_temporal = set()
 
-    # ---- extract logits ----
-    clip_logits = defaultdict(list)
+    for cand in temporal_candidates:
+        cand_meta = cand["meta"]
+        sig = dedup_signature(cand_meta)
 
-    for frames, metadata in dataset:
-        B, T = frames.shape[0], frames.shape[1]
+        if same_chunk_meta(query_meta, cand_meta):
+            continue
 
-        frame_embs = tf.numpy_function(
-            hf_vit_embed_batch,
-            [tf.reshape(frames, (-1, 432, 768, 3))],
-            tf.float32
+        # optional: skip exact future anchor too
+        # if same_chunk_meta(future_meta, cand_meta):
+        #     continue
+
+        if cand_meta["side"] != query_meta["side"]:
+            continue
+        if sig in seen_temporal:
+            continue
+
+        temporal_items.append(cand)
+        seen_temporal.add(sig)
+
+        if len(temporal_items) >= k_temporal:
+            break
+
+    temporal_embs, temporal_meta = pad_or_trim(
+        temporal_items, k_temporal, emb_dim, pad_meta_template
+    )
+
+    return {
+        "query_emb": query_emb,
+        "sim_embs": sim_embs,
+        "contrast_embs": contrast_embs,
+        "temporal_embs": temporal_embs,
+        "query_meta": query_meta,
+        "future_meta": future_meta,
+        "sim_meta": sim_meta,
+        "contrast_meta": contrast_meta,
+        "temporal_meta": temporal_meta,
+    }
+
+def fetch_live_batch(
+    metadata,
+    chunk_lookup,
+    future_key_lookup,
+    collection,
+    chunk_encoder,
+    frame_emb_mm,
+    path_to_idx
+):
+    batch_size = metadata["vid"].shape[0]
+
+    query_embs = []
+    support_tokens = []
+    contrast_tokens = []
+    temporal_tokens = []
+
+    for i in range(batch_size):
+        key = make_chunk_key_from_meta(metadata, i)
+
+        # print(key)
+        chunk = chunk_lookup[key]
+        future_key = future_key_lookup[key]
+        future_chunk = chunk_lookup[future_key]
+
+        # print(f"key: {key} "
+        #       f"future key: {future_key} "
+        #       f"future chunk: {future_chunk} ")
+
+        # q = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+        # print(q[:20])
+        # print(np.linalg.norm(q))
+        entry = build_live_entry(
+            chunk=chunk,
+            future_chunk=future_chunk,
+            collection=collection,
+            chunk_encoder=chunk_encoder,
+            frame_emb_mm=frame_emb_mm,
+            path_to_idx=path_to_idx,
+            search_k_content=config.SEARCH_K_CONTENT,
+            search_k_temporal=config.SEARCH_K_TEMPORAL,
+            k_sim=config.K_SIM,
+            k_contrast=config.K_CONTRAST,
+            k_temporal=config.K_TEMPORAL,
         )
-        frame_embs = tf.reshape(frame_embs, (B, T, 768))
 
-        deltas = frame_embs[:, 1:, :] - frame_embs[:, :-1, :]
+        # print('--------------------------------')
+        # pprint.pprint(entry["sim_meta"][:5])
+        # print()
+        # pprint.pprint(entry["contrast_meta"][:5])
+        # print()
+        # pprint.pprint(entry["temporal_meta"][:5])
+        # print('***********************************')
 
-        mean = tf.reduce_mean(frame_embs, axis=1)
-        mean_deltas = tf.reduce_mean(deltas, axis=1)
-        std_deltas = tf.math.reduce_std(deltas, axis=1)
+        query_embs.append(entry["query_emb"])
+        support_tokens.append(entry["sim_embs"])
+        contrast_tokens.append(entry["contrast_embs"])
+        temporal_tokens.append(entry["temporal_embs"])
 
-        # raw_chunk = tf.concat([mean, std, max_], axis=-1)
-        raw_chunk = tf.concat([mean, mean_deltas, std_deltas], axis=-1)
-        raw_chunk = tf.nn.l2_normalize(raw_chunk, axis=1)
+    query_embs = tf.convert_to_tensor(np.stack(query_embs, axis=0), dtype=tf.float32)
+    support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32)
+    contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32)
+    temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32)
 
-        chunk_embs = proj_head(raw_chunk, training=False)
-        chunk_embs = tf.nn.l2_normalize(chunk_embs, axis=-1)
+    return query_embs, support_tokens, contrast_tokens, temporal_tokens
+
+
+def build_and_load_ratt_head():
+    fresh_head = RATTHeadV2(
+        hidden_size=768,
+        num_heads=8,
+        num_layers=2,   # or whatever your config uses
+    )
+
+    dummy_q = tf.zeros((1, 768), dtype=tf.float32)
+    dummy_s = tf.zeros((1, config.K_SIM, 768), dtype=tf.float32)
+    dummy_c = tf.zeros((1, config.K_CONTRAST, 768), dtype=tf.float32)
+    dummy_t = tf.zeros((1, config.K_TEMPORAL, 768), dtype=tf.float32)
+
+    fresh_head.query_proj.build((None, 1, 768))
+    fresh_head.support_proj.build((None, config.K_SIM, 768))
+    fresh_head.contrast_proj.build((None, config.K_CONTRAST, 768))
+    fresh_head.temporal_proj.build((None, config.K_TEMPORAL, 768))
+    fresh_head.classifier.build((None, 2 * 768))
+
+    total_tokens = 4 + config.K_SIM + config.K_CONTRAST + config.K_TEMPORAL
+    fresh_head.norm.build((None, total_tokens, 768))
+
+    _ = fresh_head(
+        chunk_embs=dummy_q,
+        support_tokens=dummy_s,
+        contrast_tokens=dummy_c,
+        temporal_tokens=dummy_t,
+        training=False,
+    )
+
+    fresh_head.load_weights(config.RATT_WEIGHTS)
+    print(f'loaded ratt weights')
+    ratt_weights = [
+        "20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b_transformer_block_0.pkl",
+        "20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b_transformer_block_1.pkl"
+    ]
+    for i in range(fresh_head.num_layers):
+        block = getattr(fresh_head, f"transformer_block_{i}")
+        with open(f"rag_weights/{ratt_weights[i]}", "rb") as f:
+            print(f'loaded transformer_block_{i}')
+            weights = pickle.load(f)
+        block.set_weights(weights)
+        # with open(f"rag_weights/transformer_block_{i}.pkl", "rb") as f:
+        #     print(f'loaded transformer_block_{i}')
+        #     weights = pickle.load(f)
+        # block.set_weights(weights)
+
+    print("RATT_WEIGHTS:", config.RATT_WEIGHTS)
+    print("RATT_WEIGHTS mtime:", os.path.getmtime(config.RATT_WEIGHTS))
+
+    for i in range(config.NUM_LAYERS):
+        # p = f"rag_weights/transformer_block_{i}.pkl"
+        # print(p, "exists:", os.path.exists(p), "mtime:", os.path.getmtime(p))
+        p = f"rag_weights/{ratt_weights[i]}"
+        print(p, "exists:", os.path.exists(p), "mtime:", os.path.getmtime(p))
+    return fresh_head
+
+if __name__ == "__main__":
+    print("SEARCH_K_CONTENT", config.SEARCH_K_CONTENT)
+    print("SEARCH_K_TEMPORAL", config.SEARCH_K_TEMPORAL)
+    print("K_SIM", config.K_SIM)
+    print("K_CONTRAST", config.K_CONTRAST)
+    print("K_TEMPORAL", config.K_TEMPORAL)
+    print("FUTURE_CHUNK_STEP", config.FUTURE_CHUNK_STEP)
+    print("CHUNK_SIZE", config.CHUNK_SIZE)
+    print("CHROMADB_COLLECTION", config.CHROMADB_COLLECTION)
+    print("STAGE1_WEIGHTS", config.STAGE1_WEIGHTS)
+    print("RATT_WEIGHTS", config.RATT_WEIGHTS)
+    # --------------------------------------------------------
+    # 1. load training chunks
+    # --------------------------------------------------------
+    train_vids = config.TRAIN_VIDS
+    train_samples = load_samples(train_vids, stride=1)
+    print(train_samples[0])
+    train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
+
+    print(f"Train chunks: {len(train_chunk_samples)}")
+
+    train_dataset = build_tf_dataset_chunks(
+        train_chunk_samples,
+        batch_size=config.CHUNK_BATCH_SIZE,
+        training=False
+    )
+
+    # --------------------------------------------------------
+    # 2. live retrieval lookups
+    # --------------------------------------------------------
+    train_chunk_lookup = {make_chunk_key(c): c for c in train_chunk_samples}
+    train_future_key_lookup = build_future_key_lookup(
+        train_chunk_samples,
+        future_step=config.FUTURE_CHUNK_STEP
+    )
+
+    # --------------------------------------------------------
+    # 3. retrieval db
+    # --------------------------------------------------------
+    client = PersistentClient(path="./chroma_store")
+    collection = client.get_or_create_collection(
+        name=config.CHROMADB_COLLECTION,
+        metadata={"hnsw:space": "cosine"}
+    )
+
+    # --------------------------------------------------------
+    # 4. chunk encoder
+    # --------------------------------------------------------
+    chunk_encoder = ChunkEncoder(
+        hidden_size=768,
+        num_layers=4,
+        num_heads=8,
+        max_frames=config.CHUNK_SIZE
+    )
+
+    dummy_frame_embs = tf.zeros((1, config.CHUNK_SIZE, 768), dtype=tf.float32)
+    _ = chunk_encoder(dummy_frame_embs, training=False)
+
+    chunk_encoder.load_weights(config.STAGE1_WEIGHTS)
+
+    for i in range(chunk_encoder.num_layers):
+        block = getattr(chunk_encoder, f"transformer_block_{i}")
+        with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
+            weights = pickle.load(f)
+        block.set_weights(weights)
+    chunk_encoder.trainable = False
+    print("[MODEL] Loaded chunk encoder weights")
+
+    # --------------------------------------------------------
+    # 5. frame cache
+    # --------------------------------------------------------
+    store_name = "train_val_frames_chunk12_stride4"
+    frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
+
+    # --------------------------------------------------------
+    # 6. ratt head v2
+    # --------------------------------------------------------
+    # ratt_head = RATTHeadV2(
+    #     hidden_size=768,
+    #     num_heads=8,
+    #     num_layers=2,
+    # )
+
+    # dummy_q = tf.zeros((1, 768), dtype=tf.float32)
+    # dummy_s = tf.zeros((1, config.K_SIM, 768), dtype=tf.float32)
+    # dummy_c = tf.zeros((1, config.K_CONTRAST, 768), dtype=tf.float32)
+    # dummy_t = tf.zeros((1, config.K_TEMPORAL, 768), dtype=tf.float32)
+
+    # _ = ratt_head(
+    #     chunk_embs=dummy_q,
+    #     support_tokens=dummy_s,
+    #     contrast_tokens=dummy_c,
+    #     temporal_tokens=dummy_t,
+    #     training=False,
+    # )
+
+    # path = config.RATT_WEIGHTS
+    # import os
+
+    # path = config.RATT_WEIGHTS
+
+    # print("cwd:", os.getcwd())
+    # print("path raw:", repr(path))
+    # print("abs path:", os.path.abspath(path))
+    # print("exists:", os.path.exists(path))
+    # print("isfile:", os.path.isfile(path))
+    # print("readable:", os.access(path, os.R_OK))
+
+    # parent = os.path.dirname(path) or "."
+    # print("parent exists:", os.path.exists(parent))
+    # print("parent abs:", os.path.abspath(parent))
+    # print("parent contents:", os.listdir(parent) if os.path.exists(parent) else "MISSING")
+    # ratt_head.load_weights(config.RATT_WEIGHTS)
+    # ratt_head.trainable = False
+    # print("[MODEL] Loaded RATTHeadV2 weights")
+
+    # --------------------------------------------------------
+    # 7. run inference on training set
+    # --------------------------------------------------------
+    clip_outputs = defaultdict(list)
+
+    fresh_head = build_and_load_ratt_head()
+
+    for step, batch in enumerate(train_dataset):
+        metadata = batch[1]
+        labels = batch[2]
+
+        query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
+            metadata=metadata,
+            chunk_lookup=train_chunk_lookup,
+            future_key_lookup=train_future_key_lookup,
+            collection=collection,
+            chunk_encoder=chunk_encoder,
+            frame_emb_mm=frame_emb_mm,
+            path_to_idx=path_to_idx
+        )
+
+        # THIS matches your best ablation:
+        zeros_query = tf.zeros_like(query_embs)
+
+        # class_logits, cls_out, aux = ratt_head(
+        #     chunk_embs=zeros_query,
+        #     support_tokens=support_tokens,
+        #     contrast_tokens=contrast_tokens,
+        #     temporal_tokens=temporal_tokens,
+        #     training=False,
+        # )
+
         
-        # retrieved_np = retriever(chunk_embs, metadata)
 
-        # --- new retriever start ----
-        retrieved = get_retrieved(metadata,retrieval_cache)
-        # ---- new retriever end -----
+        class_logits, cls_out, aux = fresh_head(
+            chunk_embs=zeros_query,
+            support_tokens=support_tokens,
+            contrast_tokens=contrast_tokens,
+            temporal_tokens=temporal_tokens,
+            training=False,
+        )
 
-        logits, fused_cls, attn_scores = ratt_head(chunk_embs, retrieved, disable_cls=False, training=False)
+        logits = class_logits.numpy().reshape(-1)
+        probs = sigmoid(logits)
+        preds = (probs >= 0.5).astype(np.int32)
 
+        batch_acc = tf.reduce_mean(tf.cast(tf.equal(preds, labels), tf.float32))
+        # print(logits)
+        # print(labels)
+        temp = pd.DataFrame()
+            
+        temp['labels'] = labels.numpy().flatten()
+        temp['logits'] = logits.flatten()
+        temp['probs'] = probs.flatten()
+        print(temp)
+        print(f"batch acc={batch_acc:.6f}")
+              
+        for i in range(len(logits)):
+            vid = int(_to_py_scalar(metadata["vid"][i]))
+            clip = int(_to_py_scalar(metadata["clip"][i]))
+            side = str(_to_py_scalar(metadata["side"][i]))
+            t_center = float(_to_py_scalar(metadata["t_center"][i]))
+            start_idx = int(_to_py_scalar(metadata["start_idx"][i]))
+            end_idx = int(_to_py_scalar(metadata["end_idx"][i]))
+            label = int(_to_py_scalar(labels[i]))
 
-        # deltas = frame_embs[:,1:] - frame_embs[:,:-1]
-        # raw = tf.concat([
-        #     tf.reduce_mean(frame_embs,1),
-        #     tf.reduce_mean(deltas,1),
-        #     tf.math.reduce_std(deltas,1)
-        # ], axis=1)
-        # raw = tf.nn.l2_normalize(raw, axis=1)
+            clip_key = f"vid{vid}_clip_{clip}"
 
-        # chunk_embs = tf.nn.l2_normalize(proj_head(raw, training=False), axis=1)
-        # retrieved = get_retrieved(metadata, retrieval_cache)
+            clip_outputs[clip_key].append({
+                "vid": vid,
+                "clip": clip,
+                "side": side,
+                "label": label,
+                "t_center": t_center,
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "logit": float(logits[i]),
+                "prob": float(probs[i]),
+                "pred": int(preds[i]),
+            })
 
-        # logits, _, _ = ratt_head(chunk_embs, retrieved, training=False)
-        # logits = logits.numpy().reshape(-1)
+            pprint.pprint(clip_outputs[clip_key])
+        print(f"[infer] step={step} complete")
 
-        pprint.pprint(metadata)
-        print(logits)
-        for i in range(B):
-            clip_dir = os.path.dirname(metadata["frames"][i][0].numpy().decode())
-            clip_logits[clip_dir].append(float(logits[i]))
-            # if clip_dir in LABELS:
-            #     clip_logits[clip_dir].append(float(logits[i]))
-
-    # ---- normalize + save ----
+    # --------------------------------------------------------
+    # 8. sort per clip and save sequences
+    # --------------------------------------------------------
     rows = []
-    for clip, seq in clip_logits.items():
+
+    for clip_key, seq in clip_outputs.items():
+        seq = sorted(seq, key=lambda x: x["start_idx"])
+
+        raw_sequence = [x["logit"] for x in seq]
+
         rows.append({
-            "clip_path": clip,
-            # "label": LABELS[clip],
-            "z_sequence": z_normalize(seq).tolist(),
-            "raw_sequence": seq
+            "clip_key": clip_key,
+            "vid": seq[0]["vid"],
+            "clip": seq[0]["clip"],
+            "side": seq[0]["side"],
+            "label": seq[0]["label"],
+            "num_chunks": len(seq),
+            "start_idxs": [x["start_idx"] for x in seq],
+            "end_idxs": [x["end_idx"] for x in seq],
+            "t_centers": [x["t_center"] for x in seq],
+            "raw_sequence": raw_sequence,
+            "z_sequence": z_normalize(raw_sequence).tolist(),
+            "prob_sequence": [x["prob"] for x in seq],
+            "pred_sequence": [x["pred"] for x in seq],
         })
 
-    df = pd.DataFrame(rows)
-    df.to_json("test/new_clip_z_sequences_fixed.json", orient="records", indent=2)
-    print("Saved new_clip_z_sequences_fixed.json")
+    rows.sort(key=lambda x: (x["vid"], x["clip"]))
+
+    os.makedirs("test", exist_ok=True)
+
+    out_json = "test/test_new_clip_logit_sequences_live_zeroquery.json"
+    out_csv = "test/test_new_clip_logit_sequences_live_zeroquery.csv"
+
+    with open(out_json, "w") as f:
+        json.dump(rows, f, indent=2)
+
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+    print(f"[DONE] saved {out_json}")
+    print(f"[DONE] saved {out_csv}")
