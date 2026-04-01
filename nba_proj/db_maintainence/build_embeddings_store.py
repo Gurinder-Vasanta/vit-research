@@ -30,6 +30,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # LOAD PRETRAINED GOOGLE VIT
 # ============================================================
 processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+processor.do_rescale = False
 vit_model = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
 vit_model.eval()
 
@@ -51,17 +52,20 @@ def build_chunk_sets():
 
     train_chunk_samples = build_chunks(
         train_samples,
-        chunk_size=config_chunks.CHUNK_SIZE
+        chunk_size=config_chunks.CHUNK_SIZE,
+        chunk_stride=config_chunks.CHUNK_STRIDE,
     )
     test_chunk_samples = build_chunks(
         test_samples,
-        chunk_size=config_chunks.CHUNK_SIZE
+        chunk_size=config_chunks.CHUNK_SIZE,
+        chunk_stride=config_chunks.CHUNK_STRIDE,
     )
 
     print(f"Train chunks: {len(train_chunk_samples)}")
     print(f"Val chunks:   {len(test_chunk_samples)}")
-    print("Example chunk:")
+    print("Example chunks:")
     pprint.pprint(train_chunk_samples[0])
+    pprint.pprint(train_chunk_samples[1])
 
     return train_chunk_samples, test_chunk_samples
 
@@ -220,18 +224,51 @@ def load_frame_store(store_name="train_val_frames"):
 # ============================================================
 # CHUNK -> FRAME INDEX ARRAYS
 # ============================================================
+# def build_chunk_index_array(chunk_samples, path_to_idx):
+#     chunk_size = len(chunk_samples[0]["frames"])
+
+#     X_idx = np.empty((len(chunk_samples), chunk_size), dtype=np.int32)
+#     y = np.empty((len(chunk_samples),), dtype=np.float32)
+
+#     for i, c in enumerate(chunk_samples):
+#         X_idx[i] = [path_to_idx[p] for p in c["frames"]]
+#         y[i] = np.float32(c["label"])
+
+#     return X_idx, y
+
+
 def build_chunk_index_array(chunk_samples, path_to_idx):
     chunk_size = len(chunk_samples[0]["frames"])
+    n = len(chunk_samples)
 
-    X_idx = np.empty((len(chunk_samples), chunk_size), dtype=np.int32)
-    y = np.empty((len(chunk_samples),), dtype=np.float32)
+    X_idx = np.empty((n, chunk_size), dtype=np.int32)
+    y = np.empty((n,), dtype=np.float32)
+
+    vid = np.empty((n,), dtype=np.int32)
+    clip = np.empty((n,), dtype=np.int32)
+    side = np.empty((n,), dtype=object)
+    t_center = np.empty((n,), dtype=np.float32)
+    t_width = np.empty((n,), dtype=np.float32)
 
     for i, c in enumerate(chunk_samples):
         X_idx[i] = [path_to_idx[p] for p in c["frames"]]
         y[i] = np.float32(c["label"])
 
-    return X_idx, y
+        vid[i] = np.int32(c["vid"])
+        clip[i] = np.int32(c["clip"])
+        side[i] = c["side"]
+        t_center[i] = np.float32(c["t_center"])
+        t_width[i] = np.float32(c["t_width"])
 
+    meta = {
+        "vid": vid,
+        "clip": clip,
+        "side": side,
+        "t_center": t_center,
+        "t_width": t_width,
+    }
+
+    return X_idx, y, meta
 
 def save_chunk_index_arrays(train_chunk_indices, train_labels,
                             val_chunk_indices, val_labels,
@@ -246,6 +283,23 @@ def save_chunk_index_arrays(train_chunk_indices, train_labels,
     )
     print(f"[chunk index] saved to {out_path}")
 
+def save_chunk_metadata_arrays(train_meta, val_meta, store_name="train_val_frames"):
+    out_path = os.path.join(CACHE_DIR, f"{store_name}_chunk_meta.npz")
+    np.savez_compressed(
+        out_path,
+        train_vid=train_meta["vid"],
+        train_clip=train_meta["clip"],
+        train_side=train_meta["side"],
+        train_t_center=train_meta["t_center"],
+        train_t_width=train_meta["t_width"],
+
+        val_vid=val_meta["vid"],
+        val_clip=val_meta["clip"],
+        val_side=val_meta["side"],
+        val_t_center=val_meta["t_center"],
+        val_t_width=val_meta["t_width"],
+    )
+    print(f"[chunk meta] saved to {out_path}")
 
 def load_chunk_index_arrays(store_name="train_val_frames"):
     path = os.path.join(CACHE_DIR, f"{store_name}_chunk_indices.npz")
@@ -277,11 +331,31 @@ def gather_chunk_embedding_batch(frame_emb_mm, chunk_indices_batch):
     return frame_emb_mm[chunk_indices_batch].astype(np.float32)
 
 
+def summarize_chunks(name, chunk_samples):
+    print(f"\n[{name}] num_chunks = {len(chunk_samples)}")
+    if not chunk_samples:
+        return
+
+    widths = [c["t_width"] for c in chunk_samples]
+    clips = {(c["vid"], c["clip"]) for c in chunk_samples}
+    print(f"[{name}] unique clips = {len(clips)}")
+    print(f"[{name}] t_width min/mean/max = "
+          f"{min(widths):.4f} / {np.mean(widths):.4f} / {max(widths):.4f}")
+
+    by_clip = {}
+    for c in chunk_samples:
+        key = (c["vid"], c["clip"])
+        by_clip[key] = by_clip.get(key, 0) + 1
+
+    counts = list(by_clip.values())
+    print(f"[{name}] chunks per clip min/mean/max = "
+          f"{min(counts)} / {np.mean(counts):.2f} / {max(counts)}")
+    
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    store_name = "train_val_frames"
+    store_name = "train_val_frames_chunk8_stride2"
 
     train_chunk_samples, val_chunk_samples = build_chunk_sets()
 
@@ -302,13 +376,18 @@ def main():
     frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
 
     # Build chunk index arrays
-    train_chunk_indices, train_labels = build_chunk_index_array(train_chunk_samples, path_to_idx)
-    val_chunk_indices, val_labels = build_chunk_index_array(val_chunk_samples, path_to_idx)
+    # train_chunk_indices, train_labels = build_chunk_index_array(train_chunk_samples, path_to_idx)
+    # val_chunk_indices, val_labels = build_chunk_index_array(val_chunk_samples, path_to_idx)
+
+    train_chunk_indices, train_labels, train_meta = build_chunk_index_array(train_chunk_samples, path_to_idx)
+    val_chunk_indices, val_labels, val_meta = build_chunk_index_array(val_chunk_samples, path_to_idx)
 
     print("train_chunk_indices:", train_chunk_indices.shape)
     print("train_labels:       ", train_labels.shape)
     print("val_chunk_indices:  ", val_chunk_indices.shape)
     print("val_labels:         ", val_labels.shape)
+    summarize_chunks("train", train_chunk_samples)
+    summarize_chunks("val", val_chunk_samples)
 
     save_chunk_index_arrays(
         train_chunk_indices, train_labels,
@@ -316,6 +395,11 @@ def main():
         store_name=store_name
     )
 
+    save_chunk_metadata_arrays(
+        train_meta,
+        val_meta,
+        store_name=store_name
+    )
     # sanity check: gather one mini-batch
     B = min(4, len(train_chunk_indices))
     batch_embs = gather_chunk_embedding_batch(frame_emb_mm, train_chunk_indices[:B])

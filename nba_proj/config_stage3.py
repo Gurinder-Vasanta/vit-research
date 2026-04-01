@@ -9,13 +9,13 @@ CHROMA_PATH = os.path.join(BASE_DIR, "chroma_store")
 
 # ratt_w_ordered_new 4 toks
 # ratt_w_ordered_new_32toj 32 tokens
-CHROMADB_COLLECTION = "ratt_db_chunk_encoder_all_vids_overlap_chunks" #ratt_db_chunk_encoder_all_vids_relcls_v2
+CHROMADB_COLLECTION = "ratt_db_chunk_encoder_all_vids_overlap_chunks_chunk_size8_stride2" #ratt_db_chunk_encoder_all_vids_relcls_v2
 # ratt_db_chunk_encoder_all_vids_v2
 # ratt_db_cached_30_clips_ordered_fixed_rebuild_w_labels v26
 
 DELTA_T_NORM = 0.05 #this was 0.05
 
-STAGE1_WEIGHTS = "./chunk_encoder_ckpts_chunk12_stride4/chunk_encoder_best_v3.weights.h5"
+STAGE1_WEIGHTS = "./chunk_encoder_ckpts_chunk8_stride2/chunk_encoder_best_v3.weights.h5"
 BUILD_RET_C = 75 #this was a 100
 TOP_K = 32
 SEARCH_K = 100#750
@@ -45,8 +45,8 @@ NUM_QUERIES = TOP_K #was 16
 NUM_LAYERS = 2
 NUM_HEADS = 8
 
-CHUNK_SIZE = 12
-CHUNK_STRIDE = 4
+CHUNK_SIZE = 8
+CHUNK_STRIDE =4
 
 START_CHUNK_TRAIN = 0
 END_CHUNK_TRAIN = 3750
@@ -79,7 +79,8 @@ RUN_ID = (
 )
 
 # RATT_WEIGHTS = f"rag_weights/{RUN_ID}.weights.h5" 
-RATT_WEIGHTS = "rag_weights/20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b.weights.h5"
+RATT_WEIGHTS = "rag_weights/20260331-151759_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_chunk_size8_stride2_ret75_k32_sk100_dt005_ch8_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_b0d8.weights.h5"
+# RATT_WEIGHTS = "rag_weights/20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b.weights.h5"
 # RATT_WEIGHTS = "rag_weights/20260329-100502_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_4e2b.weights.h5"
 # RATT_WEIGHTS = "rag_weights/20260328-222443_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_0087.weights.h5"
 # RATT_WEIGHTS = "rag_weights/20260328-183548_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_2619.weights.h5"
@@ -96,9 +97,9 @@ TEMPORAL_EXPAND_WINDOW = 0.50
 # -----------------------------
 # config
 # -----------------------------
-K_SIM = 10
-K_CONTRAST = 10
-K_TEMPORAL = 10
+K_SIM = 5
+K_CONTRAST = 5
+K_TEMPORAL = 5
 
 SEARCH_K_CONTENT = 500
 SEARCH_K_TEMPORAL = 500

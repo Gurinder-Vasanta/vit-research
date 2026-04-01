@@ -24,7 +24,8 @@ from models.chunk_encoder import ChunkEncoder
 # CONFIG
 # ============================================================
 CACHE_DIR = "./frame_cache_vit"
-STORE_NAME = "train_val_frames" #train_val_frames_all_vids
+# STORE_NAME = "train_val_frames" #train_val_frames_all_vids
+STORE_NAME = "train_val_frames_chunk8_stride2"
 FRAME_BATCH_SIZE = 1024
 NUM_LOAD_WORKERS = 16
 
@@ -34,13 +35,13 @@ NUM_HEADS = 8
 
 # set this to your trained chunk encoder checkpoint
 # CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_cached/chunk_encoder_best_v3.weights.h5"
-CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_chunk12_stride4/chunk_encoder_best_v3.weights.h5"
+CHUNK_ENCODER_WEIGHTS = "./chunk_encoder_ckpts_chunk8_stride2/chunk_encoder_best_v3.weights.h5"
 
 
 # Chroma
 CHROMA_PATH = "./chroma_store"
-COLLECTION_NAME = "ratt_db_chunk_encoder_all_vids_overlap_chunks"
-COLLECTION_NAME_RELCLS = "ratt_db_chunk_encoder_all_vids_relcls_overlap_chunks"
+COLLECTION_NAME = "ratt_db_chunk_encoder_all_vids_overlap_chunks_chunk_size8_stride2"
+COLLECTION_NAME_RELCLS = "ratt_db_chunk_encoder_all_vids_relcls_overlap_chunks_chunk_size8_stride2"
 
 UPSERT_SIZE = 512
 SEED = 42
@@ -63,7 +64,10 @@ vit_model.eval()
 # HELPERS
 # ============================================================
 def resolve_all_vids():
-    if hasattr(config_ratt, "TRAIN_VIDS") and hasattr(config_ratt, "TEST_VIDS"):
+    if hasattr(config_ratt, "TRAIN_VIDS"):
+        vids = sorted(set(list(config_ratt.TRAIN_VIDS)))
+        print(f'writing {config_ratt.TRAIN_VIDS}')
+    elif hasattr(config_ratt, "TRAIN_VIDS") and hasattr(config_ratt, "TEST_VIDS"):
         vids = sorted(set(list(config_ratt.TRAIN_VIDS) + list(config_ratt.TEST_VIDS)))
     elif hasattr(config_ratt, "VIDS_TO_USE"):
         vids = list(config_ratt.VIDS_TO_USE)
@@ -88,7 +92,8 @@ def build_all_chunk_samples():
 
     chunk_samples = dataset.build_chunks(
         samples,
-        chunk_size=config_ratt.CHUNK_SIZE
+        chunk_size=config_ratt.CHUNK_SIZE,
+        chunk_stride=config_ratt.CHUNK_STRIDE,
     )
 
     print(f"Total chunks: {len(chunk_samples)}")

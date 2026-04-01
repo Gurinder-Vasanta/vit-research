@@ -15,6 +15,18 @@ from models.chunk_encoder import ChunkEncoder
 from models.ratt_v2 import RATTHeadV2
 import config_stage3 as config
 import gc
+from PIL import Image
+
+import torch
+from transformers import ViTImageProcessor, ViTModel
+
+# make sure these exist globally, same as in your training script
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+hf_processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+# hf_processor.do_rescale = False
+hf_vit = ViTModel.from_pretrained("google/vit-base-patch16-224").to(device)
+hf_vit.eval()
 
 # reuse these from your current stage2 file
 # load_frame_store
@@ -119,13 +131,72 @@ def load_frame_store(store_name="train_val_frames"):
 
     return emb_mm, frame_paths, path_to_idx
 
-def encode_chunk(chunk, chunk_encoder, frame_emb_mm,path_to_idx):
-    # pprint.pprint(chunk)
-    idxs = [path_to_idx[p] for p in chunk["frames"]]          # length T
-    frame_embs = frame_emb_mm[idxs].astype(np.float32)        # (T, 768)
-    frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)  # (1, T, 768)
+# def encode_chunk(chunk, chunk_encoder, frame_emb_mm,path_to_idx):
+#     # pprint.pprint(chunk)
+#     idxs = [path_to_idx[p] for p in chunk["frames"]]          # length T
+#     frame_embs = frame_emb_mm[idxs].astype(np.float32)        # (T, 768)
+#     frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)  # (1, T, 768)
 
-    stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)  # (1, 768)
+#     stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)  # (1, 768)
+#     return stage1_chunk_emb[0].numpy().astype(np.float32)
+
+def hf_vit_embed_batch(frames_np):
+    """
+    frames_np: (N, 432, 768, 3) uint8 or float32
+    Returns (N, 768) numpy embeddings (L2 normalized)
+    """
+    # frames_np = frames_np.astype(np.float32)
+
+    # frames_np = frames_np.astype(np.float32)
+
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np, 0, 255).astype(np.uint8)
+
+    # frames_np = frames_np.astype(np.float32)
+        
+    frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
+    with torch.no_grad():
+        inputs = hf_processor(images=frames_list, return_tensors="pt").to(device)
+        out = hf_vit(**inputs)
+        cls = out.last_hidden_state[:, 0, :]  # (N,768)
+        cls = cls.cpu().numpy()
+        cls = cls / (np.linalg.norm(cls, axis=1, keepdims=True) + 1e-8)
+        return cls.astype(np.float32)
+
+
+def load_frame_rgb(path):
+    img = Image.open(path).convert("RGB")
+    return np.array(img, dtype=np.uint8)
+
+def encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx):
+    frame_vecs = []
+    missing_paths = []
+
+    # first collect cached vs uncached frames
+    for p in chunk["frames"]:
+        idx = path_to_idx.get(p, None)
+        if idx is not None:
+            frame_vecs.append(frame_emb_mm[idx].astype(np.float32))
+        else:
+            missing_paths.append(p)
+            frame_vecs.append(None)
+
+    # compute embeddings for missing frames on the fly
+    if missing_paths:
+        print(f"[encode_chunk] {len(missing_paths)} uncached frames; embedding on the fly")
+        missing_imgs = np.stack([load_frame_rgb(p) for p in missing_paths], axis=0)
+        missing_embs = hf_vit_embed_batch(missing_imgs)
+
+        miss_i = 0
+        for i in range(len(frame_vecs)):
+            if frame_vecs[i] is None:
+                frame_vecs[i] = missing_embs[miss_i]
+                miss_i += 1
+
+    frame_embs = np.stack(frame_vecs, axis=0)   # (T, 768)
+    frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)
+
+    stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)
     return stage1_chunk_emb[0].numpy().astype(np.float32)
 
 def pad_or_trim(items, k, emb_dim, pad_meta_template):
@@ -447,10 +518,17 @@ def build_and_load_ratt_head():
 
     fresh_head.load_weights(config.RATT_WEIGHTS)
     print(f'loaded ratt weights')
+    # ratt_weights = [
+    #     "20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b_transformer_block_0.pkl",
+    #     "20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b_transformer_block_1.pkl"
+    # ]
+    # 20260331-151759_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_chunk_size8_stride2_ret75_k32_sk100_dt005_ch8_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_b0d8.weights.h5
+
     ratt_weights = [
-        "20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b_transformer_block_0.pkl",
-        "20260329-102828_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_ret75_k32_sk100_dt005_ch12_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_8e5b_transformer_block_1.pkl"
+        "20260331-151759_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_chunk_size8_stride2_ret75_k32_sk100_dt005_ch8_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_b0d8_transformer_block_0.pkl",
+        "20260331-151759_vtest-vid10_db-ratt_db_chunk_encoder_all_vids_overlap_chunks_chunk_size8_stride2_ret75_k32_sk100_dt005_ch8_L2H8Q32_bs16_acc1_e3_lr1e-03to1e-03_reb3_b0d8_transformer_block_1.pkl"
     ]
+
     for i in range(fresh_head.num_layers):
         block = getattr(fresh_head, f"transformer_block_{i}")
         with open(f"rag_weights/{ratt_weights[i]}", "rb") as f:
@@ -472,6 +550,53 @@ def build_and_load_ratt_head():
         print(p, "exists:", os.path.exists(p), "mtime:", os.path.getmtime(p))
     return fresh_head
 
+TOP_K_EVENT_CHUNKS = 5
+
+def frame_name_to_int(frame_name):
+    """
+    Examples:
+      'vid2_frame_23117' -> 23117
+      '23117' -> 23117
+    """
+    if frame_name is None:
+        return None
+    s = str(frame_name)
+    try:
+        return int(s.split("_")[-1])
+    except Exception:
+        return None
+
+def get_topk_chunks_for_sequence(seq, k=5):
+    """
+    seq: list of per-chunk dicts for one clip
+    Returns top-k rows sorted by descending logit.
+    """
+    k = min(k, len(seq))
+    top_seq = sorted(seq, key=lambda x: x["logit"], reverse=True)[:k]
+
+    rows = []
+    for rank, x in enumerate(top_seq, start=1):
+        rows.append({
+            "rank": rank,
+            "vid": x["vid"],
+            "clip": x["clip"],
+            "side": x["side"],
+            "label": x["label"],
+            "chunk_start_idx": x["start_idx"],
+            "chunk_end_idx": x["end_idx"],
+            "start_frame": x.get("start_frame"),
+            "end_frame": x.get("end_frame"),
+            "center_frame": (
+                (x.get("start_frame") + x.get("end_frame")) // 2
+                if x.get("start_frame") is not None and x.get("end_frame") is not None
+                else None
+            ),
+            "logit": float(x["logit"]),
+            "prob": float(x["prob"]),
+            "pred": int(x["pred"]),
+        })
+    return rows
+
 if __name__ == "__main__":
     print("SEARCH_K_CONTENT", config.SEARCH_K_CONTENT)
     print("SEARCH_K_TEMPORAL", config.SEARCH_K_TEMPORAL)
@@ -480,16 +605,20 @@ if __name__ == "__main__":
     print("K_TEMPORAL", config.K_TEMPORAL)
     print("FUTURE_CHUNK_STEP", config.FUTURE_CHUNK_STEP)
     print("CHUNK_SIZE", config.CHUNK_SIZE)
+    print("CHUNK_STRIDE", config.CHUNK_STRIDE)
     print("CHROMADB_COLLECTION", config.CHROMADB_COLLECTION)
     print("STAGE1_WEIGHTS", config.STAGE1_WEIGHTS)
     print("RATT_WEIGHTS", config.RATT_WEIGHTS)
-    # --------------------------------------------------------
-    # 1. load training chunks
-    # --------------------------------------------------------
-    train_vids = config.TRAIN_VIDS
-    train_samples = load_samples(train_vids, stride=1)
+
+    train_vids = config.TEST_VIDS
+    train_samples = load_samples(train_vids, stride=1, start_clip=55, end_clip=56)
     print(train_samples[0])
-    train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
+
+    train_chunk_samples = build_chunks(
+        train_samples,
+        chunk_size=config.CHUNK_SIZE,
+        chunk_stride=config.CHUNK_STRIDE,
+    )
 
     print(f"Train chunks: {len(train_chunk_samples)}")
 
@@ -499,27 +628,18 @@ if __name__ == "__main__":
         training=False
     )
 
-    # --------------------------------------------------------
-    # 2. live retrieval lookups
-    # --------------------------------------------------------
     train_chunk_lookup = {make_chunk_key(c): c for c in train_chunk_samples}
     train_future_key_lookup = build_future_key_lookup(
         train_chunk_samples,
         future_step=config.FUTURE_CHUNK_STEP
     )
 
-    # --------------------------------------------------------
-    # 3. retrieval db
-    # --------------------------------------------------------
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
         name=config.CHROMADB_COLLECTION,
         metadata={"hnsw:space": "cosine"}
     )
 
-    # --------------------------------------------------------
-    # 4. chunk encoder
-    # --------------------------------------------------------
     chunk_encoder = ChunkEncoder(
         hidden_size=768,
         num_layers=4,
@@ -537,62 +657,14 @@ if __name__ == "__main__":
         with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
             weights = pickle.load(f)
         block.set_weights(weights)
+
     chunk_encoder.trainable = False
     print("[MODEL] Loaded chunk encoder weights")
 
-    # --------------------------------------------------------
-    # 5. frame cache
-    # --------------------------------------------------------
-    store_name = "train_val_frames_chunk12_stride4"
+    store_name = "train_val_frames_chunk8_stride2"
     frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
 
-    # --------------------------------------------------------
-    # 6. ratt head v2
-    # --------------------------------------------------------
-    # ratt_head = RATTHeadV2(
-    #     hidden_size=768,
-    #     num_heads=8,
-    #     num_layers=2,
-    # )
-
-    # dummy_q = tf.zeros((1, 768), dtype=tf.float32)
-    # dummy_s = tf.zeros((1, config.K_SIM, 768), dtype=tf.float32)
-    # dummy_c = tf.zeros((1, config.K_CONTRAST, 768), dtype=tf.float32)
-    # dummy_t = tf.zeros((1, config.K_TEMPORAL, 768), dtype=tf.float32)
-
-    # _ = ratt_head(
-    #     chunk_embs=dummy_q,
-    #     support_tokens=dummy_s,
-    #     contrast_tokens=dummy_c,
-    #     temporal_tokens=dummy_t,
-    #     training=False,
-    # )
-
-    # path = config.RATT_WEIGHTS
-    # import os
-
-    # path = config.RATT_WEIGHTS
-
-    # print("cwd:", os.getcwd())
-    # print("path raw:", repr(path))
-    # print("abs path:", os.path.abspath(path))
-    # print("exists:", os.path.exists(path))
-    # print("isfile:", os.path.isfile(path))
-    # print("readable:", os.access(path, os.R_OK))
-
-    # parent = os.path.dirname(path) or "."
-    # print("parent exists:", os.path.exists(parent))
-    # print("parent abs:", os.path.abspath(parent))
-    # print("parent contents:", os.listdir(parent) if os.path.exists(parent) else "MISSING")
-    # ratt_head.load_weights(config.RATT_WEIGHTS)
-    # ratt_head.trainable = False
-    # print("[MODEL] Loaded RATTHeadV2 weights")
-
-    # --------------------------------------------------------
-    # 7. run inference on training set
-    # --------------------------------------------------------
     clip_outputs = defaultdict(list)
-
     fresh_head = build_and_load_ratt_head()
 
     for step, batch in enumerate(train_dataset):
@@ -609,18 +681,7 @@ if __name__ == "__main__":
             path_to_idx=path_to_idx
         )
 
-        # THIS matches your best ablation:
         zeros_query = tf.zeros_like(query_embs)
-
-        # class_logits, cls_out, aux = ratt_head(
-        #     chunk_embs=zeros_query,
-        #     support_tokens=support_tokens,
-        #     contrast_tokens=contrast_tokens,
-        #     temporal_tokens=temporal_tokens,
-        #     training=False,
-        # )
-
-        
 
         class_logits, cls_out, aux = fresh_head(
             chunk_embs=zeros_query,
@@ -635,17 +696,16 @@ if __name__ == "__main__":
         preds = (probs >= 0.5).astype(np.int32)
 
         batch_acc = tf.reduce_mean(tf.cast(tf.equal(preds, labels), tf.float32))
-        # print(logits)
-        # print(labels)
-        temp = pd.DataFrame()
-            
-        temp['labels'] = labels.numpy().flatten()
-        temp['logits'] = logits.flatten()
-        temp['probs'] = probs.flatten()
-        print(temp)
-        print(f"batch acc={batch_acc:.6f}")
-              
+
+        temp_vids = []
+        temp_clips = []
+        temp_start_frames = []
+        temp_end_frames = []
+
         for i in range(len(logits)):
+            frames = metadata["frames"][i].numpy()
+            frames = [f.decode() for f in frames]
+
             vid = int(_to_py_scalar(metadata["vid"][i]))
             clip = int(_to_py_scalar(metadata["clip"][i]))
             side = str(_to_py_scalar(metadata["side"][i]))
@@ -653,6 +713,12 @@ if __name__ == "__main__":
             start_idx = int(_to_py_scalar(metadata["start_idx"][i]))
             end_idx = int(_to_py_scalar(metadata["end_idx"][i]))
             label = int(_to_py_scalar(labels[i]))
+
+            start_frame_name = frames[0].split("/")[-1].split(".")[0]
+            end_frame_name = frames[-1].split("/")[-1].split(".")[0]
+
+            start_frame_num = frame_name_to_int(start_frame_name)
+            end_frame_num = frame_name_to_int(end_frame_name)
 
             clip_key = f"vid{vid}_clip_{clip}"
 
@@ -664,23 +730,53 @@ if __name__ == "__main__":
                 "t_center": t_center,
                 "start_idx": start_idx,
                 "end_idx": end_idx,
+                "start_frame": start_frame_num,
+                "end_frame": end_frame_num,
+                "start_frame_name": start_frame_name,
+                "end_frame_name": end_frame_name,
                 "logit": float(logits[i]),
                 "prob": float(probs[i]),
                 "pred": int(preds[i]),
             })
 
-            pprint.pprint(clip_outputs[clip_key])
+            temp_vids.append(vid)
+            temp_clips.append(clip)
+            temp_start_frames.append(start_frame_name)
+            temp_end_frames.append(end_frame_name)
+
+        temp = pd.DataFrame()
+        temp["labels"] = labels.numpy().flatten()
+        temp["logits"] = logits.flatten()
+        temp["probs"] = probs.flatten()
+        temp["preds"] = np.array(preds).flatten()
+        temp["vids"] = np.array(temp_vids).flatten()
+        temp["clips"] = np.array(temp_clips).flatten()
+        temp["start_frames"] = np.array(temp_start_frames).flatten()
+        temp["end_frames"] = np.array(temp_end_frames).flatten()
+
+        print(temp)
+        print(f"batch acc={batch_acc:.6f}")
         print(f"[infer] step={step} complete")
 
-    # --------------------------------------------------------
-    # 8. sort per clip and save sequences
-    # --------------------------------------------------------
     rows = []
 
     for clip_key, seq in clip_outputs.items():
         seq = sorted(seq, key=lambda x: x["start_idx"])
 
         raw_sequence = [x["logit"] for x in seq]
+        topk_chunks = get_topk_chunks_for_sequence(seq, k=TOP_K_EVENT_CHUNKS)
+
+        print(f"\n=== {clip_key} | label={seq[0]['label']} ===")
+        for row in topk_chunks:
+            print(
+                f"rank={row['rank']} "
+                f"chunk_idx=({row['chunk_start_idx']},{row['chunk_end_idx']}) "
+                f"frames=({row['start_frame']},{row['end_frame']}) "
+                f"center={row['center_frame']} "
+                f"logit={row['logit']:.4f} "
+                f"prob={row['prob']:.4f} "
+                f"pred={row['pred']}"
+            )
 
         rows.append({
             "clip_key": clip_key,
@@ -691,19 +787,22 @@ if __name__ == "__main__":
             "num_chunks": len(seq),
             "start_idxs": [x["start_idx"] for x in seq],
             "end_idxs": [x["end_idx"] for x in seq],
+            "start_frames": [x.get("start_frame") for x in seq],
+            "end_frames": [x.get("end_frame") for x in seq],
             "t_centers": [x["t_center"] for x in seq],
             "raw_sequence": raw_sequence,
             "z_sequence": z_normalize(raw_sequence).tolist(),
             "prob_sequence": [x["prob"] for x in seq],
             "pred_sequence": [x["pred"] for x in seq],
+            "topk_chunks": topk_chunks,
         })
 
     rows.sort(key=lambda x: (x["vid"], x["clip"]))
 
     os.makedirs("test", exist_ok=True)
 
-    out_json = "test/test_new_clip_logit_sequences_live_zeroquery.json"
-    out_csv = "test/test_new_clip_logit_sequences_live_zeroquery.csv"
+    out_json = "test/new_logit_sequences_live_zeroquery.json"
+    out_csv = "test/new_logit_sequences_live_zeroquery.csv"
 
     with open(out_json, "w") as f:
         json.dump(rows, f, indent=2)

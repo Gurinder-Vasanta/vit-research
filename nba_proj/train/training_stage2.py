@@ -15,7 +15,7 @@ from models.ratt_head import RATTHead
 from models.projection_head import ProjectionHead
 from retrieval.ratt_chunk_retriever import RattChunkRetriever
 from models.candidate_reranker import CandidateReranker
-from db_maintainence.db_rebuild_chunk import rebuild_db
+# from db_maintainence.db_rebuild_chunk import rebuild_db
 import config_stage2 as config
 import time
 
@@ -655,25 +655,25 @@ def load_retrieval_cache(path):
     print(f"[CACHE] Loaded retrieval cache from {path}")
     return cache    
 
-def print_random_cache_queries():
-    r_inds = [random.randint(1,len(cache.keys())) for i in range(10)]
-    for ind in r_inds: 
-        entry = cache[list(cache.keys())[ind]]
-        print('-----------------')
-        print("QUERY")
-        print(entry["query_meta"])
+# def print_random_cache_queries():
+#     r_inds = [random.randint(1,len(cache.keys())) for i in range(10)]
+#     for ind in r_inds: 
+#         entry = cache[list(cache.keys())[ind]]
+#         print('-----------------')
+#         print("QUERY")
+#         print(entry["query_meta"])
 
-        print("\nSIM")
-        for m in entry["sim_meta"][:5]:
-            print(m)
+#         print("\nSIM")
+#         for m in entry["sim_meta"][:5]:
+#             print(m)
 
-        print("\nCONTRAST")
-        for m in entry["contrast_meta"][:5]:
-            print(m)
+#         print("\nCONTRAST")
+#         for m in entry["contrast_meta"][:5]:
+#             print(m)
 
-        print("\nTEMPORAL")
-        for m in entry["temporal_meta"][:5]:
-            print(m)
+#         print("\nTEMPORAL")
+#         for m in entry["temporal_meta"][:5]:
+#             print(m)
 
 def _to_py_scalar(x):
     if hasattr(x, "numpy"):
@@ -1151,7 +1151,7 @@ if __name__ == "__main__":
     # ---------------------------------------------
     train_vids = config.TRAIN_VIDS
     train_samples = load_samples(train_vids,stride=1)
-    train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
+    train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE, chunk_stride=config.CHUNK_STRIDE)
     # train_chunk_samples = train_chunk_samples[0:100]
     # label_lookup = {}
     # for c in train_chunk_samples:
@@ -1160,7 +1160,7 @@ if __name__ == "__main__":
 
     test_vids = config.TEST_VIDS
     test_samples = load_samples(test_vids,stride=1)
-    test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE)
+    test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE, chunk_stride=config.CHUNK_STRIDE)
     # test_chunk_samples = train_chunk_samples[0:32]
     random.shuffle(train_samples)
     random.shuffle(test_samples)
@@ -1208,6 +1208,13 @@ if __name__ == "__main__":
     dummy_frame_embs = tf.zeros((1, config.CHUNK_SIZE, 768), dtype=tf.float32)
     _ = chunk_encoder(dummy_frame_embs, training=False)
 
+    print("==== DEBUG STAGE2 ====")
+    print("cwd:", os.getcwd())
+    print("weights path:", config.STAGE1_WEIGHTS)
+    print("abs path:", os.path.abspath(config.STAGE1_WEIGHTS))
+    print("exists:", os.path.exists(config.STAGE1_WEIGHTS))
+    print("======================")
+
     chunk_encoder.load_weights(config.STAGE1_WEIGHTS)
 
     for i in range(chunk_encoder.num_layers):
@@ -1221,22 +1228,22 @@ if __name__ == "__main__":
     chunk_encoder.trainable = False
     print("[STAGE1] Chunk encoder frozen")
 
-    store_name = 'train_val_frames_chunk12_stride4'
+    store_name = 'train_val_frames_chunk8_stride2'
     frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
-    if(os.path.exists(config.STAGE2_CACHE_PATH)):
-        cache = load_retrieval_cache(config.STAGE2_CACHE_PATH)
-        # print(cache)
-        print("[CACHE] loaded cache")
-    else:
-        cache = build_retrieval_cache(
-            all_chunks=train_chunk_samples,
-            collection=collection,
-            chunk_encoder=chunk_encoder,
-            frame_emb_mm=frame_emb_mm,
-            frame_paths=frame_paths,
-            path_to_idx=path_to_idx
-            )
-        save_retrieval_cache(cache,config.STAGE2_CACHE_PATH)
+    # if(os.path.exists(config.STAGE2_CACHE_PATH)):
+    #     cache = load_retrieval_cache(config.STAGE2_CACHE_PATH)
+    #     # print(cache)
+    #     print("[CACHE] loaded cache")
+    # else:
+    #     cache = build_retrieval_cache(
+    #         all_chunks=train_chunk_samples,
+    #         collection=collection,
+    #         chunk_encoder=chunk_encoder,
+    #         frame_emb_mm=frame_emb_mm,
+    #         frame_paths=frame_paths,
+    #         path_to_idx=path_to_idx
+    #         )
+    #     save_retrieval_cache(cache,config.STAGE2_CACHE_PATH)
     
     bce_loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
@@ -1259,7 +1266,8 @@ if __name__ == "__main__":
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
 
-    query_embs, support, contrast, temporal = fetch_cache_batch(batch[1], cache)
+    # query_embs, support, contrast, temporal = fetch_cache_batch(batch[1], cache)
+    
 
     train_chunk_lookup = {make_chunk_key(c): c for c in train_chunk_samples}
     train_future_key_lookup = build_future_key_lookup(train_chunk_samples, future_step=5)
@@ -1267,7 +1275,17 @@ if __name__ == "__main__":
     val_chunk_lookup = {make_chunk_key(c): c for c in test_chunk_samples}
     val_future_key_lookup = build_future_key_lookup(test_chunk_samples, future_step=5)
 
+    # query_embs, support, contrast, temporal = fetch_cache_batch(batch[1], cache)
     
+    query_embs, support, contrast, temporal = fetch_live_batch(
+        metadata=batch[1],
+        chunk_lookup=train_chunk_lookup,
+        future_key_lookup=train_future_key_lookup,
+        collection=collection,
+        chunk_encoder=chunk_encoder,
+        frame_emb_mm=frame_emb_mm,
+        path_to_idx=path_to_idx,
+    )
     print(query_embs.shape)
     print(support.shape)
     print(contrast.shape)
@@ -1282,7 +1300,7 @@ if __name__ == "__main__":
     )
     print(logits)
     print("logits:", logits.shape)
-    print_random_cache_queries()
+    # print_random_cache_queries()
     for epoch in range(config.EPOCHS):
         print(f"\n===== EPOCH {epoch+1}/{config.EPOCHS} =====")
 

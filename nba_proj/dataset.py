@@ -17,7 +17,7 @@ def comparator(fname):
     frame_num = int(splitted[2].split('.')[0])
     return (vid_num, frame_num)
 
-def load_samples(train_vids, stride = 1, max_clips = 30):
+def load_samples(train_vids, stride = 1, max_clips = 30, start_clip = 0, end_clip=30):
     already_labelled = pd.read_csv("clips_label.csv")
     
     samples = []
@@ -31,7 +31,7 @@ def load_samples(train_vids, stride = 1, max_clips = 30):
         clip_root = f'/home/vasantgc/venv/nba_proj/data/unseen_test_images/smarter_clips/clips_hmm_smooth_{vid}_smart'
         clips = sorted(os.listdir(clip_root),key=comparator) 
     
-        clips = clips[0:max_clips] #this should change to 50:50+max_clips (because first 50 will get added )
+        clips = clips[start_clip:end_clip] #this should change to 50:50+max_clips (because first 50 will get added )
         for clip in clips:
             clip_path = os.path.join(clip_root, clip)
             frames = sorted(os.listdir(clip_path),key=comparator) 
@@ -42,8 +42,11 @@ def load_samples(train_vids, stride = 1, max_clips = 30):
             ]
             # print(len(np.array(label_row)[0]))
             if label_row.empty or pd.isna(label_row['label'].iloc[0]):
-                continue
-            clip_label = int(label_row["label"].iloc[0])
+                clip_label= -1 #-1 means its not labelled, so any chunk with this label is true inference
+                # print('???')
+                # continue
+            else: 
+                clip_label = int(label_row["label"].iloc[0])
 
             num_frames = len(frames)
             stride_counter = 0
@@ -70,13 +73,21 @@ def load_samples(train_vids, stride = 1, max_clips = 30):
     # input(np.array(samples))
     return samples
 
-def build_chunks(frame_samples, chunk_size=60):
+def build_chunks(frame_samples, chunk_size=12, chunk_stride=4):
     """
     frame_samples: list of dictionaries (one per frame)
-    chunk_size: number of frames to group into one chunk
+    chunk_size: number of frames per chunk
+    chunk_stride: step size between consecutive chunks
 
     Returns: list of chunk dictionaries
     """
+
+    if chunk_stride <= 0:
+        raise ValueError(f"chunk_stride must be positive, got {chunk_stride}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if chunk_stride > chunk_size:
+        print(f"[warn] chunk_stride ({chunk_stride}) > chunk_size ({chunk_size}); chunks will not overlap")
 
     # --- Group frames by clip ---
     clips = {}
@@ -95,32 +106,34 @@ def build_chunks(frame_samples, chunk_size=60):
 
     for (vid, clip), frames in clips.items():
         total_frames = len(frames)
-        label = frames[0]["label"]     # all frames share the clip label
-        side = frames[0]["side"]       # same within a clip
 
-        # slide with step = chunk_size (no overlap for now)
-        for i in range(0, total_frames, chunk_size):
-            sub = frames[i : i + chunk_size]
-            if len(sub) < chunk_size:
-                # OPTIONAL: skip incomplete chunk
-                continue
+        if total_frames < chunk_size:
+            continue
 
-            # frame paths
+        label = frames[0]["label"]
+        side = frames[0]["side"]
+
+        # overlapping sliding window
+        for start in range(0, total_frames - chunk_size + 1, chunk_stride):
+            end = start + chunk_size
+            sub = frames[start:end]
+
             frame_paths = [f["pth"] for f in sub]
 
-            # compute temporal window
             t_vals = [f["t_norm"] for f in sub]
             t_center = float(sum(t_vals) / len(t_vals))
-            t_width = float(max(t_vals) - min(t_vals))  # ~60 frames worth
+            t_width = float(max(t_vals) - min(t_vals))
 
             chunk_samples.append({
-                "frames": frame_paths,    # list of image paths (length chunk_size)
+                "frames": frame_paths,
                 "label": label,
                 "side": side,
                 "vid": vid,
                 "clip": clip,
                 "t_center": t_center,
-                "t_width": t_width, #max(t_width, 0.4)
+                "t_width": t_width,
+                "start_idx": start,
+                "end_idx": end - 1,
             })
 
     return chunk_samples
@@ -136,41 +149,64 @@ def load_and_preprocess_image(path, img_size=(432, 768)):
     img = tf.image.resize(img, img_size)
     return img
 
-def parse_chunk(chunk, img_size=(432,768)):
-    """
-    chunk: dict with fields:
-       - frames: list of Python strings
-       - label: int
-       - vid, clip: int
-       - side: 'left' or 'right'
-       - t_center, t_width: float
-    """
+# def parse_chunk(chunk, img_size=(432,768)):
+#     """
+#     chunk: dict with fields:
+#        - frames: list of Python strings
+#        - label: int
+#        - vid, clip: int
+#        - side: 'left' or 'right'
+#        - t_center, t_width: float
+#     """
 
+#     frame_paths = chunk["frames"]
+#     label = chunk["label"]
+
+#     # input(chunk)
+#     # convert python list → tf constant
+#     # path_tensor = tf.constant(frame_paths)
+#     path_tensor = frame_paths
+
+#     # load all 60 images
+#     imgs = tf.map_fn(
+#         lambda p: load_and_preprocess_image(p, img_size),
+#         path_tensor,
+#         fn_output_signature=tf.float32
+#     )
+#     # shape = (chunk_size, H, W, 3)
+
+#     metadata = {
+#         "vid": chunk["vid"],
+#         "clip": chunk["clip"],
+#         "side": chunk["side"],
+#         "t_center": chunk["t_center"],
+#         "t_width": chunk["t_width"]
+#     }
+
+#     # label = tf.constant(label, dtype=tf.int32)
+#     return imgs, metadata, label
+
+def parse_chunk(chunk, img_size=(432,768)):
     frame_paths = chunk["frames"]
     label = chunk["label"]
 
-    # input(chunk)
-    # convert python list → tf constant
-    # path_tensor = tf.constant(frame_paths)
-    path_tensor = frame_paths
-
-    # load all 60 images
     imgs = tf.map_fn(
         lambda p: load_and_preprocess_image(p, img_size),
-        path_tensor,
+        frame_paths,
         fn_output_signature=tf.float32
     )
-    # shape = (chunk_size, H, W, 3)
 
     metadata = {
+        "frames": chunk['frames'],
         "vid": chunk["vid"],
         "clip": chunk["clip"],
         "side": chunk["side"],
         "t_center": chunk["t_center"],
-        "t_width": chunk["t_width"]
+        "t_width": chunk["t_width"],
+        "start_idx": chunk["start_idx"],
+        "end_idx": chunk["end_idx"],
     }
 
-    # label = tf.constant(label, dtype=tf.int32)
     return imgs, metadata, label
 
 # chunk_samples.append({
@@ -201,136 +237,119 @@ def parse_chunk(chunk, img_size=(432,768)):
 #  't_center': 0.11796536796536798, 
 #  't_width': 0.023809523809523794}
 
-def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_workers=16, training = False):
-    # vids 8 and 10 are test vids
+# def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_workers=16, training = False):
+#     # vids 8 and 10 are test vids
+#     def gen():
+#         for sample in chunk_samples:
+#             yield sample
+
+#     output_signature = {
+#         "frames": tf.TensorSpec(shape=(None,), dtype=tf.string),  # list of frame paths
+#         "label": tf.TensorSpec(shape=(), dtype=tf.int32),
+#         "side":  tf.TensorSpec(shape=(), dtype=tf.string),
+#         "vid":   tf.TensorSpec(shape=(), dtype=tf.int32),
+#         "clip":  tf.TensorSpec(shape=(), dtype=tf.int32),
+#         "t_center": tf.TensorSpec(shape=(), dtype=tf.float32),
+#         "t_width":  tf.TensorSpec(shape=(), dtype=tf.float32),
+#     }
+
+#     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
+
+#     # shuffle dataset order
+#     ds = ds.shuffle(len(chunk_samples), reshuffle_each_iteration=True) # 2048 was len(chunk_samples)
+
+#     # map to parsed tensors (loads images, builds metadata dict)
+#     ds = ds.map(lambda chunk: parse_chunk(chunk, img_size),
+#                 num_parallel_calls=num_workers)
+
+#     # batching & prefetch
+#     ds = ds.batch(batch_size, drop_remainder=True)
+#     ds = ds.prefetch(tf.data.AUTOTUNE)
+
+#     return ds
+
+#     # ds = tf.data.Dataset.from_tensor_slices(chunk_samples)
+#     # ds = ds.shuffle(len(chunk_samples), reshuffle_each_iteration=True)
+
+#     # # ds = ds.map(parse_chunk, num_parallel_calls=16)
+
+#     # ds = ds.map(
+#     #     lambda chunk: parse_chunk(chunk, img_size),
+#     #     num_parallel_calls=num_workers
+#     # )
+
+#     # ds = ds.batch(batch_size, drop_remainder=True)
+#     # ds = ds.prefetch(tf.data.AUTOTUNE)
+#     # ds = tf.data.Dataset.from_generator(
+#     #     lambda: chunk_samples,
+#     #     output_types={
+#     #         "frames": tf.string,
+#     #         "label": tf.int32,
+#     #         "side": tf.string,
+#     #         "vid": tf.int32,
+#     #         "clip": tf.int32,
+#     #         "t_center": tf.float32,
+#     #         "t_width": tf.float32,
+#     #     }
+#     # )
+
+    
+
+#     # ds = ds.shuffle(256)
+#     # ds = ds.batch(batch_size, drop_remainder=True)
+#     # ds = ds.prefetch(tf.data.AUTOTUNE)
+
+#     return ds
+
+def build_tf_dataset_chunks(chunk_samples, batch_size, img_size=(432,768), num_workers=16, training=False):
     def gen():
         for sample in chunk_samples:
-            yield sample
+            yield {
+                "frames": sample["frames"],
+                "label": sample["label"],
+                "side": sample["side"],
+                "vid": sample["vid"],
+                "clip": sample["clip"],
+                "t_center": sample["t_center"],
+                "t_width": sample["t_width"],
+                "start_idx": sample["start_idx"],
+                "end_idx": sample["end_idx"],
+            }
 
     output_signature = {
-        "frames": tf.TensorSpec(shape=(None,), dtype=tf.string),  # list of frame paths
+        "frames": tf.TensorSpec(shape=(None,), dtype=tf.string),
         "label": tf.TensorSpec(shape=(), dtype=tf.int32),
-        "side":  tf.TensorSpec(shape=(), dtype=tf.string),
-        "vid":   tf.TensorSpec(shape=(), dtype=tf.int32),
-        "clip":  tf.TensorSpec(shape=(), dtype=tf.int32),
+        "side": tf.TensorSpec(shape=(), dtype=tf.string),
+        "vid": tf.TensorSpec(shape=(), dtype=tf.int32),
+        "clip": tf.TensorSpec(shape=(), dtype=tf.int32),
         "t_center": tf.TensorSpec(shape=(), dtype=tf.float32),
-        "t_width":  tf.TensorSpec(shape=(), dtype=tf.float32),
+        "t_width": tf.TensorSpec(shape=(), dtype=tf.float32),
+        "start_idx": tf.TensorSpec(shape=(), dtype=tf.int32),
+        "end_idx": tf.TensorSpec(shape=(), dtype=tf.int32),
     }
 
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
 
-    # shuffle dataset order
-    ds = ds.shuffle(len(chunk_samples), reshuffle_each_iteration=True) # 2048 was len(chunk_samples)
+    # ds = ds.shuffle(len(chunk_samples), seed=1234, reshuffle_each_iteration=False)
 
-    # map to parsed tensors (loads images, builds metadata dict)
-    ds = ds.map(lambda chunk: parse_chunk(chunk, img_size),
-                num_parallel_calls=num_workers)
+    ds = ds.map(
+        lambda chunk: parse_chunk(chunk, img_size),
+        num_parallel_calls=num_workers
+    )
 
-    # batching & prefetch
     ds = ds.batch(batch_size, drop_remainder=True)
     ds = ds.prefetch(tf.data.AUTOTUNE)
-
     return ds
 
-    # ds = tf.data.Dataset.from_tensor_slices(chunk_samples)
-    # ds = ds.shuffle(len(chunk_samples), reshuffle_each_iteration=True)
-
-    # # ds = ds.map(parse_chunk, num_parallel_calls=16)
-
-    # ds = ds.map(
-    #     lambda chunk: parse_chunk(chunk, img_size),
-    #     num_parallel_calls=num_workers
-    # )
-
-    # ds = ds.batch(batch_size, drop_remainder=True)
-    # ds = ds.prefetch(tf.data.AUTOTUNE)
-    # ds = tf.data.Dataset.from_generator(
-    #     lambda: chunk_samples,
-    #     output_types={
-    #         "frames": tf.string,
-    #         "label": tf.int32,
-    #         "side": tf.string,
-    #         "vid": tf.int32,
-    #         "clip": tf.int32,
-    #         "t_center": tf.float32,
-    #         "t_width": tf.float32,
-    #     }
-    # )
-
-    
-
-    # ds = ds.shuffle(256)
-    # ds = ds.batch(batch_size, drop_remainder=True)
-    # ds = ds.prefetch(tf.data.AUTOTUNE)
-
-    return ds
-
-def chunk_generator(chunk_samples):
-    for c in chunk_samples:
-        yield {
-            "frames": c["frames"],         # python list of strings
-            "label": c["label"],
-            "side": c["side"],
-            "vid": c["vid"],
-            "clip": c["clip"],
-            "t_center": c["t_center"],
-            "t_width": c["t_width"],
-        }
-
-# def batch_generator(samples, batch_size=32, num_workers=32):
-#     """
-#     Samples: list of dicts: {pth, vid_num, clip_num, side, t_norm, label}
-#     """
-#     N = len(samples)
-#     idx = 0
-
-#     pool = Pool(num_workers)
-
-#     while idx < N:
-#         batch_samples = samples[idx : idx + batch_size]
-
-#         paths = [s["pth"] for s in batch_samples]
-#         frames = pool.map(preprocess_frame, paths)
-#         frames = np.array(frames, dtype=np.float32)
-
-#         metadata = {
-#             "vid":    np.array([s["vid_num"]  for s in batch_samples], dtype=np.int32),
-#             "clip":   np.array([s["clip_num"] for s in batch_samples], dtype=np.int32),
-#             "side":   np.array([s["side"]     for s in batch_samples], dtype=object),
-#             "t_norm": np.array([s["t_norm"]   for s in batch_samples], dtype=np.float32)
+# def chunk_generator(chunk_samples):
+#     for c in chunk_samples:
+#         yield {
+#             "frames": c["frames"],         # python list of strings
+#             "label": c["label"],
+#             "side": c["side"],
+#             "vid": c["vid"],
+#             "clip": c["clip"],
+#             "t_center": c["t_center"],
+#             "t_width": c["t_width"],
 #         }
-
-#         labels = np.array([s["label"] for s in batch_samples], dtype=np.int32)
-
-#         yield frames, metadata, labels
-
-#         idx += batch_size
-
-#     pool.close()
-#     pool.join()
-
-
-
-# def build_tf_dataset(samples, batch_size=32, num_workers=32):
-#     """
-#     Wrap the Python generator into a tf.data.Dataset.
-#     """
-
-#     output_signature = (
-#         tf.TensorSpec(shape=(None, 432, 768, 3), dtype=tf.float32),  # frames batch
-#         {
-#             "vid": tf.TensorSpec(shape=(None,), dtype=tf.int32),
-#             "clip": tf.TensorSpec(shape=(None,), dtype=tf.int32),
-#             "side": tf.TensorSpec(shape=(None,), dtype=tf.string),
-#             "t_norm": tf.TensorSpec(shape=(None,), dtype=tf.float32),
-#         },
-#         tf.TensorSpec(shape=(None,), dtype=tf.int32),
-#     )
-
-#     return (
-#         tf.data.Dataset.from_generator(
-#             lambda: batch_generator(samples, batch_size, num_workers),
-#             output_signature=output_signature
-#         )
-#         .prefetch(tf.data.AUTOTUNE)
-#     )
+        
