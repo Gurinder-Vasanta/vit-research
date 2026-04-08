@@ -3012,38 +3012,154 @@ def load_encoded_embeddings(path):
     print(f"[CACHE] Loaded encoded embeddings from {path}")
     return cache
 
-def query_collection(query_emb, collection, n_results):
-        results = collection.query(
-            query_embeddings=[query_emb.tolist()],
-            n_results=n_results,
-            include=["embeddings", "metadatas"]
+# def query_collection(query_emb, collection, n_results, ):
+#         results = collection.query(
+#             query_embeddings=[query_emb.tolist()],
+#             n_results=n_results,
+#             include=["embeddings", "metadatas"]
+#         )
+
+#         raw_embs = results["embeddings"][0]
+#         raw_meta = results["metadatas"][0]
+
+#         out = []
+#         for emb, meta in zip(raw_embs, raw_meta):
+#             # pprint.pprint(meta)
+#             out.append(
+#                 {
+#                     "emb": np.asarray(emb, dtype=np.float32),
+#                     "meta": {
+#                         "label": int(meta["label"]),
+#                         "status": str(meta["status"]),
+#                         "status_id": int(meta["status_id"]),
+#                         "side": str(meta["side"]),
+#                         "vid": int(meta["vid_num"]),
+#                         "clip": int(meta["clip_num"]),
+#                         "t_center": float(meta["t_center"]),
+#                         "t_width": float(meta["t_width"]),
+#                         "start_idx": int(meta["start_idx"]),
+#                         "end_idx": int(meta["end_idx"]),
+#                         "class_logit": float(meta["class_logit"])
+#                     },
+#                 }
+#             )
+#         return out
+
+
+def query_collection(
+    query_emb,
+    collection,
+    n_results,
+    side=None,
+    target_status_ids=None,
+):
+    where_clauses = []
+
+    if side is not None:
+        where_clauses.append({"side": str(side)})
+
+    if target_status_ids is not None:
+        target_status_ids = [int(s) for s in target_status_ids]
+        if len(target_status_ids) == 1:
+            where_clauses.append({"status_id": target_status_ids[0]})
+        else:
+            where_clauses.append({
+                "$or": [{"status_id": s} for s in target_status_ids]
+            })
+
+    if len(where_clauses) == 0:
+        where = None
+    elif len(where_clauses) == 1:
+        where = where_clauses[0]
+    else:
+        where = {"$and": where_clauses}
+
+    query_kwargs = {
+        "query_embeddings": [query_emb.tolist()],
+        "n_results": n_results,
+        "include": ["embeddings", "metadatas"],
+    }
+    if where is not None:
+        query_kwargs["where"] = where
+
+    results = collection.query(**query_kwargs)
+
+    raw_embs = results["embeddings"][0]
+    raw_meta = results["metadatas"][0]
+
+    out = []
+    for emb, meta in zip(raw_embs, raw_meta):
+        out.append(
+            {
+                "emb": np.asarray(emb, dtype=np.float32),
+                "meta": {
+                    "label": int(meta["label"]),
+                    "status": str(meta["status"]),
+                    "status_id": int(meta["status_id"]),
+                    "side": str(meta["side"]),
+                    "vid": int(meta["vid_num"]),
+                    "clip": int(meta["clip_num"]),
+                    "t_center": float(meta["t_center"]),
+                    "t_width": float(meta["t_width"]),
+                    "start_idx": int(meta["start_idx"]),
+                    "end_idx": int(meta["end_idx"]),
+                    "class_logit": float(meta["class_logit"]),
+                },
+            }
         )
+    return out
 
-        raw_embs = results["embeddings"][0]
-        raw_meta = results["metadatas"][0]
 
-        out = []
-        for emb, meta in zip(raw_embs, raw_meta):
-            # pprint.pprint(meta)
-            out.append(
-                {
-                    "emb": np.asarray(emb, dtype=np.float32),
-                    "meta": {
-                        "label": int(meta["label"]),
-                        "status": str(meta["status"]),
-                        "status_id": int(meta["status_id"]),
-                        "side": str(meta["side"]),
-                        "vid": int(meta["vid_num"]),
-                        "clip": int(meta["clip_num"]),
-                        "t_center": float(meta["t_center"]),
-                        "t_width": float(meta["t_width"]),
-                        "start_idx": int(meta["start_idx"]),
-                        "end_idx": int(meta["end_idx"]),
-                        "class_logit": float(meta["class_logit"])
-                    },
-                }
-            )
-        return out
+def dedup_and_remove_self(candidates, query_meta):
+    out = []
+    seen = set()
+
+    for cand in candidates:
+        cand_meta = cand["meta"]
+        sig = dedup_signature(cand_meta)
+
+        if same_chunk_meta(query_meta, cand_meta):
+            continue
+        if sig in seen:
+            continue
+
+        seen.add(sig)
+        out.append(cand)
+
+    return out
+
+
+def interleave_lists(a, b, n_total):
+    out = []
+    ia = ib = 0
+
+    while len(out) < n_total and (ia < len(a) or ib < len(b)):
+        if ia < len(a):
+            out.append(a[ia])
+            ia += 1
+            if len(out) >= n_total:
+                break
+        if ib < len(b):
+            out.append(b[ib])
+            ib += 1
+
+    return out
+
+
+def take_unique(items, k):
+    out = []
+    seen = set()
+
+    for cand in items:
+        sig = dedup_signature(cand["meta"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(cand)
+        if len(out) >= k:
+            break
+
+    return out
 
 def query_collection_batch(query_embs, collection, n_results):
     """
@@ -3120,6 +3236,549 @@ def dedup_signature(meta):
         int(meta["end_idx"]),
     )
 
+def get_branch_mix_counts(epoch_idx, k, training):
+    """
+    Returns:
+        n_ideal: number of oracle tokens
+        n_noisy: number of corrupted tokens
+        use_unrestricted_final: if True, stop using label-based routing entirely
+    """
+    if not training or epoch_idx is None:
+        return k, 0, False   # full oracle for validation/debug
+
+    # curriculum:
+    # 0-1   : 100% ideal
+    # 2-3   : 80% ideal / 20% noisy
+    # 4-5   : 60% ideal / 40% noisy
+    # 6-7   : 50% ideal / 50% noisy
+    # 8-9   : 20% ideal / 80% noisy
+    # 10+   : unrestricted retrieval
+    if epoch_idx < 2:
+        return k, 0, False
+    elif epoch_idx < 4:
+        n_ideal = int(round(0.8 * k))
+        return n_ideal, k - n_ideal, False
+    elif epoch_idx < 6:
+        n_ideal = int(round(0.6 * k))
+        return n_ideal, k - n_ideal, False
+    elif epoch_idx < 8:
+        n_ideal = int(round(0.5 * k))
+        return n_ideal, k - n_ideal, False
+    elif epoch_idx < 10:
+        n_ideal = int(round(0.2 * k))
+        return n_ideal, k - n_ideal, False
+    else:
+        return 0, k, True
+
+
+# def build_live_entry(
+#     chunk,
+#     future_chunk,
+#     collection,
+#     chunk_encoder,
+#     frame_emb_mm,
+#     path_to_idx,
+#     search_k_content,
+#     search_k_temporal,
+#     k_sim,
+#     k_contrast,
+#     k_temporal,
+#     training=False,
+#     epoch_idx=None,
+# ):
+#     query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+#     future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+
+#     query_meta = extract_meta(chunk)
+#     future_meta = extract_meta(future_chunk)
+
+#     emb_dim = query_emb.shape[0]
+
+#     pad_meta_template = {
+#         "label": -1,
+#         "side": "PAD",
+#         "status": "PAD",
+#         "status_id": -1,
+#         "vid": -1,
+#         "clip": -1,
+#         "t_center": -1.0,
+#         "t_width": -1.0,
+#         "start_idx": -1,
+#         "end_idx": -1,
+#     }
+
+#     # -------------------------
+#     # content retrieval pool
+#     # -------------------------
+#     content_candidates = query_collection(query_emb, collection, search_k_content)
+
+#     same_status = []
+#     diff_status = []
+#     unrestricted = []
+#     seen_content = set()
+
+#     for cand in content_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+#         if sig in seen_content:
+#             continue
+
+#         seen_content.add(sig)
+#         unrestricted.append(cand)
+
+#         if int(cand_meta["status_id"]) == int(query_meta["status_id"]):
+#             same_status.append(cand)
+#         else:
+#             diff_status.append(cand)
+
+#     # -------------------------
+#     # support curriculum
+#     # -------------------------
+#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
+#         epoch_idx=epoch_idx, k=k_sim, training=training
+#     )
+
+#     if sim_unrestricted:
+#         sim_items = unrestricted[:k_sim]
+#     else:
+#         sim_items = []
+
+#         # ideal support = same-status
+#         sim_items.extend(same_status[:sim_n_ideal])
+
+#         # noisy support = different-status
+#         # use a disjoint slice from diff_status
+#         sim_items.extend(diff_status[:sim_n_noisy])
+
+#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+
+#     # -------------------------
+#     # contrast curriculum
+#     # -------------------------
+#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
+#         epoch_idx=epoch_idx, k=k_contrast, training=training
+#     )
+
+#     if con_unrestricted:
+#         # use a later slice so contrast isn't identical to support
+#         contrast_items = unrestricted[k_sim:k_sim + k_contrast]
+#     else:
+#         contrast_items = []
+
+#         # ideal contrast = different-status
+#         contrast_items.extend(diff_status[sim_n_noisy:sim_n_noisy + con_n_ideal])
+
+#         # noisy contrast = same-status
+#         # use a disjoint slice from same_status after support's ideal picks
+#         contrast_items.extend(same_status[sim_n_ideal:sim_n_ideal + con_n_noisy])
+
+#     contrast_embs, contrast_meta = pad_or_trim(
+#         contrast_items, k_contrast, emb_dim, pad_meta_template
+#     )
+
+#     # -------------------------
+#     # temporal retrieval
+#     # -------------------------
+#     temporal_candidates = query_collection(future_emb, collection, search_k_temporal)
+
+#     temporal_items = []
+#     seen_temporal = set()
+
+#     for cand in temporal_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+
+#         # optional:
+#         # if same_chunk_meta(future_meta, cand_meta):
+#         #     continue
+
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+#         if sig in seen_temporal:
+#             continue
+
+#         temporal_items.append(cand)
+#         seen_temporal.add(sig)
+
+#         if len(temporal_items) >= k_temporal:
+#             break
+
+#     temporal_embs, temporal_meta = pad_or_trim(
+#         temporal_items, k_temporal, emb_dim, pad_meta_template
+#     )
+
+#     return {
+#         "query_emb": query_emb,
+#         "sim_embs": sim_embs,
+#         "contrast_embs": contrast_embs,
+#         "temporal_embs": temporal_embs,
+#         "query_meta": query_meta,
+#         "future_meta": future_meta,
+#         "sim_meta": sim_meta,
+#         "contrast_meta": contrast_meta,
+#         "temporal_meta": temporal_meta,
+#     }
+
+
+# def build_live_entry(
+#     chunk,
+#     future_chunk,
+#     collection,
+#     chunk_encoder,
+#     frame_emb_mm,
+#     path_to_idx,
+#     search_k_content,
+#     search_k_temporal,
+#     k_sim,
+#     k_contrast,
+#     k_temporal,
+#     training=False,
+#     epoch_idx=None,
+# ):
+#     query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+#     future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+
+#     query_meta = extract_meta(chunk)
+#     future_meta = extract_meta(future_chunk)
+
+#     q_status = int(query_meta["status_id"])
+#     emb_dim = query_emb.shape[0]
+
+#     pad_meta_template = {
+#         "label": -1,
+#         "side": "PAD",
+#         "status": "PAD",
+#         "status_id": -1,
+#         "vid": -1,
+#         "clip": -1,
+#         "t_center": -1.0,
+#         "t_width": -1.0,
+#         "start_idx": -1,
+#         "end_idx": -1,
+#     }
+
+#     # -------------------------
+#     # content retrieval pool
+#     # -------------------------
+#     content_candidates = query_collection(query_emb, collection, search_k_content)
+    
+
+#     raw_counts = {0: 0, 1: 0, 2: 0, "other": 0}
+#     filtered_counts = {0: 0, 1: 0, 2: 0, "other": 0}
+
+#     for cand in content_candidates:
+#         s = int(cand["meta"]["status_id"])
+#         if s in raw_counts:
+#             raw_counts[s] += 1
+#         else:
+#             raw_counts["other"] += 1
+
+#     for cand in content_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+#         s = int(cand_meta["status_id"])
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+
+#         if s in filtered_counts:
+#             filtered_counts[s] += 1
+#         else:
+#             filtered_counts["other"] += 1
+
+#     print("query status:", int(query_meta["status_id"]))
+#     print("raw top-k status counts:", raw_counts)
+#     print("filtered same-side/non-self counts:", filtered_counts)
+
+#     same_status = []
+#     # by_status = {0: [], 1: [], 2: []}
+#     # unrestricted = []
+#     # seen_content = set()
+
+#     # for cand in content_candidates:
+#     #     cand_meta = cand["meta"]
+#     #     sig = dedup_signature(cand_meta)
+#     #     cand_status = int(cand_meta["status_id"])
+
+#     #     if same_chunk_meta(query_meta, cand_meta):
+#     #         continue
+#     #     if cand_meta["side"] != query_meta["side"]:
+#     #         continue
+#     #     if sig in seen_content:
+#     #         continue
+#     #     if cand_status not in (0, 1, 2):
+#     #         continue
+
+#     #     seen_content.add(sig)
+#     #     unrestricted.append(cand)
+#     #     by_status[cand_status].append(cand)
+
+#     #     if cand_status == q_status:
+#     #         same_status.append(cand)
+
+#     # other_statuses = [s for s in (0, 1, 2) if s != q_status]
+#     # diff_a = by_status[other_statuses[0]]
+#     # diff_b = by_status[other_statuses[1]]
+
+#     # # -------------------------
+#     # # support curriculum
+#     # # -------------------------
+#     # sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
+#     #     epoch_idx=epoch_idx, k=k_sim, training=training
+#     # )
+
+#     # if sim_unrestricted:
+#     #     sim_items = unrestricted[:k_sim]
+#     # else:
+#     #     sim_items = []
+
+#     #     # ideal support = same-status
+#     #     sim_items.extend(same_status[:sim_n_ideal])
+
+#     #     # noisy support = non-query statuses mixed together
+#     #     diff_mix = []
+#     #     ia = ib = 0
+#     #     while len(diff_mix) < sim_n_noisy and (ia < len(diff_a) or ib < len(diff_b)):
+#     #         if ia < len(diff_a):
+#     #             diff_mix.append(diff_a[ia])
+#     #             ia += 1
+#     #             if len(diff_mix) >= sim_n_noisy:
+#     #                 break
+#     #         if ib < len(diff_b):
+#     #             diff_mix.append(diff_b[ib])
+#     #             ib += 1
+
+#     #     sim_items.extend(diff_mix[:sim_n_noisy])
+
+#     # sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+
+#     # print('query metadata')
+#     # pprint.pprint(query_meta)
+#     # print('sim metadata')
+#     # # pprint.pprint(sim_meta)
+
+#     # sim_counts = {0:0,1:0,2:0}
+#     # for s in sim_meta: 
+#     #     sim_counts[s['status_id']] += 1
+#     # print(sim_counts)
+#     # # -------------------------
+#     # # contrast curriculum
+#     # # -------------------------
+#     # con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
+#     #     epoch_idx=epoch_idx, k=k_contrast, training=training
+#     # )
+
+#     # if con_unrestricted:
+#     #     # later unrestricted slice so contrast isn't identical to support
+#     #     contrast_items = unrestricted[k_sim:k_sim + k_contrast]
+#     # else:
+#     #     contrast_items = []
+
+#     #     # ideal contrast = balanced across the two non-query classes
+#     #     n_a = con_n_ideal // 2
+#     #     n_b = con_n_ideal - n_a
+
+#     #     contrast_items.extend(diff_a[:n_a])
+#     #     contrast_items.extend(diff_b[:n_b])
+
+#     #     # backfill if one side is short
+#     #     if len(contrast_items) < con_n_ideal:
+#     #         used_sigs = {dedup_signature(x["meta"]) for x in contrast_items}
+#     #         extra_diff = []
+#     #         for cand in diff_a[n_a:] + diff_b[n_b:]:
+#     #             sig = dedup_signature(cand["meta"])
+#     #             if sig in used_sigs:
+#     #                 continue
+#     #             extra_diff.append(cand)
+#     #             used_sigs.add(sig)
+#     #             if len(contrast_items) + len(extra_diff) >= con_n_ideal:
+#     #                 break
+#     #         contrast_items.extend(extra_diff[: max(0, con_n_ideal - len(contrast_items))])
+
+#     #     # noisy contrast = same-status tokens
+#     #     # use a disjoint slice after support's ideal picks
+#     #     contrast_items.extend(same_status[sim_n_ideal:sim_n_ideal + con_n_noisy])
+
+#     # contrast_embs, contrast_meta = pad_or_trim(
+#     #     contrast_items, k_contrast, emb_dim, pad_meta_template
+#     # )
+
+
+#     by_status = {0: [], 1: [], 2: []}
+#     unrestricted = []
+#     seen_content = set()
+
+#     for cand in content_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+#         cand_status = int(cand_meta["status_id"])
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+#         if sig in seen_content:
+#             continue
+#         if cand_status not in (0, 1, 2):
+#             continue
+
+#         seen_content.add(sig)
+#         unrestricted.append(cand)
+#         by_status[cand_status].append(cand)
+
+#     q_status = int(query_meta["status_id"])
+
+#     same_status = by_status[q_status]
+#     other_statuses = [s for s in (0, 1, 2) if s != q_status]
+#     other_a = by_status[other_statuses[0]]
+#     other_b = by_status[other_statuses[1]]
+
+#     # -------------------------
+#     # support curriculum
+#     # -------------------------
+#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
+#         epoch_idx=epoch_idx, k=k_sim, training=training
+#     )
+
+#     if sim_unrestricted:
+#         sim_items = unrestricted[:k_sim]
+#     else:
+#         sim_items = []
+
+#         # ideal support = same-status
+#         sim_items.extend(same_status[:sim_n_ideal])
+
+#         # noisy support = mix of the two non-query classes
+#         noisy_support = []
+#         ia = ib = 0
+#         while len(noisy_support) < sim_n_noisy and (ia < len(other_a) or ib < len(other_b)):
+#             if ia < len(other_a):
+#                 noisy_support.append(other_a[ia])
+#                 ia += 1
+#                 if len(noisy_support) >= sim_n_noisy:
+#                     break
+#             if ib < len(other_b):
+#                 noisy_support.append(other_b[ib])
+#                 ib += 1
+
+#         sim_items.extend(noisy_support[:sim_n_noisy])
+
+#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+
+#     print('query metadata')
+#     pprint.pprint(query_meta)
+#     print('sim metadata')
+#     # pprint.pprint(sim_meta)
+
+#     sim_counts = {0:0,1:0,2:0}
+#     for s in sim_meta: 
+#         sim_counts[s['status_id']] += 1
+#     print(sim_counts)
+
+#     # -------------------------
+#     # contrast curriculum
+#     # -------------------------
+#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
+#         epoch_idx=epoch_idx, k=k_contrast, training=training
+#     )
+
+#     if con_unrestricted:
+#         contrast_items = unrestricted[k_sim:k_sim + k_contrast]
+#     else:
+#         contrast_items = []
+
+#         # ideal contrast = balanced across the TWO non-query classes
+#         n_a = con_n_ideal // 2
+#         n_b = con_n_ideal - n_a
+
+#         contrast_items.extend(other_a[:n_a])
+#         contrast_items.extend(other_b[:n_b])
+
+#         # backfill from the other non-query class if one side is short
+#         if len(contrast_items) < con_n_ideal:
+#             used_sigs = {dedup_signature(x["meta"]) for x in contrast_items}
+#             for cand in other_a[n_a:] + other_b[n_b:]:
+#                 sig = dedup_signature(cand["meta"])
+#                 if sig in used_sigs:
+#                     continue
+#                 contrast_items.append(cand)
+#                 used_sigs.add(sig)
+#                 if len(contrast_items) >= con_n_ideal:
+#                     break
+
+#         # noisy contrast = same-status tokens
+#         contrast_items.extend(same_status[sim_n_ideal:sim_n_ideal + con_n_noisy])
+
+#     contrast_embs, contrast_meta = pad_or_trim(
+#         contrast_items, k_contrast, emb_dim, pad_meta_template
+#     )
+
+#     print('contrast metadata')
+#     pprint.pprint(contrast_meta)
+#     contr_counts = {0:0,1:0,2:0}
+#     for s in contrast_meta: 
+#         contr_counts[s['status_id']] += 1
+#     print(contr_counts)
+#     # pprint.pprint(contrast_meta)
+#     # -------------------------
+#     # temporal retrieval
+#     # -------------------------
+#     temporal_candidates = query_collection(future_emb, collection, search_k_temporal)
+
+#     temporal_items = []
+#     seen_temporal = set()
+
+#     for cand in temporal_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+
+#         # optional:
+#         # if same_chunk_meta(future_meta, cand_meta):
+#         #     continue
+
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+#         if sig in seen_temporal:
+#             continue
+
+#         temporal_items.append(cand)
+#         seen_temporal.add(sig)
+
+#         if len(temporal_items) >= k_temporal:
+#             break
+
+#     temporal_embs, temporal_meta = pad_or_trim(
+#         temporal_items, k_temporal, emb_dim, pad_meta_template
+#     )
+
+#     return {
+#         "query_emb": query_emb,
+#         "sim_embs": sim_embs,
+#         "contrast_embs": contrast_embs,
+#         "temporal_embs": temporal_embs,
+#         "query_meta": query_meta,
+#         "future_meta": future_meta,
+#         "sim_meta": sim_meta,
+#         "contrast_meta": contrast_meta,
+#         "temporal_meta": temporal_meta,
+#     }
+
+
+
+
 def build_live_entry(
     chunk,
     future_chunk,
@@ -3132,6 +3791,8 @@ def build_live_entry(
     k_sim,
     k_contrast,
     k_temporal,
+    training=False,
+    epoch_idx=None,
 ):
     query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
     future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
@@ -3139,7 +3800,12 @@ def build_live_entry(
     query_meta = extract_meta(chunk)
     future_meta = extract_meta(future_chunk)
 
+    q_status = int(query_meta["status_id"])
+    q_side = str(query_meta["side"])
     emb_dim = query_emb.shape[0]
+
+    other_statuses = [s for s in (0, 1, 2) if s != q_status]
+    other_a, other_b = other_statuses[0], other_statuses[1]
 
     pad_meta_template = {
         "label": -1,
@@ -3155,45 +3821,193 @@ def build_live_entry(
     }
 
     # -------------------------
-    # content retrieval: sim + contrast
+    # oracle support pool
     # -------------------------
-    content_candidates = query_collection(query_emb, collection, search_k_content)
+    print('building support')
+    support_oracle = query_collection(
+        query_emb=query_emb,
+        collection=collection,
+        n_results=search_k_content,
+        side=q_side,
+        target_status_ids=[q_status],
+    )
+    support_oracle = dedup_and_remove_self(support_oracle, query_meta)
 
-    sim_items = []
-    contrast_items = []
-    used_content = set()
+    
+    # -------------------------
+    # oracle contrast pools
+    # -------------------------
+    print('building contrast a')
+    contrast_oracle_a = query_collection(
+        query_emb=query_emb,
+        collection=collection,
+        n_results=search_k_content,
+        side=q_side,
+        target_status_ids=[other_a],
+    )
+    contrast_oracle_a = dedup_and_remove_self(contrast_oracle_a, query_meta)
 
-    for cand in content_candidates:
-        cand_meta = cand["meta"]
-        sig = dedup_signature(cand_meta)
+    print('building contrast b')
+    contrast_oracle_b = query_collection(
+        query_emb=query_emb,
+        collection=collection,
+        n_results=search_k_content,
+        side=q_side,
+        target_status_ids=[other_b],
+    )
+    contrast_oracle_b = dedup_and_remove_self(contrast_oracle_b, query_meta)
 
-        if same_chunk_meta(query_meta, cand_meta):
-            continue
-        if cand_meta["side"] != query_meta["side"]:
-            continue
+    # -------------------------
+    # unrestricted noisy pool
+    # -------------------------
+    print('building unrestricted')
+    unrestricted_candidates = query_collection(
+        query_emb=query_emb,
+        collection=collection,
+        n_results=search_k_content,
+        side=q_side,
+        target_status_ids=None,
+    )
+    unrestricted_candidates = dedup_and_remove_self(unrestricted_candidates, query_meta)
 
-        if (
-            cand_meta["status_id"] == query_meta["status_id"]
-            and sig not in used_content
-            and len(sim_items) < k_sim
-        ):
-            sim_items.append(cand)
-            used_content.add(sig)
-            continue
+    unrestricted_same = []
+    unrestricted_diff = []
 
-        if (
-            cand_meta["status_id"] != query_meta["status_id"]
-            and sig not in used_content
-            and len(contrast_items) < k_contrast
-        ):
-            contrast_items.append(cand)
-            used_content.add(sig)
-            continue
+    for cand in unrestricted_candidates:
+        s = int(cand["meta"]["status_id"])
+        if s == q_status:
+            unrestricted_same.append(cand)
+        elif s in (0, 1, 2):
+            unrestricted_diff.append(cand)
 
-        if len(sim_items) >= k_sim and len(contrast_items) >= k_contrast:
-            break
+    unrestricted_diff_balanced = interleave_lists(
+        [c for c in unrestricted_diff if int(c["meta"]["status_id"]) == other_a],
+        [c for c in unrestricted_diff if int(c["meta"]["status_id"]) == other_b],
+        n_total=len(unrestricted_diff),
+    )
+
+    # -------------------------
+    # support curriculum
+    # -------------------------
+    sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
+        epoch_idx=epoch_idx, k=k_sim, training=training
+    )
+
+    if sim_unrestricted:
+        sim_items = take_unique(unrestricted_candidates, k_sim)
+    else:
+        sim_items = []
+
+        # ideal support = oracle same-class
+        sim_items.extend(take_unique(support_oracle, sim_n_ideal))
+
+        # noisy support = unrestricted non-query classes
+        used = {dedup_signature(x["meta"]) for x in sim_items}
+        noisy_support = []
+        for cand in unrestricted_diff_balanced:
+            sig = dedup_signature(cand["meta"])
+            if sig in used:
+                continue
+            noisy_support.append(cand)
+            used.add(sig)
+            if len(noisy_support) >= sim_n_noisy:
+                break
+
+        sim_items.extend(noisy_support)
+
+        # backfill support from oracle same-class, then unrestricted
+        if len(sim_items) < k_sim:
+            used = {dedup_signature(x["meta"]) for x in sim_items}
+            for pool in [support_oracle, unrestricted_candidates]:
+                for cand in pool:
+                    sig = dedup_signature(cand["meta"])
+                    if sig in used:
+                        continue
+                    sim_items.append(cand)
+                    used.add(sig)
+                    if len(sim_items) >= k_sim:
+                        break
+                if len(sim_items) >= k_sim:
+                    break
 
     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+
+    # -------------------------
+    # contrast curriculum
+    # -------------------------
+    con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
+        epoch_idx=epoch_idx, k=k_contrast, training=training
+    )
+
+    print({'sim ideal count': sim_n_ideal, 'sim noise count': sim_n_noisy, 'con ideal count': con_n_ideal, 'con noise count': con_n_noisy})
+    if con_unrestricted:
+        # fully real contrast = later unrestricted slice if possible
+        contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
+        if len(contrast_items) < k_contrast:
+            used = {dedup_signature(x["meta"]) for x in contrast_items}
+            for cand in unrestricted_candidates:
+                sig = dedup_signature(cand["meta"])
+                if sig in used:
+                    continue
+                contrast_items.append(cand)
+                used.add(sig)
+                if len(contrast_items) >= k_contrast:
+                    break
+    else:
+        contrast_items = []
+
+        # ideal contrast = balanced oracle from the two other classes
+        n_a = con_n_ideal // 2
+        n_b = con_n_ideal - n_a
+
+        contrast_items.extend(take_unique(contrast_oracle_a, n_a))
+        contrast_items.extend(take_unique(contrast_oracle_b, n_b))
+
+        # backfill ideal contrast if one side is short
+        if len(contrast_items) < con_n_ideal:
+            used = {dedup_signature(x["meta"]) for x in contrast_items}
+            for cand in interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9):
+                sig = dedup_signature(cand["meta"])
+                if sig in used:
+                    continue
+                contrast_items.append(cand)
+                used.add(sig)
+                if len(contrast_items) >= con_n_ideal:
+                    break
+
+        # noisy contrast = unrestricted same-class tokens
+        used = {dedup_signature(x["meta"]) for x in contrast_items}
+        noisy_contrast = []
+        for cand in unrestricted_same:
+            sig = dedup_signature(cand["meta"])
+            if sig in used:
+                continue
+            noisy_contrast.append(cand)
+            used.add(sig)
+            if len(noisy_contrast) >= con_n_noisy:
+                break
+
+        contrast_items.extend(noisy_contrast)
+
+        # backfill contrast from oracle contrast pools, then unrestricted diff
+        if len(contrast_items) < k_contrast:
+            used = {dedup_signature(x["meta"]) for x in contrast_items}
+            for pool in [
+                interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9),
+                unrestricted_diff_balanced,
+                unrestricted_candidates,
+            ]:
+                for cand in pool:
+                    sig = dedup_signature(cand["meta"])
+                    if sig in used:
+                        continue
+                    contrast_items.append(cand)
+                    used.add(sig)
+                    if len(contrast_items) >= k_contrast:
+                        break
+                if len(contrast_items) >= k_contrast:
+                    break
+
     contrast_embs, contrast_meta = pad_or_trim(
         contrast_items, k_contrast, emb_dim, pad_meta_template
     )
@@ -3201,32 +4015,17 @@ def build_live_entry(
     # -------------------------
     # temporal retrieval
     # -------------------------
-    temporal_candidates = query_collection(future_emb, collection, search_k_temporal)
+    print('building temporal ')
+    temporal_candidates = query_collection(
+        query_emb=future_emb,
+        collection=collection,
+        n_results=search_k_temporal,
+        side=q_side,
+        target_status_ids=None,
+    )
+    temporal_candidates = dedup_and_remove_self(temporal_candidates, query_meta)
 
-    temporal_items = []
-    seen_temporal = set()
-
-    for cand in temporal_candidates:
-        cand_meta = cand["meta"]
-        sig = dedup_signature(cand_meta)
-
-        if same_chunk_meta(query_meta, cand_meta):
-            continue
-
-        # optional: skip exact future anchor too
-        # if same_chunk_meta(future_meta, cand_meta):
-        #     continue
-
-        if cand_meta["side"] != query_meta["side"]:
-            continue
-        if sig in seen_temporal:
-            continue
-
-        temporal_items.append(cand)
-        seen_temporal.add(sig)
-
-        if len(temporal_items) >= k_temporal:
-            break
+    temporal_items = take_unique(temporal_candidates, k_temporal)
 
     temporal_embs, temporal_meta = pad_or_trim(
         temporal_items, k_temporal, emb_dim, pad_meta_template
@@ -3243,6 +4042,134 @@ def build_live_entry(
         "contrast_meta": contrast_meta,
         "temporal_meta": temporal_meta,
     }
+
+
+
+
+# def build_live_entry(
+#     chunk,
+#     future_chunk,
+#     collection,
+#     chunk_encoder,
+#     frame_emb_mm,
+#     path_to_idx,
+#     search_k_content,
+#     search_k_temporal,
+#     k_sim,
+#     k_contrast,
+#     k_temporal,
+#     training=False
+# ):
+#     query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+#     future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+
+#     query_meta = extract_meta(chunk)
+#     future_meta = extract_meta(future_chunk)
+
+#     emb_dim = query_emb.shape[0]
+
+#     pad_meta_template = {
+#         "label": -1,
+#         "side": "PAD",
+#         "status": "PAD",
+#         "status_id": -1,
+#         "vid": -1,
+#         "clip": -1,
+#         "t_center": -1.0,
+#         "t_width": -1.0,
+#         "start_idx": -1,
+#         "end_idx": -1,
+#     }
+
+#     # -------------------------
+#     # content retrieval: sim + contrast
+#     # -------------------------
+#     content_candidates = query_collection(query_emb, collection, search_k_content)
+
+#     sim_items = []
+#     contrast_items = []
+#     used_content = set()
+
+#     for cand in content_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+
+#         if (
+#             cand_meta["status_id"] == query_meta["status_id"]
+#             and sig not in used_content
+#             and len(sim_items) < k_sim
+#         ):
+#             sim_items.append(cand)
+#             used_content.add(sig)
+#             continue
+
+#         if (
+#             cand_meta["status_id"] != query_meta["status_id"]
+#             and sig not in used_content
+#             and len(contrast_items) < k_contrast
+#         ):
+#             contrast_items.append(cand)
+#             used_content.add(sig)
+#             continue
+
+#         if len(sim_items) >= k_sim and len(contrast_items) >= k_contrast:
+#             break
+
+#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+#     contrast_embs, contrast_meta = pad_or_trim(
+#         contrast_items, k_contrast, emb_dim, pad_meta_template
+#     )
+
+#     # -------------------------
+#     # temporal retrieval
+#     # -------------------------
+#     temporal_candidates = query_collection(future_emb, collection, search_k_temporal)
+
+#     temporal_items = []
+#     seen_temporal = set()
+
+#     for cand in temporal_candidates:
+#         cand_meta = cand["meta"]
+#         sig = dedup_signature(cand_meta)
+
+#         if same_chunk_meta(query_meta, cand_meta):
+#             continue
+
+#         # optional: skip exact future anchor too
+#         # if same_chunk_meta(future_meta, cand_meta):
+#         #     continue
+
+#         if cand_meta["side"] != query_meta["side"]:
+#             continue
+#         if sig in seen_temporal:
+#             continue
+
+#         temporal_items.append(cand)
+#         seen_temporal.add(sig)
+
+#         if len(temporal_items) >= k_temporal:
+#             break
+
+#     temporal_embs, temporal_meta = pad_or_trim(
+#         temporal_items, k_temporal, emb_dim, pad_meta_template
+#     )
+
+#     return {
+#         "query_emb": query_emb,
+#         "sim_embs": sim_embs,
+#         "contrast_embs": contrast_embs,
+#         "temporal_embs": temporal_embs,
+#         "query_meta": query_meta,
+#         "future_meta": future_meta,
+#         "sim_meta": sim_meta,
+#         "contrast_meta": contrast_meta,
+#         "temporal_meta": temporal_meta,
+#     }
 
 scce_no_reduce = tf.keras.losses.SparseCategoricalCrossentropy(
     from_logits=True,
@@ -3617,7 +4544,9 @@ def fetch_live_batch(
     collection,
     chunk_encoder,
     frame_emb_mm,
-    path_to_idx
+    path_to_idx,
+    training=False,
+    epoch_idx=None
 ):
     batch_size = metadata["vid"].shape[0]
 
@@ -3652,6 +4581,8 @@ def fetch_live_batch(
             k_sim=config.K_SIM,
             k_contrast=config.K_CONTRAST,
             k_temporal=config.K_TEMPORAL,
+            training = training,
+            epoch_idx=epoch_idx
         )
 
         # print('--------------------------------')
@@ -3695,7 +4626,8 @@ def train_step(batch,
     frame_emb_mm,
     path_to_idx,
     # pos_weight
-    class_weights
+    class_weights,
+    epoch_idx=None
     ):
     # metadata, labels = batch[1], batch[2]
 
@@ -3717,6 +4649,8 @@ def train_step(batch,
         chunk_encoder=chunk_encoder,
         frame_emb_mm=frame_emb_mm,
         path_to_idx=path_to_idx,
+        training=True,
+        epoch_idx=epoch_idx
     )
     zeros_query = tf.zeros_like(query_embs)
     def grad_rms(g):
@@ -3825,6 +4759,7 @@ def eval_step(
         chunk_encoder=chunk_encoder,
         frame_emb_mm=frame_emb_mm,
         path_to_idx=path_to_idx,
+        training=False
     )
 
     zeros_query = tf.zeros_like(query_embs)
@@ -3879,7 +4814,8 @@ def run_train_epoch(train_ds,
     frame_emb_mm,
     path_to_idx,
     # pos_weight
-    class_weight
+    class_weight,
+    epoch_idx=None
     ):
     train_loss_metric.reset_state()
     train_acc_metric.reset_state()
@@ -3895,7 +4831,8 @@ def run_train_epoch(train_ds,
             frame_emb_mm=frame_emb_mm,
             path_to_idx=path_to_idx,
             # pos_weight=pos_weight
-            class_weights=class_weight
+            class_weights=class_weight,
+            epoch_idx=epoch_idx
         )
 
         if step % 1 == 0:
@@ -4194,7 +5131,8 @@ if __name__ == "__main__":
             frame_emb_mm=frame_emb_mm,
             path_to_idx=path_to_idx,
             # pos_weight=pos_weight
-            class_weight=class_weight
+            class_weight=class_weight,
+            epoch_idx=epoch+1
         )
 
         val_loss, val_acc = run_val_epoch(
