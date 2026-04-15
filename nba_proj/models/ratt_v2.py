@@ -451,7 +451,7 @@ class RATTHeadV2(tf_keras.Model):
         self.classifier = tf_keras.Sequential([
             layers.Dense(mlp_dim*2, activation="relu"),
             layers.Dropout(0.2),
-            layers.Dense(1),
+            layers.Dense(3),
         ])
 
     def debug_forward(
@@ -687,12 +687,37 @@ class RATTHeadV2(tf_keras.Model):
         contrast_attn = tf.reduce_mean(cls_attn[:, 3+Ks:3+Ks+Kc], axis=1)
         temporal_attn = tf.reduce_mean(cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt], axis=1)
 
-        # tf.print("CLS self-attn:", tf.reduce_mean(cls_attn[:, idx_cls]))
-        # tf.print("CLS -> support_summary:", tf.reduce_mean(cls_attn[:, idx_support_summary]))
-        # tf.print("CLS -> support_tokens:", tf.reduce_mean(support_attn))
-        # tf.print("CLS -> contrast_summary:", tf.reduce_mean(cls_attn[:, idx_contrast_summary]))
-        # tf.print("CLS -> contrast_tokens:", tf.reduce_mean(contrast_attn))
-        # tf.print("CLS -> temporal_summary:", tf.reduce_mean(cls_attn[:, idx_temporal_summary]))
-        # tf.print("CLS -> temporal_tokens:", tf.reduce_mean(temporal_attn))
-        # tf.print("CLS -> local_out:", tf.reduce_mean(cls_attn[:, idx_local]))
+        cls_self = cls_attn[:, idx_cls]
+        cls_to_support_summary = cls_attn[:, idx_support_summary]
+        cls_to_support = tf.reduce_mean(cls_attn[:, 2:2+Ks], axis=1)
+        cls_to_contrast_summary = cls_attn[:, idx_contrast_summary]
+        cls_to_contrast = tf.reduce_mean(cls_attn[:, 3+Ks:3+Ks+Kc], axis=1)
+        cls_to_temporal_summary = cls_attn[:, idx_temporal_summary]
+        cls_to_temporal = tf.reduce_mean(cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt], axis=1)
+        cls_to_local = cls_attn[:, idx_local]
+
+        # batch-mean each
+        attn_dict = {
+            "self":     tf.reduce_mean(cls_self),
+            "sup_sum":  tf.reduce_mean(cls_to_support_summary),
+            "support":  tf.reduce_mean(cls_to_support),
+            "con_sum":  tf.reduce_mean(cls_to_contrast_summary),
+            "contrast": tf.reduce_mean(cls_to_contrast),
+            "tmp_sum":  tf.reduce_mean(cls_to_temporal_summary),
+            "temporal": tf.reduce_mean(cls_to_temporal),
+            "local":    tf.reduce_mean(cls_to_local),
+        }
+
+        tf.print(
+            "cls_attn | "
+            "self:", attn_dict["self"],
+            "sup_sum:", attn_dict["sup_sum"],
+            "sup:", attn_dict["support"],
+            "con_sum:", attn_dict["con_sum"],
+            "con:", attn_dict["contrast"],
+            "tmp_sum:", attn_dict["tmp_sum"],
+            "tmp:", attn_dict["temporal"],
+            "local:", attn_dict["local"],
+            summarize=-1,
+        )
         return class_logit, cls_out, aux
