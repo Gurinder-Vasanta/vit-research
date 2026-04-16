@@ -1,5 +1,6 @@
 
 from collections import defaultdict
+import math
 import os
 import pprint
 import random
@@ -398,30 +399,135 @@ def get_branch_mix_counts(epoch_idx, k, training):
     if not training or epoch_idx is None:
         return k, 0, False   # full oracle for validation/debug
 
-    # curriculum:
-    # 0-1   : 100% ideal
-    # 2-3   : 80% ideal / 20% noisy
-    # 4-5   : 60% ideal / 40% noisy
-    # 6-7   : 50% ideal / 50% noisy
-    # 8-9   : 20% ideal / 80% noisy
-    # 10+   : unrestricted retrieval
-    if epoch_idx < 2:
-        return k, 0, False
-    elif epoch_idx < 4:
-        n_ideal = int(round(0.8 * k))
-        return n_ideal, k - n_ideal, False
-    elif epoch_idx < 6:
-        n_ideal = int(round(0.6 * k))
-        return n_ideal, k - n_ideal, False
-    elif epoch_idx < 8:
-        n_ideal = int(round(0.5 * k))
-        return n_ideal, k - n_ideal, False
-    elif epoch_idx < 10:
-        n_ideal = int(round(0.2 * k))
-        return n_ideal, k - n_ideal, False
-    else:
-        return 0, k, True
+    # # curriculum:
+    # # 0-1   : 100% ideal
+    # # 2-3   : 80% ideal / 20% noisy
+    # # 4-5   : 60% ideal / 40% noisy
+    # # 6-7   : 50% ideal / 50% noisy
+    # # 8-9   : 20% ideal / 80% noisy
+    # # 10+   : unrestricted retrieval
+    # if epoch_idx < 2:
+    #     return k, 0, False
+    # elif epoch_idx < 4:
+    #     n_ideal = int(round(0.8 * k))
+    #     return n_ideal, k - n_ideal, False
+    # elif epoch_idx < 6:
+    #     n_ideal = int(round(0.6 * k))
+    #     return n_ideal, k - n_ideal, False
+    # elif epoch_idx < 8:
+    #     n_ideal = int(round(0.5 * k))
+    #     return n_ideal, k - n_ideal, False
+    # elif epoch_idx < 10:
+    #     n_ideal = int(round(0.2 * k))
+    #     return n_ideal, k - n_ideal, False
+    # else:
+    #     return 0, k, True
 
+    # curriculum
+    if epoch_idx < 3:
+        return k, 0, False          # epochs 1-2:  100% ideal
+    elif epoch_idx < 6:
+        n_ideal = int(round(0.8 * k))
+        return n_ideal, k - n_ideal, False  # epochs 3-5: 80/20
+    elif epoch_idx < 9:
+        n_ideal = int(round(0.6 * k))
+        return n_ideal, k - n_ideal, False  # epochs 6-8: 60/40
+    elif epoch_idx < 12:
+        n_ideal = int(round(0.4 * k))
+        return n_ideal, k - n_ideal, False  # epochs 9-11: 40/60
+    elif epoch_idx < 15:
+        n_ideal = int(round(0.2 * k))
+        return n_ideal, k - n_ideal, False  # epochs 12-14: 20/80
+    elif epoch_idx < 18:
+        n_ideal = int(round(0.05 * k))
+        return n_ideal, k - n_ideal, False  # epochs 15-17: 5/95
+    else:
+        return 0, k, True           # epochs 18+: fully unrestricted
+
+    # total_epochs = config.EPOCHS
+    # # fraction of ideal tokens decays exponentially
+    # # starts at 1.0, reaches ~0.05 by epoch 16, ~0.01 by epoch 20
+    # decay_rate = 0.25  # tune this
+    # ideal_fraction = math.exp(-decay_rate * (epoch_idx - 1))
+    # ideal_fraction = max(ideal_fraction, 0.0)
+
+    # # switch to fully unrestricted once ideal fraction is negligible
+    # if ideal_fraction < 0.02:
+    #     return 0, k, True
+
+    # n_ideal = int(round(ideal_fraction * k))
+    # n_noisy = k - n_ideal
+    # return n_ideal, n_noisy, False
+
+
+# def attention_supervision_loss(cls_attn, sim_meta, contrast_meta, temporal_meta, Ks, Kc, Kt):
+#     """
+#     cls_attn: (B, T) — CLS token attention weights
+#     target: concentrate on real (non-pad) tokens within each branch
+#     """
+#     B = tf.shape(cls_attn)[0]
+    
+#     # build target attention — uniform over real tokens, zero over padding
+#     # support positions: 2..2+Ks
+#     support_attn = cls_attn[:, 2:2+Ks]          # (B, Ks)
+#     contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc]   # (B, Kc)
+#     temporal_attn = cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt]  # (B, Kt)
+    
+#     # support mask — 1 for real tokens, 0 for padding
+#     support_real = tf.cast(support_mask, tf.float32)   # (B, Ks)
+#     contrast_real = tf.cast(contrast_mask, tf.float32) # (B, Kc)
+#     temporal_real = tf.cast(temporal_mask, tf.float32) # (B, Kt)
+    
+#     # target = uniform over real tokens
+#     support_target = support_real / (tf.reduce_sum(support_real, axis=1, keepdims=True) + 1e-8)
+#     contrast_target = contrast_real / (tf.reduce_sum(contrast_real, axis=1, keepdims=True) + 1e-8)
+#     temporal_target = temporal_real / (tf.reduce_sum(temporal_real, axis=1, keepdims=True) + 1e-8)
+    
+#     # KL divergence between predicted and target attention
+#     def kl_div(p_pred, p_target):
+#         # p_pred is already softmax output, p_target is normalized mask
+#         # add small epsilon for numerical stability
+#         return tf.reduce_mean(
+#             tf.reduce_sum(
+#                 p_target * tf.math.log((p_target + 1e-8) / (p_pred + 1e-8)),
+#                 axis=1
+#             )
+#         )
+    
+#     loss = kl_div(support_attn, support_target)
+#     loss += kl_div(contrast_attn, contrast_target)
+#     loss += kl_div(temporal_attn, temporal_target)
+    
+#     return loss
+
+
+
+def attention_supervision_loss(cls_attn, support_mask, contrast_mask, temporal_mask, Ks, Kc, Kt):
+    support_attn = cls_attn[:, 2:2+Ks]
+    contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc]
+    temporal_attn = cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt]
+
+    support_real = tf.cast(support_mask, tf.float32)
+    contrast_real = tf.cast(contrast_mask, tf.float32)
+    temporal_real = tf.cast(temporal_mask, tf.float32)
+
+    support_target = support_real / (tf.reduce_sum(support_real, axis=1, keepdims=True) + 1e-8)
+    contrast_target = contrast_real / (tf.reduce_sum(contrast_real, axis=1, keepdims=True) + 1e-8)
+    temporal_target = temporal_real / (tf.reduce_sum(temporal_real, axis=1, keepdims=True) + 1e-8)
+
+    def kl_div(p_pred, p_target):
+        return tf.reduce_mean(
+            tf.reduce_sum(
+                p_target * tf.math.log((p_target + 1e-8) / (p_pred + 1e-8)),
+                axis=1
+            )
+        )
+
+    loss = kl_div(support_attn, support_target)
+    loss += kl_div(contrast_attn, contrast_target)
+    loss += kl_div(temporal_attn, temporal_target)
+
+    return loss
 
 def query_collection_batch(
     query_embs,
@@ -491,365 +597,6 @@ def query_collection_batch(
     return batch_out
 
 
-# def assemble_live_entry_from_candidates(
-#     query_emb,
-#     future_emb,
-#     query_meta,
-#     future_meta,
-#     support_oracle,
-#     contrast_oracle,
-#     unrestricted_candidates,
-#     temporal_candidates,
-#     k_sim,
-#     k_contrast,
-#     k_temporal,
-#     training=False,
-#     epoch_idx=None,
-# ):
-#     q_status = int(query_meta["status_id"])
-#     other_statuses = [s for s in (0, 1, 2) if s != q_status]
-#     other_a, other_b = other_statuses[0], other_statuses[1]
-#     emb_dim = query_emb.shape[0]
-
-#     pad_meta_template = {
-#         "label": -1,
-#         "side": "PAD",
-#         "status": "PAD",
-#         "status_id": -1,
-#         "vid": -1,
-#         "clip": -1,
-#         "t_center": -1.0,
-#         "t_width": -1.0,
-#         "start_idx": -1,
-#         "end_idx": -1,
-#     }
-
-#     support_oracle = dedup_and_remove_self(support_oracle, query_meta)
-#     contrast_oracle = dedup_and_remove_self(contrast_oracle, query_meta)
-#     unrestricted_candidates = dedup_and_remove_self(unrestricted_candidates, query_meta)
-#     temporal_candidates = dedup_and_remove_self(temporal_candidates, query_meta)
-
-#     contrast_oracle_a = [c for c in contrast_oracle if int(c["meta"]["status_id"]) == other_a]
-#     contrast_oracle_b = [c for c in contrast_oracle if int(c["meta"]["status_id"]) == other_b]
-
-#     unrestricted_same = []
-#     unrestricted_diff_a = []
-#     unrestricted_diff_b = []
-
-#     for cand in unrestricted_candidates:
-#         s = int(cand["meta"]["status_id"])
-#         if s == q_status:
-#             unrestricted_same.append(cand)
-#         elif s == other_a:
-#             unrestricted_diff_a.append(cand)
-#         elif s == other_b:
-#             unrestricted_diff_b.append(cand)
-
-#     unrestricted_diff_balanced = interleave_lists(
-#         unrestricted_diff_a,
-#         unrestricted_diff_b,
-#         n_total=len(unrestricted_diff_a) + len(unrestricted_diff_b),
-#     )
-
-#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=k_sim, training=training
-#     )
-
-#     if sim_unrestricted:
-#         sim_items = take_unique(unrestricted_candidates, k_sim)
-#     else:
-#         sim_items = []
-#         sim_items.extend(take_unique(support_oracle, sim_n_ideal))
-
-#         used = {dedup_signature(x["meta"]) for x in sim_items}
-#         for cand in unrestricted_diff_balanced:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             sim_items.append(cand)
-#             used.add(sig)
-#             if len(sim_items) >= sim_n_ideal + sim_n_noisy:
-#                 break
-
-#         if len(sim_items) < k_sim:
-#             for pool in [support_oracle, unrestricted_candidates]:
-#                 for cand in pool:
-#                     sig = dedup_signature(cand["meta"])
-#                     if sig in used:
-#                         continue
-#                     sim_items.append(cand)
-#                     used.add(sig)
-#                     if len(sim_items) >= k_sim:
-#                         break
-#                 if len(sim_items) >= k_sim:
-#                     break
-
-#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
-
-#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=k_contrast, training=training
-#     )
-
-#     if con_unrestricted:
-#         contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
-#         if len(contrast_items) < k_contrast:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for cand in unrestricted_candidates:
-#                 sig = dedup_signature(cand["meta"])
-#                 if sig in used:
-#                     continue
-#                 contrast_items.append(cand)
-#                 used.add(sig)
-#                 if len(contrast_items) >= k_contrast:
-#                     break
-#     else:
-#         contrast_items = []
-
-#         n_a = con_n_ideal // 2
-#         n_b = con_n_ideal - n_a
-#         contrast_items.extend(take_unique(contrast_oracle_a, n_a))
-#         contrast_items.extend(take_unique(contrast_oracle_b, n_b))
-
-#         if len(contrast_items) < con_n_ideal:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for cand in interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9):
-#                 sig = dedup_signature(cand["meta"])
-#                 if sig in used:
-#                     continue
-#                 contrast_items.append(cand)
-#                 used.add(sig)
-#                 if len(contrast_items) >= con_n_ideal:
-#                     break
-
-#         used = {dedup_signature(x["meta"]) for x in contrast_items}
-#         for cand in unrestricted_same:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             contrast_items.append(cand)
-#             used.add(sig)
-#             if len(contrast_items) >= con_n_ideal + con_n_noisy:
-#                 break
-
-#         if len(contrast_items) < k_contrast:
-#             for pool in [
-#                 interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9),
-#                 unrestricted_diff_balanced,
-#                 unrestricted_candidates,
-#             ]:
-#                 for cand in pool:
-#                     sig = dedup_signature(cand["meta"])
-#                     if sig in used:
-#                         continue
-#                     contrast_items.append(cand)
-#                     used.add(sig)
-#                     if len(contrast_items) >= k_contrast:
-#                         break
-#                 if len(contrast_items) >= k_contrast:
-#                     break
-
-#     contrast_embs, contrast_meta = pad_or_trim(
-#         contrast_items, k_contrast, emb_dim, pad_meta_template
-#     )
-
-#     temporal_items = take_unique(temporal_candidates, k_temporal)
-#     temporal_embs, temporal_meta = pad_or_trim(
-#         temporal_items, k_temporal, emb_dim, pad_meta_template
-#     )
-#     print({'sim ideal count': sim_n_ideal, 'sim noise count': sim_n_noisy, 'con ideal count': con_n_ideal, 'con noise count': con_n_noisy})
-#     return {
-#         "query_emb": query_emb,
-#         "sim_embs": sim_embs,
-#         "contrast_embs": contrast_embs,
-#         "temporal_embs": temporal_embs,
-#         "query_meta": query_meta,
-#         "future_meta": future_meta,
-#         "sim_meta": sim_meta,
-#         "contrast_meta": contrast_meta,
-#         "temporal_meta": temporal_meta,
-#     }
-
-
-# def assemble_live_entry_from_candidates(
-#     query_emb,
-#     future_emb,
-#     query_meta,
-#     future_meta,
-#     support_oracle,
-#     contrast_oracle,
-#     unrestricted_candidates,
-#     temporal_candidates,
-#     k_sim,
-#     k_contrast,
-#     k_temporal,
-#     training=False,
-#     epoch_idx=None,
-# ):
-#     q_status = int(query_meta["status_id"])
-#     other_statuses = [s for s in (0, 1, 2) if s != q_status]
-#     other_a, other_b = other_statuses[0], other_statuses[1]
-#     emb_dim = query_emb.shape[0]
-
-#     pad_meta_template = {
-#         "label": -1,
-#         "side": "PAD",
-#         "status": "PAD",
-#         "status_id": -1,
-#         "vid": -1,
-#         "clip": -1,
-#         "t_center": -1.0,
-#         "t_width": -1.0,
-#         "start_idx": -1,
-#         "end_idx": -1,
-#     }
-
-#     support_oracle = [] if support_oracle is None else dedup_and_remove_self(support_oracle, query_meta)
-#     contrast_oracle = [] if contrast_oracle is None else dedup_and_remove_self(contrast_oracle, query_meta)
-#     unrestricted_candidates = [] if unrestricted_candidates is None else dedup_and_remove_self(unrestricted_candidates, query_meta)
-#     temporal_candidates = [] if temporal_candidates is None else dedup_and_remove_self(temporal_candidates, query_meta)
-
-#     contrast_oracle_a = [c for c in contrast_oracle if int(c["meta"]["status_id"]) == other_a]
-#     contrast_oracle_b = [c for c in contrast_oracle if int(c["meta"]["status_id"]) == other_b]
-
-#     unrestricted_same = []
-#     unrestricted_diff_a = []
-#     unrestricted_diff_b = []
-
-#     for cand in unrestricted_candidates:
-#         s = int(cand["meta"]["status_id"])
-#         if s == q_status:
-#             unrestricted_same.append(cand)
-#         elif s == other_a:
-#             unrestricted_diff_a.append(cand)
-#         elif s == other_b:
-#             unrestricted_diff_b.append(cand)
-
-#     unrestricted_diff_balanced = interleave_lists(
-#         unrestricted_diff_a,
-#         unrestricted_diff_b,
-#         n_total=len(unrestricted_diff_a) + len(unrestricted_diff_b),
-#     )
-
-#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=k_sim, training=training
-#     )
-
-#     if sim_unrestricted:
-#         sim_items = take_unique(unrestricted_candidates, k_sim)
-#     else:
-#         sim_items = []
-#         sim_items.extend(take_unique(support_oracle, sim_n_ideal))
-
-#         used = {dedup_signature(x["meta"]) for x in sim_items}
-#         for cand in unrestricted_diff_balanced:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             sim_items.append(cand)
-#             used.add(sig)
-#             if len(sim_items) >= sim_n_ideal + sim_n_noisy:
-#                 break
-
-#         if len(sim_items) < k_sim:
-#             for pool in [support_oracle, unrestricted_candidates]:
-#                 for cand in pool:
-#                     sig = dedup_signature(cand["meta"])
-#                     if sig in used:
-#                         continue
-#                     sim_items.append(cand)
-#                     used.add(sig)
-#                     if len(sim_items) >= k_sim:
-#                         break
-#                 if len(sim_items) >= k_sim:
-#                     break
-
-#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
-
-#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=k_contrast, training=training
-#     )
-
-#     if con_unrestricted:
-#         contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
-#         if len(contrast_items) < k_contrast:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for cand in unrestricted_candidates:
-#                 sig = dedup_signature(cand["meta"])
-#                 if sig in used:
-#                     continue
-#                 contrast_items.append(cand)
-#                 used.add(sig)
-#                 if len(contrast_items) >= k_contrast:
-#                     break
-#     else:
-#         contrast_items = []
-
-#         n_a = con_n_ideal // 2
-#         n_b = con_n_ideal - n_a
-#         contrast_items.extend(take_unique(contrast_oracle_a, n_a))
-#         contrast_items.extend(take_unique(contrast_oracle_b, n_b))
-
-#         if len(contrast_items) < con_n_ideal:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for cand in interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9):
-#                 sig = dedup_signature(cand["meta"])
-#                 if sig in used:
-#                     continue
-#                 contrast_items.append(cand)
-#                 used.add(sig)
-#                 if len(contrast_items) >= con_n_ideal:
-#                     break
-
-#         used = {dedup_signature(x["meta"]) for x in contrast_items}
-#         for cand in unrestricted_same:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             contrast_items.append(cand)
-#             used.add(sig)
-#             if len(contrast_items) >= con_n_ideal + con_n_noisy:
-#                 break
-
-#         if len(contrast_items) < k_contrast:
-#             for pool in [
-#                 interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9),
-#                 unrestricted_diff_balanced,
-#                 unrestricted_candidates,
-#             ]:
-#                 for cand in pool:
-#                     sig = dedup_signature(cand["meta"])
-#                     if sig in used:
-#                         continue
-#                     contrast_items.append(cand)
-#                     used.add(sig)
-#                     if len(contrast_items) >= k_contrast:
-#                         break
-#                 if len(contrast_items) >= k_contrast:
-#                     break
-
-#     contrast_embs, contrast_meta = pad_or_trim(
-#         contrast_items, k_contrast, emb_dim, pad_meta_template
-#     )
-
-#     temporal_items = take_unique(temporal_candidates, k_temporal)
-#     temporal_embs, temporal_meta = pad_or_trim(
-#         temporal_items, k_temporal, emb_dim, pad_meta_template
-#     )
-
-#     return {
-#         "query_emb": query_emb,
-#         "sim_embs": sim_embs,
-#         "contrast_embs": contrast_embs,
-#         "temporal_embs": temporal_embs,
-#         "query_meta": query_meta,
-#         "future_meta": future_meta,
-#         "sim_meta": sim_meta,
-#         "contrast_meta": contrast_meta,
-#         "temporal_meta": temporal_meta,
-#     }
-
-
-
 def assemble_live_entry_from_candidates(
     query_emb,
     future_emb,
@@ -914,6 +661,7 @@ def assemble_live_entry_from_candidates(
         epoch_idx=epoch_idx, k=k_sim, training=training
     )
 
+    pprint.pprint({'sim_ideal: ': sim_n_ideal,'sim_n_noisy: ': sim_n_noisy,'sim_unrestricted: ': sim_unrestricted})
     if sim_unrestricted:
         sim_items = take_unique(unrestricted_candidates, k_sim)
     else:
@@ -948,7 +696,7 @@ def assemble_live_entry_from_candidates(
     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
         epoch_idx=epoch_idx, k=k_contrast, training=training
     )
-
+    pprint.pprint({'con_ideal: ': con_n_ideal,'sim_n_noisy: ': con_n_noisy,'con_unrestricted: ': con_unrestricted})
     if con_unrestricted:
         contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
         if len(contrast_items) < k_contrast:
@@ -1029,448 +777,6 @@ def assemble_live_entry_from_candidates(
     }
 
 
-# def fetch_live_batch(
-#     metadata,
-#     chunk_lookup,
-#     future_key_lookup,
-#     collection,
-#     chunk_encoder,
-#     frame_emb_mm,
-#     path_to_idx,
-#     training=False,
-#     epoch_idx=None
-# ):
-#     batch_size = metadata["vid"].shape[0]
-
-#     batch_query_meta = []
-#     batch_future_meta = []
-#     batch_query_embs_np = []
-#     batch_future_embs_np = []
-
-#     for i in range(batch_size):
-#         key = make_chunk_key_from_meta(metadata, i)
-#         chunk = chunk_lookup[key]
-#         future_chunk = chunk_lookup[future_key_lookup[key]]
-
-#         query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-#         future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-
-#         batch_query_meta.append(extract_meta(chunk))
-#         batch_future_meta.append(extract_meta(future_chunk))
-#         batch_query_embs_np.append(query_emb)
-#         batch_future_embs_np.append(future_emb)
-
-#     # Group content queries by (side, status_id)
-#     content_groups = defaultdict(list)
-#     for i, meta_i in enumerate(batch_query_meta):
-#         content_groups[(str(meta_i["side"]), int(meta_i["status_id"]))].append(i)
-
-#     support_results = [None] * batch_size
-#     contrast_results = [None] * batch_size
-#     unrestricted_results = [None] * batch_size
-
-#     counter = 1
-#     for (side, status_id), idxs in content_groups.items():
-#         group_query_embs = [batch_query_embs_np[i] for i in idxs]
-#         other_statuses = [s for s in (0, 1, 2) if s != status_id]
-
-#         print('support')
-#         print(f'{counter}/{len(content_groups.items())}')
-#         counter += 1
-#         group_support = query_collection_batch(
-#             query_embs=group_query_embs,
-#             collection=collection,
-#             n_results=config.SEARCH_K_CONTENT,
-#             side=side,
-#             target_status_ids=[status_id],
-#         )
-
-#         print('contrast')
-#         group_contrast = query_collection_batch(
-#             query_embs=group_query_embs,
-#             collection=collection,
-#             n_results=config.SEARCH_K_CONTENT,
-#             side=side,
-#             target_status_ids=other_statuses,
-#         )
-
-#         print('restricted')
-#         group_unrestricted = query_collection_batch(
-#             query_embs=group_query_embs,
-#             collection=collection,
-#             n_results=config.SEARCH_K_CONTENT,
-#             side=side,
-#             target_status_ids=None,
-#         )
-
-#         for local_j, global_i in enumerate(idxs):
-#             support_results[global_i] = group_support[local_j]
-#             contrast_results[global_i] = group_contrast[local_j]
-#             unrestricted_results[global_i] = group_unrestricted[local_j]
-
-#     # Group temporal queries by side only
-#     temporal_groups = defaultdict(list)
-#     for i, meta_i in enumerate(batch_query_meta):
-#         temporal_groups[str(meta_i["side"])].append(i)
-
-#     temporal_results = [None] * batch_size
-#     for side, idxs in temporal_groups.items():
-#         group_future_embs = [batch_future_embs_np[i] for i in idxs]
-
-#         group_temporal = query_collection_batch(
-#             query_embs=group_future_embs,
-#             collection=collection,
-#             n_results=config.SEARCH_K_TEMPORAL,
-#             side=side,
-#             target_status_ids=None,
-#         )
-
-#         for local_j, global_i in enumerate(idxs):
-#             temporal_results[global_i] = group_temporal[local_j]
-
-#     query_embs = []
-#     support_tokens = []
-#     contrast_tokens = []
-#     temporal_tokens = []
-
-#     for i in range(batch_size):
-#         entry = assemble_live_entry_from_candidates(
-#             query_emb=batch_query_embs_np[i],
-#             future_emb=batch_future_embs_np[i],
-#             query_meta=batch_query_meta[i],
-#             future_meta=batch_future_meta[i],
-#             support_oracle=support_results[i],
-#             contrast_oracle=contrast_results[i],
-#             unrestricted_candidates=unrestricted_results[i],
-#             temporal_candidates=temporal_results[i],
-#             k_sim=config.K_SIM,
-#             k_contrast=config.K_CONTRAST,
-#             k_temporal=config.K_TEMPORAL,
-#             training=training,
-#             epoch_idx=epoch_idx,
-#         )
-
-#         query_embs.append(entry["query_emb"])
-#         support_tokens.append(entry["sim_embs"])
-#         contrast_tokens.append(entry["contrast_embs"])
-#         temporal_tokens.append(entry["temporal_embs"])
-
-#     query_embs = tf.convert_to_tensor(np.stack(query_embs, axis=0), dtype=tf.float32)
-#     support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32)
-#     contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32)
-#     temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32)
-    
-#     return query_embs, support_tokens, contrast_tokens, temporal_tokens
-
-
-
-
-# def fetch_live_batch(
-#     metadata,
-#     chunk_lookup,
-#     future_key_lookup,
-#     collection,
-#     chunk_encoder,
-#     frame_emb_mm,
-#     path_to_idx,
-#     training=False,
-#     epoch_idx=None
-# ):
-#     batch_size = metadata["vid"].shape[0]
-
-#     batch_query_meta = []
-#     batch_future_meta = []
-#     batch_query_embs_np = []
-#     batch_future_embs_np = []
-
-#     for i in range(batch_size):
-#         key = make_chunk_key_from_meta(metadata, i)
-#         chunk = chunk_lookup[key]
-#         future_chunk = chunk_lookup[future_key_lookup[key]]
-
-#         query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-#         future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-
-#         batch_query_meta.append(extract_meta(chunk))
-#         batch_future_meta.append(extract_meta(future_chunk))
-#         batch_query_embs_np.append(query_emb)
-#         batch_future_embs_np.append(future_emb)
-
-#     # curriculum needs
-#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=config.K_SIM, training=training
-#     )
-#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=config.K_CONTRAST, training=training
-#     )
-
-#     need_support_oracle = (sim_n_ideal > 0) or (not sim_unrestricted)
-#     need_contrast_oracle = (con_n_ideal > 0) or (not con_unrestricted)
-#     need_unrestricted = sim_unrestricted or con_unrestricted or (sim_n_noisy > 0) or (con_n_noisy > 0)
-
-#     search_k_support = getattr(config, "SEARCH_K_SUPPORT", config.SEARCH_K_CONTENT)
-#     search_k_contrast = getattr(config, "SEARCH_K_CONTRAST", config.SEARCH_K_CONTENT)
-#     search_k_unrestricted = getattr(config, "SEARCH_K_UNRESTRICTED", config.SEARCH_K_CONTENT)
-
-#     # group content queries by (side, status_id)
-#     content_groups = defaultdict(list)
-#     for i, meta_i in enumerate(batch_query_meta):
-#         content_groups[(str(meta_i["side"]), int(meta_i["status_id"]))].append(i)
-
-#     support_results = [None] * batch_size
-#     contrast_results = [None] * batch_size
-#     unrestricted_results = [None] * batch_size
-
-#     for (side, status_id), idxs in content_groups.items():
-#         group_query_embs = [batch_query_embs_np[i] for i in idxs]
-#         other_statuses = [s for s in (0, 1, 2) if s != status_id]
-
-#         if need_support_oracle:
-#             print('querying support')
-#             group_support = query_collection_batch(
-#                 query_embs=group_query_embs,
-#                 collection=collection,
-#                 n_results=search_k_support,
-#                 side=side,
-#                 target_status_ids=[status_id],
-#             )
-#             for local_j, global_i in enumerate(idxs):
-#                 support_results[global_i] = group_support[local_j]
-
-#         if need_contrast_oracle:
-#             print('querying contrast')
-#             group_contrast = query_collection_batch(
-#                 query_embs=group_query_embs,
-#                 collection=collection,
-#                 n_results=search_k_contrast,
-#                 side=side,
-#                 target_status_ids=other_statuses,
-#             )
-#             for local_j, global_i in enumerate(idxs):
-#                 contrast_results[global_i] = group_contrast[local_j]
-
-#         if need_unrestricted:
-#             print('querying unrestricted')
-#             group_unrestricted = query_collection_batch(
-#                 query_embs=group_query_embs,
-#                 collection=collection,
-#                 n_results=search_k_unrestricted,
-#                 side=side,
-#                 target_status_ids=None,
-#             )
-#             for local_j, global_i in enumerate(idxs):
-#                 unrestricted_results[global_i] = group_unrestricted[local_j]
-
-#     # temporal grouped only by side
-#     temporal_groups = defaultdict(list)
-#     for i, meta_i in enumerate(batch_query_meta):
-#         temporal_groups[str(meta_i["side"])].append(i)
-
-#     temporal_results = [None] * batch_size
-#     for side, idxs in temporal_groups.items():
-#         group_future_embs = [batch_future_embs_np[i] for i in idxs]
-
-#         print('querying temporal')
-#         group_temporal = query_collection_batch(
-#             query_embs=group_future_embs,
-#             collection=collection,
-#             n_results=config.SEARCH_K_TEMPORAL,
-#             side=side,
-#             target_status_ids=None,
-#         )
-
-#         for local_j, global_i in enumerate(idxs):
-#             temporal_results[global_i] = group_temporal[local_j]
-
-#     query_embs = []
-#     support_tokens = []
-#     contrast_tokens = []
-#     temporal_tokens = []
-
-#     for i in range(batch_size):
-#         entry = assemble_live_entry_from_candidates(
-#             query_emb=batch_query_embs_np[i],
-#             future_emb=batch_future_embs_np[i],
-#             query_meta=batch_query_meta[i],
-#             future_meta=batch_future_meta[i],
-#             support_oracle=support_results[i],
-#             contrast_oracle=contrast_results[i],
-#             unrestricted_candidates=unrestricted_results[i],
-#             temporal_candidates=temporal_results[i],
-#             k_sim=config.K_SIM,
-#             k_contrast=config.K_CONTRAST,
-#             k_temporal=config.K_TEMPORAL,
-#             training=training,
-#             epoch_idx=epoch_idx,
-#         )
-
-#         query_embs.append(entry["query_emb"])
-#         support_tokens.append(entry["sim_embs"])
-#         contrast_tokens.append(entry["contrast_embs"])
-#         temporal_tokens.append(entry["temporal_embs"])
-
-#     query_embs = tf.convert_to_tensor(np.stack(query_embs, axis=0), dtype=tf.float32)
-#     support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32)
-#     contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32)
-#     temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32)
-
-#     return query_embs, support_tokens, contrast_tokens, temporal_tokens
-
-
-
-
-# def fetch_live_batch(
-#     metadata,
-#     chunk_lookup,
-#     future_key_lookup,
-#     collection,
-#     chunk_encoder,
-#     frame_emb_mm,
-#     path_to_idx,
-#     training=False,
-#     epoch_idx=None
-# ):
-#     batch_size = metadata["vid"].shape[0]
-
-#     batch_query_meta = []
-#     batch_future_meta = []
-#     batch_query_embs_np = []
-#     batch_future_embs_np = []
-
-#     for i in range(batch_size):
-#         key = make_chunk_key_from_meta(metadata, i)
-#         chunk = chunk_lookup[key]
-#         future_chunk = chunk_lookup[future_key_lookup[key]]
-
-#         query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-#         future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-
-#         batch_query_meta.append(extract_meta(chunk))
-#         batch_future_meta.append(extract_meta(future_chunk))
-#         batch_query_embs_np.append(query_emb)
-#         batch_future_embs_np.append(future_emb)
-
-#     # curriculum needs
-#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=config.K_SIM, training=training
-#     )
-#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=config.K_CONTRAST, training=training
-#     )
-
-#     need_oracle = (sim_n_ideal > 0) or (con_n_ideal > 0)
-#     need_unrestricted = sim_unrestricted or con_unrestricted or (sim_n_noisy > 0) or (con_n_noisy > 0)
-
-#     search_k_oracle = getattr(config, "SEARCH_K_ORACLE", config.SEARCH_K_CONTENT)
-#     search_k_unrestricted = getattr(config, "SEARCH_K_UNRESTRICTED", config.SEARCH_K_CONTENT)
-
-#     oracle_results = [None] * batch_size
-#     unrestricted_results = [None] * batch_size
-#     temporal_results = [None] * batch_size
-
-#     # -------------------------------------------------
-#     # ORACLE CONTENT: group by (side, status_id)
-#     # one oracle query per group, not separate support/contrast
-#     # -------------------------------------------------
-#     if need_oracle:
-#         print('querying oracle')
-#         oracle_groups = defaultdict(list)
-#         for i, meta_i in enumerate(batch_query_meta):
-#             oracle_groups[(str(meta_i["side"]), int(meta_i["status_id"]))].append(i)
-
-#         for (side, status_id), idxs in oracle_groups.items():
-#             group_query_embs = [batch_query_embs_np[i] for i in idxs]
-
-#             group_oracle = query_collection_batch(
-#                 query_embs=group_query_embs,
-#                 collection=collection,
-#                 n_results=search_k_oracle,
-#                 side=side,
-#                 target_status_ids=[0, 1, 2],
-#             )
-
-#             for local_j, global_i in enumerate(idxs):
-#                 oracle_results[global_i] = group_oracle[local_j]
-
-#     # -------------------------------------------------
-#     # UNRESTRICTED CONTENT: group ONLY by side
-#     # -------------------------------------------------
-#     if need_unrestricted:
-#         print('querying unrestricted')
-#         unrestricted_groups = defaultdict(list)
-#         for i, meta_i in enumerate(batch_query_meta):
-#             unrestricted_groups[str(meta_i["side"])].append(i)
-
-#         for side, idxs in unrestricted_groups.items():
-#             group_query_embs = [batch_query_embs_np[i] for i in idxs]
-
-#             group_unrestricted = query_collection_batch(
-#                 query_embs=group_query_embs,
-#                 collection=collection,
-#                 n_results=search_k_unrestricted,
-#                 side=side,
-#                 target_status_ids=None,
-#             )
-
-#             for local_j, global_i in enumerate(idxs):
-#                 unrestricted_results[global_i] = group_unrestricted[local_j]
-
-#     # -------------------------------------------------
-#     # TEMPORAL: group ONLY by side
-#     # -------------------------------------------------
-#     temporal_groups = defaultdict(list)
-#     for i, meta_i in enumerate(batch_query_meta):
-#         temporal_groups[str(meta_i["side"])].append(i)
-
-#     for side, idxs in temporal_groups.items():
-#         group_future_embs = [batch_future_embs_np[i] for i in idxs]
-
-#         group_temporal = query_collection_batch(
-#             query_embs=group_future_embs,
-#             collection=collection,
-#             n_results=config.SEARCH_K_TEMPORAL,
-#             side=side,
-#             target_status_ids=None,
-#         )
-
-#         for local_j, global_i in enumerate(idxs):
-#             temporal_results[global_i] = group_temporal[local_j]
-
-#     query_embs = []
-#     support_tokens = []
-#     contrast_tokens = []
-#     temporal_tokens = []
-
-#     for i in range(batch_size):
-#         entry = assemble_live_entry_from_candidates(
-#             query_emb=batch_query_embs_np[i],
-#             future_emb=batch_future_embs_np[i],
-#             query_meta=batch_query_meta[i],
-#             future_meta=batch_future_meta[i],
-#             oracle_candidates=oracle_results[i],
-#             unrestricted_candidates=unrestricted_results[i],
-#             temporal_candidates=temporal_results[i],
-#             k_sim=config.K_SIM,
-#             k_contrast=config.K_CONTRAST,
-#             k_temporal=config.K_TEMPORAL,
-#             training=training,
-#             epoch_idx=epoch_idx,
-#         )
-
-#         query_embs.append(entry["query_emb"])
-#         support_tokens.append(entry["sim_embs"])
-#         contrast_tokens.append(entry["contrast_embs"])
-#         temporal_tokens.append(entry["temporal_embs"])
-
-#     query_embs = tf.convert_to_tensor(np.stack(query_embs, axis=0), dtype=tf.float32)
-#     support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32)
-#     contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32)
-#     temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32)
-
-#     return query_embs, support_tokens, contrast_tokens, temporal_tokens
-
-
-
 def make_padding_mask(tokens):
     """
     tokens: (B, K, D)
@@ -1482,7 +788,7 @@ def make_padding_mask(tokens):
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-CHROMA_SUBBATCH_SIZE = 8
+CHROMA_SUBBATCH_SIZE = 4
 
 def fetch_live_batch(
     metadata,
@@ -1518,10 +824,12 @@ def fetch_live_batch(
     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
         epoch_idx=epoch_idx, k=config.K_SIM, training=training
     )
+
+    pprint.pprint({'sim_ideal: ': sim_n_ideal,'sim_n_noisy: ': sim_n_noisy,'sim_unrestricted: ': sim_unrestricted})
     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
         epoch_idx=epoch_idx, k=config.K_CONTRAST, training=training
     )
-
+    pprint.pprint({'con_ideal: ': con_n_ideal,'con_n_noisy: ': con_n_noisy,'con_unrestricted: ': con_unrestricted})
     need_oracle = (sim_n_ideal > 0) or (con_n_ideal > 0)
     need_unrestricted = sim_unrestricted or con_unrestricted or (sim_n_noisy > 0) or (con_n_noisy > 0)
 
@@ -1665,274 +973,8 @@ def fetch_live_batch(
     contrast_mask = make_padding_mask(contrast_tokens)  # (B, K_CONTRAST)
     temporal_mask = make_padding_mask(temporal_tokens)  # (B, K_TEMPORAL)
 
-    return query_embs_out, support_tokens, contrast_tokens, temporal_tokens
-
-
-
-
-# def build_live_entry(
-#     chunk,
-#     future_chunk,
-#     collection,
-#     chunk_encoder,
-#     frame_emb_mm,
-#     path_to_idx,
-#     search_k_content,
-#     search_k_temporal,
-#     k_sim,
-#     k_contrast,
-#     k_temporal,
-#     training=False,
-#     epoch_idx=None,
-# ):
-#     query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-#     future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-
-#     query_meta = extract_meta(chunk)
-#     future_meta = extract_meta(future_chunk)
-
-#     q_status = int(query_meta["status_id"])
-#     q_side = str(query_meta["side"])
-#     emb_dim = query_emb.shape[0]
-
-#     other_statuses = [s for s in (0, 1, 2) if s != q_status]
-#     other_a, other_b = other_statuses[0], other_statuses[1]
-
-#     pad_meta_template = {
-#         "label": -1,
-#         "side": "PAD",
-#         "status": "PAD",
-#         "status_id": -1,
-#         "vid": -1,
-#         "clip": -1,
-#         "t_center": -1.0,
-#         "t_width": -1.0,
-#         "start_idx": -1,
-#         "end_idx": -1,
-#     }
-
-#     # -------------------------
-#     # oracle support pool
-#     # -------------------------
-#     print('building support')
-#     support_oracle = query_collection(
-#         query_emb=query_emb,
-#         collection=collection,
-#         n_results=search_k_content,
-#         side=q_side,
-#         target_status_ids=[q_status],
-#     )
-#     support_oracle = dedup_and_remove_self(support_oracle, query_meta)
-
-    
-#     # -------------------------
-#     # oracle contrast pools
-#     # -------------------------
-#     print('building contrast a')
-#     contrast_oracle_a = query_collection(
-#         query_emb=query_emb,
-#         collection=collection,
-#         n_results=search_k_content,
-#         side=q_side,
-#         target_status_ids=[other_a],
-#     )
-#     contrast_oracle_a = dedup_and_remove_self(contrast_oracle_a, query_meta)
-
-#     print('building contrast b')
-#     contrast_oracle_b = query_collection(
-#         query_emb=query_emb,
-#         collection=collection,
-#         n_results=search_k_content,
-#         side=q_side,
-#         target_status_ids=[other_b],
-#     )
-#     contrast_oracle_b = dedup_and_remove_self(contrast_oracle_b, query_meta)
-
-#     # -------------------------
-#     # unrestricted noisy pool
-#     # -------------------------
-#     print('building unrestricted')
-#     unrestricted_candidates = query_collection(
-#         query_emb=query_emb,
-#         collection=collection,
-#         n_results=search_k_content,
-#         side=q_side,
-#         target_status_ids=None,
-#     )
-#     unrestricted_candidates = dedup_and_remove_self(unrestricted_candidates, query_meta)
-
-#     unrestricted_same = []
-#     unrestricted_diff = []
-
-#     for cand in unrestricted_candidates:
-#         s = int(cand["meta"]["status_id"])
-#         if s == q_status:
-#             unrestricted_same.append(cand)
-#         elif s in (0, 1, 2):
-#             unrestricted_diff.append(cand)
-
-#     unrestricted_diff_balanced = interleave_lists(
-#         [c for c in unrestricted_diff if int(c["meta"]["status_id"]) == other_a],
-#         [c for c in unrestricted_diff if int(c["meta"]["status_id"]) == other_b],
-#         n_total=len(unrestricted_diff),
-#     )
-
-#     # -------------------------
-#     # support curriculum
-#     # -------------------------
-#     sim_n_ideal, sim_n_noisy, sim_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=k_sim, training=training
-#     )
-
-#     if sim_unrestricted:
-#         sim_items = take_unique(unrestricted_candidates, k_sim)
-#     else:
-#         sim_items = []
-
-#         # ideal support = oracle same-class
-#         sim_items.extend(take_unique(support_oracle, sim_n_ideal))
-
-#         # noisy support = unrestricted non-query classes
-#         used = {dedup_signature(x["meta"]) for x in sim_items}
-#         noisy_support = []
-#         for cand in unrestricted_diff_balanced:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             noisy_support.append(cand)
-#             used.add(sig)
-#             if len(noisy_support) >= sim_n_noisy:
-#                 break
-
-#         sim_items.extend(noisy_support)
-
-#         # backfill support from oracle same-class, then unrestricted
-#         if len(sim_items) < k_sim:
-#             used = {dedup_signature(x["meta"]) for x in sim_items}
-#             for pool in [support_oracle, unrestricted_candidates]:
-#                 for cand in pool:
-#                     sig = dedup_signature(cand["meta"])
-#                     if sig in used:
-#                         continue
-#                     sim_items.append(cand)
-#                     used.add(sig)
-#                     if len(sim_items) >= k_sim:
-#                         break
-#                 if len(sim_items) >= k_sim:
-#                     break
-
-#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
-
-#     # -------------------------
-#     # contrast curriculum
-#     # -------------------------
-#     con_n_ideal, con_n_noisy, con_unrestricted = get_branch_mix_counts(
-#         epoch_idx=epoch_idx, k=k_contrast, training=training
-#     )
-
-#     print({'sim ideal count': sim_n_ideal, 'sim noise count': sim_n_noisy, 'con ideal count': con_n_ideal, 'con noise count': con_n_noisy})
-#     if con_unrestricted:
-#         # fully real contrast = later unrestricted slice if possible
-#         contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
-#         if len(contrast_items) < k_contrast:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for cand in unrestricted_candidates:
-#                 sig = dedup_signature(cand["meta"])
-#                 if sig in used:
-#                     continue
-#                 contrast_items.append(cand)
-#                 used.add(sig)
-#                 if len(contrast_items) >= k_contrast:
-#                     break
-#     else:
-#         contrast_items = []
-
-#         # ideal contrast = balanced oracle from the two other classes
-#         n_a = con_n_ideal // 2
-#         n_b = con_n_ideal - n_a
-
-#         contrast_items.extend(take_unique(contrast_oracle_a, n_a))
-#         contrast_items.extend(take_unique(contrast_oracle_b, n_b))
-
-#         # backfill ideal contrast if one side is short
-#         if len(contrast_items) < con_n_ideal:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for cand in interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9):
-#                 sig = dedup_signature(cand["meta"])
-#                 if sig in used:
-#                     continue
-#                 contrast_items.append(cand)
-#                 used.add(sig)
-#                 if len(contrast_items) >= con_n_ideal:
-#                     break
-
-#         # noisy contrast = unrestricted same-class tokens
-#         used = {dedup_signature(x["meta"]) for x in contrast_items}
-#         noisy_contrast = []
-#         for cand in unrestricted_same:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             noisy_contrast.append(cand)
-#             used.add(sig)
-#             if len(noisy_contrast) >= con_n_noisy:
-#                 break
-
-#         contrast_items.extend(noisy_contrast)
-
-#         # backfill contrast from oracle contrast pools, then unrestricted diff
-#         if len(contrast_items) < k_contrast:
-#             used = {dedup_signature(x["meta"]) for x in contrast_items}
-#             for pool in [
-#                 interleave_lists(contrast_oracle_a, contrast_oracle_b, n_total=10**9),
-#                 unrestricted_diff_balanced,
-#                 unrestricted_candidates,
-#             ]:
-#                 for cand in pool:
-#                     sig = dedup_signature(cand["meta"])
-#                     if sig in used:
-#                         continue
-#                     contrast_items.append(cand)
-#                     used.add(sig)
-#                     if len(contrast_items) >= k_contrast:
-#                         break
-#                 if len(contrast_items) >= k_contrast:
-#                     break
-
-#     contrast_embs, contrast_meta = pad_or_trim(
-#         contrast_items, k_contrast, emb_dim, pad_meta_template
-#     )
-
-#     # -------------------------
-#     # temporal retrieval
-#     # -------------------------
-#     print('building temporal ')
-#     temporal_candidates = query_collection(
-#         query_emb=future_emb,
-#         collection=collection,
-#         n_results=search_k_temporal,
-#         side=q_side,
-#         target_status_ids=None,
-#     )
-#     temporal_candidates = dedup_and_remove_self(temporal_candidates, query_meta)
-
-#     temporal_items = take_unique(temporal_candidates, k_temporal)
-
-#     temporal_embs, temporal_meta = pad_or_trim(
-#         temporal_items, k_temporal, emb_dim, pad_meta_template
-#     )
-
-#     return {
-#         "query_emb": query_emb,
-#         "sim_embs": sim_embs,
-#         "contrast_embs": contrast_embs,
-#         "temporal_embs": temporal_embs,
-#         "query_meta": query_meta,
-#         "future_meta": future_meta,
-#         "sim_meta": sim_meta,
-#         "contrast_meta": contrast_meta,
-#         "temporal_meta": temporal_meta,
-#     }
+    # return query_embs_out, support_tokens, contrast_tokens, temporal_tokens
+    return query_embs_out, support_tokens, contrast_tokens, temporal_tokens, support_mask, contrast_mask, temporal_mask
 
 scce_no_reduce = tf.keras.losses.SparseCategoricalCrossentropy(
     from_logits=True,
@@ -2380,6 +1422,284 @@ def weighted_bce_with_logits(labels, logits, pos_weight):
     )
     return tf.reduce_mean(loss)
 
+# def train_step(batch,
+#     ratt_head,
+#     train_chunk_lookup,
+#     train_future_key_lookup,
+#     collection,
+#     chunk_encoder,
+#     frame_emb_mm,
+#     path_to_idx,
+#     # pos_weight
+#     class_weights,
+#     epoch_idx=None
+#     ):
+#     # metadata, labels = batch[1], batch[2]
+
+#     # labels = tf.cast(labels, tf.float32)
+#     # labels = tf.reshape(labels, (-1, 1))
+
+#     metadata = batch[1]
+#     labels = tf.cast(metadata["status_id"], tf.int32)
+#     labels = tf.reshape(labels, (-1,))
+
+#     # query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_cache_batch(
+#     #     metadata, cache
+#     # )
+
+#     # query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
+#     #     metadata=metadata,
+#     #     chunk_lookup=train_chunk_lookup,
+#     #     future_key_lookup=train_future_key_lookup,
+#     #     collection=collection,
+#     #     chunk_encoder=chunk_encoder,
+#     #     frame_emb_mm=frame_emb_mm,
+#     #     path_to_idx=path_to_idx,
+#     #     training=True,
+#     #     epoch_idx=epoch_idx
+#     # )
+
+#     query_embs, support_tokens, contrast_tokens, temporal_tokens, support_mask, contrast_mask, temporal_mask = fetch_live_batch(
+#         metadata=metadata,
+#         chunk_lookup=train_chunk_lookup,
+#         future_key_lookup=train_future_key_lookup,
+#         collection=collection,
+#         chunk_encoder=chunk_encoder,
+#         frame_emb_mm=frame_emb_mm,
+#         path_to_idx=path_to_idx,
+#         training=True,
+#         epoch_idx=epoch_idx
+#     )
+
+#     zeros_query = tf.zeros_like(query_embs)
+#     def grad_rms(g):
+#         if g is None:
+#             return 0.0
+#         g = tf.cast(g, tf.float32)
+#         return float(tf.sqrt(tf.reduce_mean(tf.square(g))).numpy())
+
+#     # q_exp = tf.expand_dims(query_embs, axis=1)   # (B, 1, D)
+
+#     # # Make branches explicitly different
+#     # support_in = support_tokens
+#     # # contrast_in = contrast_tokens - q_exp
+#     # contrast_in = contrast_tokens + (contrast_tokens - q_exp)
+#     # temporal_in = temporal_tokens
+
+#     with tf.GradientTape(persistent=True) as tape:
+#         tape.watch(query_embs)
+#         tape.watch(support_tokens)
+#         tape.watch(contrast_tokens)
+#         tape.watch(temporal_tokens)
+
+
+#         # class_logits, cls_out, aux = ratt_head(
+#         #     # chunk_embs=query_embs,
+#         #     chunk_embs=zeros_query,
+#         #     support_tokens=support_tokens,
+#         #     contrast_tokens=contrast_tokens,
+#         #     temporal_tokens=temporal_tokens,
+#         #     training=True,
+#         # )
+
+#         # get ideal fraction from curriculum
+#         ideal_fraction = sim_n_ideal / config.K_SIM  # 1.0 early, 0.0 late
+
+#         # aux loss weighted by how much oracle signal we have
+#         attn_loss_weight = ideal_fraction * 0.1  # tune the 0.1
+
+#         class_logits, cls_out, aux = ratt_head(
+#             # chunk_embs=zeros_query,
+#             chunk_embs=query_embs,
+#             support_tokens=support_tokens,
+#             contrast_tokens=contrast_tokens,
+#             temporal_tokens=temporal_tokens,
+#             support_mask=support_mask,
+#             contrast_mask=contrast_mask,
+#             temporal_mask=temporal_mask,
+#             training=True,
+#         )
+        
+#         # loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
+#         # loss = weighted_scce_loss(labels, class_logits, class_weights)
+#         # extract attention from aux
+#         last_attn = aux["attn_scores"][-1]
+#         attn_mean = tf.reduce_mean(last_attn, axis=1)
+#         cls_attn = attn_mean[:, 0, :]
+
+#         attn_loss = attention_supervision_loss(
+#             cls_attn, support_mask, contrast_mask, temporal_mask,
+#             config.K_SIM, config.K_CONTRAST, config.K_TEMPORAL
+#         )
+
+#         loss = weighted_scce_loss(labels, class_logits, class_weights)
+
+#         pprint.pprint({'attention loss':attn_loss,'scce loss':loss})
+#         loss = loss + attn_loss_weight * attn_loss
+
+#         if ratt_head.losses:
+#             loss += tf.add_n(ratt_head.losses)
+
+#     grads = tape.gradient(loss, ratt_head.trainable_variables)
+#     optimizer.apply_gradients(zip(grads, ratt_head.trainable_variables))
+
+    
+
+#     g_query = tape.gradient(loss, query_embs)
+#     g_support = tape.gradient(loss, support_tokens)
+#     g_contrast = tape.gradient(loss, contrast_tokens)
+#     g_temporal = tape.gradient(loss, temporal_tokens)
+
+#     print(
+#         f"branch_grad_rms | "
+#         f"query={grad_rms(g_query):.6f} "
+#         f"support={grad_rms(g_support):.6f} "
+#         f"contrast={grad_rms(g_contrast):.6f} "
+#         f"temporal={grad_rms(g_temporal):.6f}"
+#     )
+
+#     del tape
+
+#     # probs = tf.sigmoid(class_logits)
+#     probs = tf.nn.softmax(class_logits, axis=-1)
+#     batch_preds = tf.argmax(class_logits, axis=-1, output_type=tf.int32)
+# # ctrlf
+#     train_loss_metric.update_state(loss)
+#     train_acc_metric.update_state(labels, probs)
+
+#     # batch_preds = tf.cast(probs >= 0.5, tf.float32)
+#     batch_acc = tf.reduce_mean(tf.cast(tf.equal(batch_preds, labels), tf.float32))
+#     print(f"batch acc={batch_acc:.6f}")
+#     return {
+#         "loss": float(loss.numpy()),
+#         "acc": float(train_acc_metric.result().numpy()),
+#         "logits": class_logits,
+#         "probs": probs,
+#         "cls_out": cls_out,
+#         "aux": aux,
+#         "labels": labels,
+#         "preds": batch_preds
+#     }
+
+# def eval_step(
+#     batch,
+#     ratt_head,
+#     val_chunk_lookup,
+#     val_future_key_lookup,
+#     collection,
+#     chunk_encoder,
+#     frame_emb_mm,
+#     path_to_idx,
+#     # pos_weight
+#     class_weights
+# ):
+#     # metadata, labels = batch[1], batch[2]
+
+#     # labels = tf.cast(labels, tf.float32)
+#     # labels = tf.reshape(labels, (-1, 1))
+
+#     metadata = batch[1]
+#     labels = tf.cast(metadata["status_id"], tf.int32)
+#     labels = tf.reshape(labels, (-1,))
+
+#     # query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
+#     #     metadata=metadata,
+#     #     chunk_lookup=val_chunk_lookup,
+#     #     future_key_lookup=val_future_key_lookup,
+#     #     collection=collection,
+#     #     chunk_encoder=chunk_encoder,
+#     #     frame_emb_mm=frame_emb_mm,
+#     #     path_to_idx=path_to_idx,
+#     #     training=False
+#     # )
+
+#     query_embs, support_tokens, contrast_tokens, temporal_tokens, support_mask, contrast_mask, temporal_mask = fetch_live_batch(
+#         metadata=metadata,
+#         chunk_lookup=val_chunk_lookup,
+#         future_key_lookup=val_future_key_lookup,
+#         collection=collection,
+#         chunk_encoder=chunk_encoder,
+#         frame_emb_mm=frame_emb_mm,
+#         path_to_idx=path_to_idx,
+#         training=False
+#     )
+
+#     zeros_query = tf.zeros_like(query_embs)
+#     zeros_support = tf.zeros_like(support_tokens)
+#     zeros_contrast = tf.zeros_like(contrast_tokens)
+#     zeros_temporal = tf.zeros_like(temporal_tokens)
+
+#     # class_logits, cls_out, aux = ratt_head(
+#     #     # chunk_embs=query_embs,
+#     #     support_tokens=support_tokens,
+#     #     contrast_tokens=contrast_tokens,
+#     #     temporal_tokens=temporal_tokens,
+#     #     # support_tokens=zeros_support,
+#     #     # contrast_tokens=zeros_contrast,
+#     #     # temporal_tokens=zeros_temporal,
+#     #     chunk_embs=zeros_query,
+#     #     training=False,
+#     # )
+
+#     # get ideal fraction from curriculum
+#     ideal_fraction = sim_n_ideal / config.K_SIM  # 1.0 early, 0.0 late
+
+#     # aux loss weighted by how much oracle signal we have
+#     attn_loss_weight = ideal_fraction * 0.1  # tune the 0.1
+
+#     class_logits, cls_out, aux = ratt_head(
+#         # chunk_embs=zeros_query,
+#         chunk_embs=query_embs,
+#         support_tokens=support_tokens,
+#         contrast_tokens=contrast_tokens,
+#         temporal_tokens=temporal_tokens,
+#         support_mask=support_mask,
+#         contrast_mask=contrast_mask,
+#         temporal_mask=temporal_mask,
+#         training=False,
+#     )
+
+#     # loss = bce_loss_fn(labels, class_logits)
+#     # loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
+#     # loss = weighted_scce_loss(labels, class_logits, class_weights)
+#     # extract attention from aux
+#     last_attn = aux["attn_scores"][-1]
+#     attn_mean = tf.reduce_mean(last_attn, axis=1)
+#     cls_attn = attn_mean[:, 0, :]
+
+#     attn_loss = attention_supervision_loss(
+#         cls_attn, support_mask, contrast_mask, temporal_mask,
+#         config.K_SIM, config.K_CONTRAST, config.K_TEMPORAL
+#     )
+
+#     loss = weighted_scce_loss(labels, class_logits, class_weights)
+
+#     pprint.pprint({'attention loss':attn_loss,'scce loss':loss})
+#     loss = loss + attn_loss_weight * attn_loss
+
+#     if ratt_head.losses:
+#         loss += tf.add_n(ratt_head.losses)
+
+#     # probs = tf.sigmoid(class_logits)
+#     probs = tf.nn.softmax(class_logits, axis=-1)
+#     preds = tf.argmax(class_logits, axis=-1, output_type=tf.int32)
+
+#     val_loss_metric.update_state(loss)
+#     val_acc_metric.update_state(labels, probs)
+
+#     return {
+#         "loss": float(loss.numpy()),
+#         "acc": float(val_acc_metric.result().numpy()),
+#         "logits": class_logits,
+#         "probs": probs,
+#         "preds": preds,
+#         'labels':labels
+#         # "cls_out": cls_out,
+#         # "aux": aux,
+#     }
+
+
+
 def train_step(batch,
     ratt_head,
     train_chunk_lookup,
@@ -2388,23 +1708,14 @@ def train_step(batch,
     chunk_encoder,
     frame_emb_mm,
     path_to_idx,
-    # pos_weight
     class_weights,
     epoch_idx=None
     ):
-    # metadata, labels = batch[1], batch[2]
-
-    # labels = tf.cast(labels, tf.float32)
-    # labels = tf.reshape(labels, (-1, 1))
-
     metadata = batch[1]
     labels = tf.cast(metadata["status_id"], tf.int32)
     labels = tf.reshape(labels, (-1,))
 
-    # query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_cache_batch(
-    #     metadata, cache
-    # )
-    query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
+    query_embs, support_tokens, contrast_tokens, temporal_tokens, support_mask, contrast_mask, temporal_mask = fetch_live_batch(
         metadata=metadata,
         chunk_lookup=train_chunk_lookup,
         future_key_lookup=train_future_key_lookup,
@@ -2415,20 +1726,17 @@ def train_step(batch,
         training=True,
         epoch_idx=epoch_idx
     )
-    zeros_query = tf.zeros_like(query_embs)
+
+    # compute ideal fraction for attn loss weight
+    sim_n_ideal, _, _ = get_branch_mix_counts(epoch_idx=epoch_idx, k=config.K_SIM, training=True)
+    ideal_fraction = sim_n_ideal / config.K_SIM
+    attn_loss_weight = ideal_fraction * 0.1
+
     def grad_rms(g):
         if g is None:
             return 0.0
         g = tf.cast(g, tf.float32)
         return float(tf.sqrt(tf.reduce_mean(tf.square(g))).numpy())
-
-    # q_exp = tf.expand_dims(query_embs, axis=1)   # (B, 1, D)
-
-    # # Make branches explicitly different
-    # support_in = support_tokens
-    # # contrast_in = contrast_tokens - q_exp
-    # contrast_in = contrast_tokens + (contrast_tokens - q_exp)
-    # temporal_in = temporal_tokens
 
     with tf.GradientTape(persistent=True) as tape:
         tape.watch(query_embs)
@@ -2436,26 +1744,41 @@ def train_step(batch,
         tape.watch(contrast_tokens)
         tape.watch(temporal_tokens)
 
-
         class_logits, cls_out, aux = ratt_head(
-            # chunk_embs=query_embs,
-            chunk_embs=zeros_query,
+            chunk_embs=query_embs,
             support_tokens=support_tokens,
             contrast_tokens=contrast_tokens,
             temporal_tokens=temporal_tokens,
+            support_mask=support_mask,
+            contrast_mask=contrast_mask,
+            temporal_mask=temporal_mask,
             training=True,
         )
-        
-        # loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
-        loss = weighted_scce_loss(labels, class_logits, class_weights)
+
+        last_attn = aux["attn_scores"][-1]
+        attn_mean = tf.reduce_mean(last_attn, axis=1)
+        cls_attn = attn_mean[:, 0, :]
+
+        attn_loss = attention_supervision_loss(
+            cls_attn=cls_attn,
+            support_mask=support_mask,
+            contrast_mask=contrast_mask,
+            temporal_mask=temporal_mask,
+            Ks=config.K_SIM,
+            Kc=config.K_CONTRAST,
+            Kt=config.K_TEMPORAL,
+        )
+
+        class_loss = weighted_scce_loss(labels, class_logits, class_weights)
+        loss = class_loss + attn_loss_weight * attn_loss
 
         if ratt_head.losses:
             loss += tf.add_n(ratt_head.losses)
 
+    print(f"class_loss={float(class_loss):.4f} attn_loss={float(attn_loss):.4f} attn_weight={attn_loss_weight:.4f}")
+
     grads = tape.gradient(loss, ratt_head.trainable_variables)
     optimizer.apply_gradients(zip(grads, ratt_head.trainable_variables))
-
-    
 
     g_query = tape.gradient(loss, query_embs)
     g_support = tape.gradient(loss, support_tokens)
@@ -2472,14 +1795,12 @@ def train_step(batch,
 
     del tape
 
-    # probs = tf.sigmoid(class_logits)
     probs = tf.nn.softmax(class_logits, axis=-1)
     batch_preds = tf.argmax(class_logits, axis=-1, output_type=tf.int32)
-# ctrlf
+
     train_loss_metric.update_state(loss)
     train_acc_metric.update_state(labels, probs)
 
-    # batch_preds = tf.cast(probs >= 0.5, tf.float32)
     batch_acc = tf.reduce_mean(tf.cast(tf.equal(batch_preds, labels), tf.float32))
     print(f"batch acc={batch_acc:.6f}")
     return {
@@ -2493,6 +1814,7 @@ def train_step(batch,
         "preds": batch_preds
     }
 
+
 def eval_step(
     batch,
     ratt_head,
@@ -2502,19 +1824,13 @@ def eval_step(
     chunk_encoder,
     frame_emb_mm,
     path_to_idx,
-    # pos_weight
     class_weights
 ):
-    # metadata, labels = batch[1], batch[2]
-
-    # labels = tf.cast(labels, tf.float32)
-    # labels = tf.reshape(labels, (-1, 1))
-
     metadata = batch[1]
     labels = tf.cast(metadata["status_id"], tf.int32)
     labels = tf.reshape(labels, (-1,))
 
-    query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
+    query_embs, support_tokens, contrast_tokens, temporal_tokens, support_mask, contrast_mask, temporal_mask = fetch_live_batch(
         metadata=metadata,
         chunk_lookup=val_chunk_lookup,
         future_key_lookup=val_future_key_lookup,
@@ -2525,31 +1841,42 @@ def eval_step(
         training=False
     )
 
-    zeros_query = tf.zeros_like(query_embs)
-    zeros_support = tf.zeros_like(support_tokens)
-    zeros_contrast = tf.zeros_like(contrast_tokens)
-    zeros_temporal = tf.zeros_like(temporal_tokens)
+    # val always uses full oracle so ideal_fraction=1.0
+    attn_loss_weight = 1.0 * 0.1
 
     class_logits, cls_out, aux = ratt_head(
-        # chunk_embs=query_embs,
+        chunk_embs=query_embs,
         support_tokens=support_tokens,
         contrast_tokens=contrast_tokens,
         temporal_tokens=temporal_tokens,
-        # support_tokens=zeros_support,
-        # contrast_tokens=zeros_contrast,
-        # temporal_tokens=zeros_temporal,
-        chunk_embs=zeros_query,
+        support_mask=support_mask,
+        contrast_mask=contrast_mask,
+        temporal_mask=temporal_mask,
         training=False,
     )
 
-    # loss = bce_loss_fn(labels, class_logits)
-    # loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
-    loss = weighted_scce_loss(labels, class_logits, class_weights)
+    last_attn = aux["attn_scores"][-1]
+    attn_mean = tf.reduce_mean(last_attn, axis=1)
+    cls_attn = attn_mean[:, 0, :]
+
+    attn_loss = attention_supervision_loss(
+        cls_attn=cls_attn,
+        support_mask=support_mask,
+        contrast_mask=contrast_mask,
+        temporal_mask=temporal_mask,
+        Ks=config.K_SIM,
+        Kc=config.K_CONTRAST,
+        Kt=config.K_TEMPORAL,
+    )
+
+    class_loss = weighted_scce_loss(labels, class_logits, class_weights)
+    loss = class_loss + attn_loss_weight * attn_loss
 
     if ratt_head.losses:
         loss += tf.add_n(ratt_head.losses)
 
-    # probs = tf.sigmoid(class_logits)
+    print(f"class_loss={float(class_loss):.4f} attn_loss={float(attn_loss):.4f}")
+
     probs = tf.nn.softmax(class_logits, axis=-1)
     preds = tf.argmax(class_logits, axis=-1, output_type=tf.int32)
 
@@ -2562,9 +1889,7 @@ def eval_step(
         "logits": class_logits,
         "probs": probs,
         "preds": preds,
-        'labels':labels
-        # "cls_out": cls_out,
-        # "aux": aux,
+        "labels": labels,
     }
 
 
@@ -2595,7 +1920,7 @@ def run_train_epoch(train_ds,
             path_to_idx=path_to_idx,
             # pos_weight=pos_weight
             class_weights=class_weight,
-            epoch_idx=epoch_idx
+            epoch_idx=epoch_idx-1
         )
 
         if step % 1 == 0:
@@ -2741,7 +2066,7 @@ if __name__ == "__main__":
     train_vids = config.TRAIN_VIDS
     train_samples = load_samples(train_vids,stride=1)
     train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
-    train_chunk_samples = oversample_chunk_samples(train_chunk_samples,0.3)
+    train_chunk_samples = oversample_chunk_samples(train_chunk_samples,0.5)
     # train_chunk_samples = train_chunk_samples[0:100]
     # label_lookup = {}
     # for c in train_chunk_samples:
