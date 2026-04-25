@@ -807,8 +807,10 @@ def attention_token_consistency_loss(cls_attn, sim_meta, contrast_meta, query_la
     Support: same-class tokens should get higher attention than different-class tokens.
     Contrast: different-class tokens should get higher attention than same-class tokens.
     """
-    support_attn = cls_attn[:, 2:2+Ks]
-    contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc]
+    # support_attn = cls_attn[:, 2:2+Ks]
+    # contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc]
+    support_attn = cls_attn[:, 1:1+Ks]      # was 2:2+Ks
+    contrast_attn = cls_attn[:, 1+Ks:1+Ks+Kc]  # was 3+Ks:3+Ks+Kc
 
     # normalize within branch
     support_attn_norm = support_attn / (tf.reduce_sum(support_attn, axis=1, keepdims=True) + 1e-8)
@@ -866,9 +868,13 @@ def visualize_full_attention(cls_attn, sim_meta, contrast_meta, temporal_meta,
                               query_labels, Ks, Kc, Kt, n_examples=3):
     # indices — adjust for your sequence layout
     # [cls, sup_summary, support x Ks, con_summary, contrast x Kc, tmp_summary, temporal x Kt, local]
-    support_attn = cls_attn[:, 2:2+Ks].numpy()
-    contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc].numpy()
-    temporal_attn = cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt].numpy()
+    # support_attn = cls_attn[:, 2:2+Ks].numpy()
+    # contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc].numpy()
+    # temporal_attn = cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt].numpy()
+
+    support_attn = cls_attn[:, 1:1+Ks].numpy()
+    contrast_attn = cls_attn[:, 1+Ks:1+Ks+Kc].numpy()
+    temporal_attn = cls_attn[:, 1+Ks+Kc:1+Ks+Kc+Kt].numpy()
 
     for i in range(min(n_examples, len(sim_meta))):
         query_label = query_labels[i].numpy()
@@ -1195,7 +1201,7 @@ def train_step(
             Kt=config.K_TEMPORAL,
         )
         class_loss = weighted_scce_loss(labels, class_logits, class_weights)
-        loss = 1*class_loss + 0.01 * const_loss
+        loss = 1*class_loss + 0.0 * const_loss
 
         if ratt_head.losses:
             loss += tf.add_n(ratt_head.losses)
@@ -1692,11 +1698,11 @@ if __name__ == "__main__":
     _ = chunk_encoder(dummy_frame_embs, training=False)
     chunk_encoder.load_weights(config.STAGE1_WEIGHTS)
 
-    for i in range(chunk_encoder.num_layers):
-        block = getattr(chunk_encoder, f"transformer_block_{i}")
-        with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
-            weights = pickle.load(f)
-        block.set_weights(weights)
+    # for i in range(chunk_encoder.num_layers):
+    #     block = getattr(chunk_encoder, f"transformer_block_{i}")
+    #     with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
+    #         weights = pickle.load(f)
+    #     block.set_weights(weights)
 
     print("[STAGE1] Loaded chunk encoder weights")
     chunk_encoder.trainable = False
