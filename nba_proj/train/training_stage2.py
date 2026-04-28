@@ -1,16 +1,15 @@
-
 from collections import defaultdict
-import math
 import os
 import pprint
 import random
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import tf_keras
+import tensorflow.keras as tf_keras
 from chromadb import PersistentClient
 
-from dataset import load_samples, build_chunks, build_tf_dataset_chunks, oversample_chunk_samples
+# srun --jobid=614 --pty bash replace 614 with the job id and then nvidia-smi will work
+from dataset import load_samples, build_chunks, build_tf_dataset_chunks
 from models.vit_backbone import VisionTransformer
 from models.ratt_head import RATTHead
 from models.projection_head import ProjectionHead
@@ -29,9 +28,15 @@ import pickle
 from models.chunk_encoder import ChunkEncoder
 from models.ratt_v2 import RATTHeadV2
 
-import gc
+import gc 
 
-tf_keras.backend.clear_session()
+# support_reranker = CandidateReranker(...)
+# contrast_reranker = CandidateReranker(...)
+# temporal_reranker = CandidateReranker(...)
+
+# ratt_head = RATTHeadV2(...)
+
+tf.keras.backend.clear_session()
 gc.collect()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,7 +49,9 @@ hf_vit.eval()
 layers = tf_keras.layers
 
 SEED = 12
+
 os.environ["PYTHONHASHSEED"] = str(SEED)
+
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
@@ -54,40 +61,41 @@ try:
 except Exception:
     pass
 
-
-# ─────────────────────────────────────────────
-# Key helpers
-# ─────────────────────────────────────────────
-
 def make_chunk_key(chunk, precision=6):
+    # pprint.pprint(chunk)
+    # print(type(chunk))
+    # _,meta,_ = chunk 
+    # print(meta)
     return (
         int(chunk["vid"]),
         str(chunk["side"]),
         int(chunk["clip"]),
+        # round(float(chunk["t_center"]), precision),
         int(chunk["start_idx"]),
         int(chunk["end_idx"]),
     )
 
-
 def build_future_key_lookup(all_chunks, future_step=5):
     grouped = defaultdict(list)
+
     for chunk in all_chunks:
         grouped[(int(chunk["vid"]), int(chunk["clip"]))].append(chunk)
 
     future_key_lookup = {}
+
     for _, group in grouped.items():
         group_sorted = sorted(group, key=lambda c: int(c["start_idx"]))
         last_idx = len(group_sorted) - 1
+
         for idx, chunk in enumerate(group_sorted):
             cur_key = make_chunk_key(chunk)
             fut_idx = min(idx + future_step, last_idx)
             fut_key = make_chunk_key(group_sorted[fut_idx])
             future_key_lookup[cur_key] = fut_key
+
     return future_key_lookup
 
-
 CACHE_DIR = "./frame_cache_vit"
-
 
 def get_store_paths(store_name):
     return {
@@ -96,25 +104,141 @@ def get_store_paths(store_name):
         "meta": os.path.join(CACHE_DIR, f"{store_name}_meta.npz"),
     }
 
-
 def load_frame_store(store_name="train_val_frames"):
     paths = get_store_paths(store_name)
     meta = np.load(paths["meta"])
+
     n_frames = int(meta["n_frames"])
     emb_dim = int(meta["emb_dim"])
-    emb_mm = np.memmap(paths["emb"], dtype="float32", mode="r", shape=(n_frames, emb_dim))
+
+    emb_mm = np.memmap(
+        paths["emb"],
+        dtype="float32",
+        mode="r",
+        shape=(n_frames, emb_dim),
+    )
+
     frame_paths = np.load(paths["paths"], allow_pickle=True).tolist()
     path_to_idx = {p: i for i, p in enumerate(frame_paths)}
+
     print(f"[frame cache] loaded store '{store_name}'")
     print(f"[frame cache] shape = ({n_frames}, {emb_dim})")
+
     return emb_mm, frame_paths, path_to_idx
 
+def hf_vit_embed_batch(frames_np):
+    """
+    frames_np: (N, 432, 768, 3) uint8 or float32
+    Returns (N, 768) numpy embeddings (L2 normalized)
+    """
+    # frames_np = frames_np.astype(np.float32)
+
+    # frames_np = frames_np.astype(np.float32)
+
+    if frames_np.dtype != np.uint8:
+        frames_np = np.clip(frames_np, 0, 255).astype(np.uint8)
+
+
+    frames_np = frames_np.astype(np.float32)
+        
+    frames_list = [frames_np[i] for i in range(frames_np.shape[0])]
+    with torch.no_grad():
+        inputs = hf_processor(images=frames_list, return_tensors="pt").to(device)
+        out = hf_vit(**inputs)
+        cls = out.last_hidden_state[:, 0, :]  # (N,768)
+        cls = cls.cpu().numpy()
+        cls = cls / (np.linalg.norm(cls, axis=1, keepdims=True) + 1e-8)
+        return cls.astype(np.float32)
+
+def save_encoded_embeddings(encoded, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(encoded, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[CACHE] Saved encoded embeddings to {path}")
+
+def load_encoded_embeddings(path):
+    with open(path, "rb") as f:
+        cache = pickle.load(f)
+    print(f"[CACHE] Loaded encoded embeddings from {path}")
+    return cache
+
+def query_collection(query_emb, collection, n_results):
+        results = collection.query(
+            query_embeddings=[query_emb.tolist()],
+            n_results=n_results,
+            include=["embeddings", "metadatas"]
+        )
+
+        raw_embs = results["embeddings"][0]
+        raw_meta = results["metadatas"][0]
+
+        out = []
+        for emb, meta in zip(raw_embs, raw_meta):
+            # pprint.pprint(meta)
+            out.append(
+                {
+                    "emb": np.asarray(emb, dtype=np.float32),
+                    "meta": {
+                        "label": int(meta["label"]),
+                        "side": str(meta["side"]),
+                        "vid": int(meta["vid_num"]),
+                        "clip": int(meta["clip_num"]),
+                        "t_center": float(meta["t_center"]),
+                        "t_width": float(meta["t_width"]),
+                        "start_idx": int(meta["start_idx"]),
+                        "end_idx": int(meta["end_idx"]),
+                        "class_logit": float(meta["class_logit"])
+                    },
+                }
+            )
+        return out
+
+def query_collection_batch(query_embs, collection, n_results):
+    """
+    query_embs: list of np.ndarray, each shape (D,)
+    returns: list of candidate lists, one per query
+    """
+    results = collection.query(
+        query_embeddings=[q.tolist() for q in query_embs],
+        n_results=n_results,
+        include=["embeddings", "metadatas"],
+    )
+
+    batch_out = []
+
+    batch_raw_embs = results["embeddings"]     # list of length B
+    batch_raw_meta = results["metadatas"]      # list of length B
+
+    for raw_embs, raw_meta in zip(batch_raw_embs, batch_raw_meta):
+        out = []
+        for emb, meta in zip(raw_embs, raw_meta):
+            out.append(
+                {
+                    "emb": np.asarray(emb, dtype=np.float32),
+                    "meta": {
+                        "label": int(meta["label"]),
+                        "side": str(meta["side"]),
+                        "vid": int(meta["vid_num"]),
+                        "clip": int(meta["clip_num"]),
+                        "t_center": float(meta["t_center"]),
+                        "t_width": float(meta["t_width"]),
+                        "start_idx": int(meta["start_idx"]),
+                        "end_idx": int(meta["end_idx"]),
+                        "class_logit": float(meta["class_logit"]),
+                    },
+                }
+            )
+        batch_out.append(out)
+
+    return batch_out
+
+# -----------------------------
+# helpers
+# -----------------------------
 
 def extract_meta(chunk):
     return {
         "label": int(chunk["label"]),
-        "status": str(chunk["status"]),
-        "status_id": int(chunk["status_id"]),
         "side": str(chunk["side"]),
         "vid": int(chunk["vid"]),
         "clip": int(chunk["clip"]),
@@ -123,7 +247,6 @@ def extract_meta(chunk):
         "start_idx": int(chunk["start_idx"]),
         "end_idx": int(chunk["end_idx"]),
     }
-
 
 def same_chunk_meta(meta_a, meta_b):
     return (
@@ -134,7 +257,6 @@ def same_chunk_meta(meta_a, meta_b):
         and int(meta_a["end_idx"]) == int(meta_b["end_idx"])
     )
 
-
 def dedup_signature(meta):
     return (
         int(meta["vid"]),
@@ -144,481 +266,115 @@ def dedup_signature(meta):
         int(meta["end_idx"]),
     )
 
-
-def dedup_and_remove_self(candidates, query_meta):
-    out = []
-    seen = set()
-    for cand in candidates:
-        cand_meta = cand["meta"]
-        sig = dedup_signature(cand_meta)
-        if same_chunk_meta(query_meta, cand_meta):
-            continue
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(cand)
-    return out
-
-
-def interleave_lists(a, b, n_total):
-    out = []
-    ia = ib = 0
-    while len(out) < n_total and (ia < len(a) or ib < len(b)):
-        if ia < len(a):
-            out.append(a[ia])
-            ia += 1
-            if len(out) >= n_total:
-                break
-        if ib < len(b):
-            out.append(b[ib])
-            ib += 1
-    return out
-
-
-def take_unique(items, k):
-    out = []
-    seen = set()
-    for cand in items:
-        sig = dedup_signature(cand["meta"])
-        if sig in seen:
-            continue
-        seen.add(sig)
-        out.append(cand)
-        if len(out) >= k:
-            break
-    return out
-
-
-def pad_or_trim(items, k, emb_dim, pad_meta_template):
-    if len(items) >= k:
-        items = items[:k]
-    else:
-        pad_count = k - len(items)
-        zero_emb = np.zeros((emb_dim,), dtype=np.float32)
-        for _ in range(pad_count):
-            items.append({"emb": zero_emb.copy(), "meta": dict(pad_meta_template)})
-    embs = np.stack([x["emb"] for x in items], axis=0)
-    metas = [x["meta"] for x in items]
-    return embs, metas
-
-
-def make_padding_mask(tokens):
-    norms = tf.norm(tokens, axis=-1)
-    return norms > 1e-6
-
-
-# ─────────────────────────────────────────────
-# ChromaDB query helpers
-# ─────────────────────────────────────────────
-
-def query_collection(query_emb, collection, n_results, side=None, target_status_ids=None):
-    where_clauses = []
-    if side is not None:
-        where_clauses.append({"side": str(side)})
-    if target_status_ids is not None:
-        target_status_ids = [int(s) for s in target_status_ids]
-        if len(target_status_ids) == 1:
-            where_clauses.append({"status_id": target_status_ids[0]})
-        else:
-            where_clauses.append({"$or": [{"status_id": s} for s in target_status_ids]})
-
-    where = None
-    if len(where_clauses) == 1:
-        where = where_clauses[0]
-    elif len(where_clauses) > 1:
-        where = {"$and": where_clauses}
-
-    query_kwargs = {
-        "query_embeddings": [query_emb.tolist()],
-        "n_results": n_results,
-        "include": ["embeddings", "metadatas"],
-    }
-    if where is not None:
-        query_kwargs["where"] = where
-
-    results = collection.query(**query_kwargs)
-    raw_embs = results["embeddings"][0]
-    raw_meta = results["metadatas"][0]
-
-    out = []
-    for emb, meta in zip(raw_embs, raw_meta):
-        out.append({
-            "emb": np.asarray(emb, dtype=np.float32),
-            "meta": {
-                "label": int(meta["label"]),
-                "status": str(meta["status"]),
-                "status_id": int(meta["status_id"]),
-                "side": str(meta["side"]),
-                "vid": int(meta["vid_num"]),
-                "clip": int(meta["clip_num"]),
-                "t_center": float(meta["t_center"]),
-                "t_width": float(meta["t_width"]),
-                "start_idx": int(meta["start_idx"]),
-                "end_idx": int(meta["end_idx"]),
-                "class_logit": float(meta["class_logit"]),
-            },
-        })
-    return out
-
-
-# def rebuild_chromadb(train_chunk_samples, ratt_head, chunk_encoder,
-#                      frame_emb_mm, path_to_idx, collection):
-#     print("[rebuild_db] rebuilding ChromaDB with learned query_proj embeddings...")
-#     b_embeddings = []
-#     b_ids = []
-#     b_metadatas = []
-#     upsert_size = 512
-
-#     for chunk in train_chunk_samples:
-#         raw_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-#         raw_emb_tensor = tf.convert_to_tensor(raw_emb[None, None, :], dtype=tf.float32)
-#         projected = ratt_head.query_proj(raw_emb_tensor, training=False)[0, 0].numpy()
-
-#         # chunk_id = (f"vid{int(chunk['vid'])}_clip_{int(chunk['clip'])}"
-#         #             f"_s{int(chunk['start_idx'])}_e{int(chunk['end_idx'])}")
-#         chunk_id = f"vid{int(chunk['vid'])}_clip_{int(chunk['clip'])}_t_{float(chunk['t_center']):.3f}"
-
-#         b_embeddings.append(projected)
-#         b_ids.append(chunk_id)
-#         b_metadatas.append({
-#             "vid_num": int(chunk["vid"]),
-#             "clip_num": int(chunk["clip"]),
-#             "side": str(chunk["side"]),
-#             "label": int(chunk["label"]),
-#             "status_id": int(chunk["status_id"]),
-#             "status": str(chunk["status"]),
-#             "t_center": float(chunk["t_center"]),
-#             "t_width": float(chunk["t_width"]),
-#             "start_idx": int(chunk["start_idx"]),
-#             "end_idx": int(chunk["end_idx"]),
-#             "class_logit": 0.0,
-#         })
-
-#         if len(b_embeddings) >= upsert_size:
-#             collection.upsert(
-#                 embeddings=np.stack(b_embeddings).tolist(),
-#                 ids=b_ids,
-#                 metadatas=b_metadatas,
-#             )
-#             print(f"[rebuild_db] upserted {upsert_size} chunks")
-#             b_embeddings = []
-#             b_ids = []
-#             b_metadatas = []
-
-#     if b_embeddings:
-#         collection.upsert(
-#             embeddings=np.stack(b_embeddings).tolist(),
-#             ids=b_ids,
-#             metadatas=b_metadatas,
-#         )
-
-#     print("[rebuild_db] done")
-
-def rebuild_chromadb(train_chunk_samples, ratt_head, chunk_encoder,
-                     frame_emb_mm, path_to_idx, collection, batch_size=64):
-    print("[rebuild_db] rebuilding ChromaDB with learned query_proj embeddings...")
-    
-    b_embeddings = []
-    b_ids = []
-    b_metadatas = []
-    upsert_size = 512
-
-    # process in batches for speed
-    for batch_start in range(0, len(train_chunk_samples), batch_size):
-        batch = train_chunk_samples[batch_start:batch_start + batch_size]
-        
-        # encode all chunks in batch
-        raw_embs = []
-        for chunk in batch:
-            raw_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-            raw_embs.append(raw_emb)
-        
-        # stack and project all at once
-        raw_embs_tensor = tf.convert_to_tensor(
-            np.stack(raw_embs)[:, None, :], dtype=tf.float32
-        )  # (batch_size, 1, 768)
-        projected_batch = ratt_head.query_proj(
-            raw_embs_tensor, training=False
-        )[:, 0, :].numpy()  # (batch_size, 768)
-
-        for j, chunk in enumerate(batch):
-            # chunk_id = (f"vid{int(chunk['vid'])}_clip_{int(chunk['clip'])}"
-            #            f"_s{int(chunk['start_idx'])}_e{int(chunk['end_idx'])}")
-            chunk_id = f"vid{int(chunk['vid'])}_clip_{int(chunk['clip'])}_t_{float(chunk['t_center']):.3f}"
-            b_embeddings.append(projected_batch[j])
-            b_ids.append(chunk_id)
-            b_metadatas.append({
-                "vid_num": int(chunk["vid"]),
-                "clip_num": int(chunk["clip"]),
-                "side": str(chunk["side"]),
-                "label": int(chunk["label"]),
-                "status_id": int(chunk["status_id"]),
-                "status": str(chunk["status"]),
-                "t_center": float(chunk["t_center"]),
-                "t_width": float(chunk["t_width"]),
-                "start_idx": int(chunk["start_idx"]),
-                "end_idx": int(chunk["end_idx"]),
-                "class_logit": 0.0,
-            })
-
-            if len(b_embeddings) >= upsert_size:
-                collection.upsert(
-                    embeddings=np.stack(b_embeddings).tolist(),
-                    ids=b_ids,
-                    metadatas=b_metadatas,
-                )
-                print(f"[rebuild_db] upserted {upsert_size} chunks")
-                b_embeddings = []
-                b_ids = []
-                b_metadatas = []
-
-        print(f"[rebuild_db] processed {min(batch_start + batch_size, len(train_chunk_samples))}/{len(train_chunk_samples)}")
-
-    if b_embeddings:
-        collection.upsert(
-            embeddings=np.stack(b_embeddings).tolist(),
-            ids=b_ids,
-            metadatas=b_metadatas,
-        )
-
-    print("[rebuild_db] done")
-
-def query_collection_batch(query_embs, collection, n_results, side=None, target_status_ids=None):
-    where_clauses = []
-    if side is not None:
-        where_clauses.append({"side": str(side)})
-    if target_status_ids is not None:
-        target_status_ids = [int(s) for s in target_status_ids]
-        if len(target_status_ids) == 1:
-            where_clauses.append({"status_id": target_status_ids[0]})
-        else:
-            where_clauses.append({"$or": [{"status_id": s} for s in target_status_ids]})
-
-    where = None
-    if len(where_clauses) == 1:
-        where = where_clauses[0]
-    elif len(where_clauses) > 1:
-        where = {"$and": where_clauses}
-
-    query_kwargs = {
-        "query_embeddings": [q.tolist() for q in query_embs],
-        "n_results": n_results,
-        "include": ["embeddings", "metadatas"],
-    }
-    if where is not None:
-        query_kwargs["where"] = where
-
-    results = collection.query(**query_kwargs)
-    batch_out = []
-    for raw_embs, raw_meta in zip(results["embeddings"], results["metadatas"]):
-        out = []
-        for emb, meta in zip(raw_embs, raw_meta):
-            out.append({
-                "emb": np.asarray(emb, dtype=np.float32),
-                "meta": {
-                    "label": int(meta["label"]),
-                    "status": str(meta["status"]),
-                    "status_id": int(meta["status_id"]),
-                    "side": str(meta["side"]),
-                    "vid": int(meta["vid_num"]),
-                    "clip": int(meta["clip_num"]),
-                    "t_center": float(meta["t_center"]),
-                    "t_width": float(meta["t_width"]),
-                    "start_idx": int(meta["start_idx"]),
-                    "end_idx": int(meta["end_idx"]),
-                    "class_logit": float(meta["class_logit"]),
-                },
-            })
-        batch_out.append(out)
-    return batch_out
-
-
-# ─────────────────────────────────────────────
-# Curriculum — always unrestricted
-# ─────────────────────────────────────────────
-
-def get_branch_mix_counts(epoch_idx, k, training):
-    """Always fully unrestricted — no oracle filtering."""
-    return k, 0, True
-
-
-# ─────────────────────────────────────────────
-# Entry assembly — always unrestricted
-# ─────────────────────────────────────────────
-
-# def assemble_live_entry_from_candidates(
-#     query_emb,
-#     future_emb,
-#     query_meta,
-#     future_meta,
-#     unrestricted_candidates,
-#     temporal_candidates,
-#     k_sim,
-#     k_contrast,
-#     k_temporal,
-# ):
-#     emb_dim = query_emb.shape[0]
-#     pad_meta_template = {
-#         "label": -1, "side": "PAD", "status": "PAD", "status_id": -1,
-#         "vid": -1, "clip": -1, "t_center": -1.0, "t_width": -1.0,
-#         "start_idx": -1, "end_idx": -1,
-#     }
-
-#     unrestricted_candidates = dedup_and_remove_self(unrestricted_candidates or [], query_meta)
-#     temporal_candidates = dedup_and_remove_self(temporal_candidates or [], query_meta)
-
-#     q_status = int(query_meta["status_id"])
-#     other_statuses = [s for s in (0, 1, 2) if s != q_status]
-#     other_a, other_b = other_statuses[0], other_statuses[1]
-
-#     unrestricted_diff_a = [c for c in unrestricted_candidates if int(c["meta"]["status_id"]) == other_a]
-#     unrestricted_diff_b = [c for c in unrestricted_candidates if int(c["meta"]["status_id"]) == other_b]
-#     unrestricted_diff_balanced = interleave_lists(
-#         unrestricted_diff_a, unrestricted_diff_b,
-#         n_total=len(unrestricted_diff_a) + len(unrestricted_diff_b),
-#     )
-
-#     # support — unrestricted (mixed class), model learns to identify relevant tokens
-#     sim_items = take_unique(unrestricted_candidates, k_sim)
-#     sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
-
-#     # contrast — prefer different-class tokens first, fall back to any unrestricted
-#     contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
-#     if len(contrast_items) < k_contrast:
-#         used = {dedup_signature(x["meta"]) for x in contrast_items}
-#         for cand in unrestricted_candidates:
-#             sig = dedup_signature(cand["meta"])
-#             if sig in used:
-#                 continue
-#             contrast_items.append(cand)
-#             used.add(sig)
-#             if len(contrast_items) >= k_contrast:
-#                 break
-#     contrast_embs, contrast_meta = pad_or_trim(contrast_items, k_contrast, emb_dim, pad_meta_template)
-
-#     # temporal — always unrestricted future-embedding retrieval
-#     temporal_items = take_unique(temporal_candidates, k_temporal)
-#     temporal_embs, temporal_meta = pad_or_trim(temporal_items, k_temporal, emb_dim, pad_meta_template)
-
-#     return {
-#         "query_emb": query_emb,
-#         "sim_embs": sim_embs,
-#         "contrast_embs": contrast_embs,
-#         "temporal_embs": temporal_embs,
-#         "query_meta": query_meta,
-#         "future_meta": future_meta,
-#         "sim_meta": sim_meta,
-#         "contrast_meta": contrast_meta,
-#         "temporal_meta": temporal_meta,
-#     }
-
-def undersample_and_oversample(chunk_samples, target_ratio=0.3):
-    """
-    Undersample nonevents and oversample events to reach target_ratio.
-    target_ratio: desired fraction of nonevents in final dataset
-    e.g. 0.3 means nonevents are 30% of total, events are 70%
-    """
-    nonevents = [c for c in chunk_samples if int(c["status_id"]) == 0]
-    makes = [c for c in chunk_samples if int(c["status_id"]) == 1]
-    misses = [c for c in chunk_samples if int(c["status_id"]) == 2]
-    
-    n_events = len(makes) + len(misses)
-    
-    # how many nonevents to keep given target ratio
-    # n_nonevent / (n_nonevent + n_events) = target_ratio
-    # n_nonevent = target_ratio * n_events / (1 - target_ratio)
-    n_nonevent_target = int(target_ratio * n_events / (1 - target_ratio))
-    n_nonevent_target = min(n_nonevent_target, len(nonevents))
-    
-    # undersample nonevents
-    nonevents_sampled = random.sample(nonevents, n_nonevent_target)
-    
-    # oversample events to equal count
-    n_event_target = max(len(makes), len(misses))
-    makes_oversampled = random.choices(makes, k=n_event_target)
-    misses_oversampled = random.choices(misses, k=n_event_target)
-    
-    result = nonevents_sampled + makes_oversampled + misses_oversampled
-    random.shuffle(result)
-    
-    counts = {0: len(nonevents_sampled), 1: len(makes_oversampled), 2: len(misses_oversampled)}
-    print(f"after undersample+oversample: {counts}")
-    return result
-
-def assemble_live_entry_from_candidates(
-    query_emb,
-    future_emb,
-    query_meta,
-    future_meta,
-    unrestricted_candidates,
-    temporal_candidates,
+def build_live_entry(
+    chunk,
+    future_chunk,
+    collection,
+    chunk_encoder,
+    frame_emb_mm,
+    path_to_idx,
+    search_k_content,
+    search_k_temporal,
     k_sim,
     k_contrast,
     k_temporal,
 ):
+    query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+    future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
+
+    query_meta = extract_meta(chunk)
+    future_meta = extract_meta(future_chunk)
+
     emb_dim = query_emb.shape[0]
+
     pad_meta_template = {
-        "label": -1, "side": "PAD", "status": "PAD", "status_id": -1,
-        "vid": -1, "clip": -1, "t_center": -1.0, "t_width": -1.0,
-        "start_idx": -1, "end_idx": -1,
+        "label": -1,
+        "side": "PAD",
+        "vid": -1,
+        "clip": -1,
+        "t_center": -1.0,
+        "t_width": -1.0,
+        "start_idx": -1,
+        "end_idx": -1,
     }
 
-    unrestricted_candidates = dedup_and_remove_self(unrestricted_candidates or [], query_meta)
-    temporal_candidates = dedup_and_remove_self(temporal_candidates or [], query_meta)
+    # -------------------------
+    # content retrieval: sim + contrast
+    # -------------------------
+    content_candidates = query_collection(query_emb, collection, search_k_content)
 
-    q_status = int(query_meta["status_id"])
-    other_statuses = [s for s in (0, 1, 2) if s != q_status]
-    other_a, other_b = other_statuses[0], other_statuses[1]
+    sim_items = []
+    contrast_items = []
+    used_content = set()
 
-    unrestricted_diff_a = [c for c in unrestricted_candidates if int(c["meta"]["status_id"]) == other_a]
-    unrestricted_diff_b = [c for c in unrestricted_candidates if int(c["meta"]["status_id"]) == other_b]
-    unrestricted_diff_balanced = interleave_lists(
-        unrestricted_diff_a, unrestricted_diff_b,
-        n_total=len(unrestricted_diff_a) + len(unrestricted_diff_b),
+    for cand in content_candidates:
+        cand_meta = cand["meta"]
+        sig = dedup_signature(cand_meta)
+
+        if same_chunk_meta(query_meta, cand_meta):
+            continue
+        if cand_meta["side"] != query_meta["side"]:
+            continue
+
+        if (
+            cand_meta["label"] == query_meta["label"]
+            and sig not in used_content
+            and len(sim_items) < k_sim
+        ):
+            sim_items.append(cand)
+            used_content.add(sig)
+            continue
+
+        if (
+            cand_meta["label"] != query_meta["label"]
+            and sig not in used_content
+            and len(contrast_items) < k_contrast
+        ):
+            contrast_items.append(cand)
+            used_content.add(sig)
+            continue
+
+        if len(sim_items) >= k_sim and len(contrast_items) >= k_contrast:
+            break
+
+    sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+    contrast_embs, contrast_meta = pad_or_trim(
+        contrast_items, k_contrast, emb_dim, pad_meta_template
     )
 
-    # support — unrestricted (mixed class), model learns to identify relevant tokens
-    sim_items = take_unique(unrestricted_candidates, k_sim)
-    sim_embs, sim_meta = pad_or_trim(sim_items, k_sim, emb_dim, pad_meta_template)
+    # -------------------------
+    # temporal retrieval
+    # -------------------------
+    temporal_candidates = query_collection(future_emb, collection, search_k_temporal)
 
-    # # contrast — strategy depends on query class
-    # if q_status == 0:
-    #     # nonevent query — contrast must be events only (makes and misses)
-    #     # prevents contrast pool being filled with same-class nonevents
-    #     event_candidates = [c for c in unrestricted_candidates
-    #                        if int(c["meta"]["status_id"]) in (1, 2)]
-    #     contrast_items = take_unique(event_candidates, k_contrast)
-    #     # pad with remaining unrestricted if not enough events found
-    #     if len(contrast_items) < k_contrast:
-    #         used = {dedup_signature(x["meta"]) for x in contrast_items}
-    #         for cand in unrestricted_candidates:
-    #             sig = dedup_signature(cand["meta"])
-    #             if sig in used:
-    #                 continue
-    #             contrast_items.append(cand)
-    #             used.add(sig)
-    #             if len(contrast_items) >= k_contrast:
-    #                 break
-    # else:
-    #     # event query (make or miss) — contrast with different-class tokens
-    #     # prefer balanced mix of the other two classes
-    contrast_items = take_unique(unrestricted_diff_balanced, k_contrast)
-    if len(contrast_items) < k_contrast:
-        used = {dedup_signature(x["meta"]) for x in contrast_items}
-        for cand in unrestricted_candidates:
-            sig = dedup_signature(cand["meta"])
-            if sig in used:
-                continue
-            contrast_items.append(cand)
-            used.add(sig)
-            if len(contrast_items) >= k_contrast:
-                break
+    temporal_items = []
+    seen_temporal = set()
 
-    contrast_embs, contrast_meta = pad_or_trim(contrast_items, k_contrast, emb_dim, pad_meta_template)
+    for cand in temporal_candidates:
+        cand_meta = cand["meta"]
+        sig = dedup_signature(cand_meta)
 
-    # temporal — always unrestricted future-embedding retrieval
-    temporal_items = take_unique(temporal_candidates, k_temporal)
-    temporal_embs, temporal_meta = pad_or_trim(temporal_items, k_temporal, emb_dim, pad_meta_template)
+        if same_chunk_meta(query_meta, cand_meta):
+            continue
+
+        # optional: skip exact future anchor too
+        # if same_chunk_meta(future_meta, cand_meta):
+        #     continue
+
+        if cand_meta["side"] != query_meta["side"]:
+            continue
+        if sig in seen_temporal:
+            continue
+
+        temporal_items.append(cand)
+        seen_temporal.add(sig)
+
+        if len(temporal_items) >= k_temporal:
+            break
+
+    temporal_embs, temporal_meta = pad_or_trim(
+        temporal_items, k_temporal, emb_dim, pad_meta_template
+    )
 
     return {
         "query_emb": query_emb,
@@ -632,412 +388,453 @@ def assemble_live_entry_from_candidates(
         "temporal_meta": temporal_meta,
     }
 
-# ─────────────────────────────────────────────
-# Live batch fetching
-# ─────────────────────────────────────────────
+def encode_chunk(chunk, chunk_encoder, frame_emb_mm,path_to_idx):
+    # pprint.pprint(chunk)
+    idxs = [path_to_idx[p] for p in chunk["frames"]]          # length T
+    frame_embs = frame_emb_mm[idxs].astype(np.float32)        # (T, 768)
+    frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)  # (1, T, 768)
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
+    stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)  # (1, 768)
+    return stage1_chunk_emb[0].numpy().astype(np.float32)
 
-CHROMA_SUBBATCH_SIZE = 8
+def pad_or_trim(items, k, emb_dim, pad_meta_template):
+    """
+    items: list of {"emb": ..., "meta": ...}
+    returns (embs, metas)
+    """
+    if len(items) >= k:
+        items = items[:k]
+    else:
+        pad_count = k - len(items)
+        zero_emb = np.zeros((emb_dim,), dtype=np.float32)
+        for _ in range(pad_count):
+            items.append(
+                {
+                    "emb": zero_emb.copy(),
+                    "meta": dict(pad_meta_template),
+                }
+            )
 
+    embs = np.stack([x["emb"] for x in items], axis=0)
+    metas = [x["meta"] for x in items]
+    return embs, metas
 
-def fetch_live_batch(
-    metadata,
-    chunk_lookup,
-    future_key_lookup,
+def build_retrieval_cache(
+    all_chunks,
     collection,
     chunk_encoder,
     frame_emb_mm,
-    path_to_idx,
-    ratt_head=None,
-    use_projected_retrieval=False,
-    training=False,
-    epoch_idx=None,
+    frame_paths,
+    path_to_idx
 ):
-    batch_size = metadata["vid"].shape[0]
-
-    batch_query_meta = []
-    batch_future_meta = []
-    batch_query_embs_np = []
-    batch_query_embs_retrieval = [] # projected — for ChromaDB search
-    batch_future_embs_np = []
-
-    for i in range(batch_size):
-        key = make_chunk_key_from_meta(metadata, i)
-        chunk = chunk_lookup[key]
-        future_chunk = chunk_lookup[future_key_lookup[key]]
-
-        query_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-        future_emb = encode_chunk(future_chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-
-        batch_query_meta.append(extract_meta(chunk))
-        batch_future_meta.append(extract_meta(future_chunk))
-        batch_query_embs_np.append(query_emb)
-
-        # project query for retrieval if ratt_head available
-        if ratt_head is not None and use_projected_retrieval==True:
-            raw_tensor = tf.convert_to_tensor(query_emb[None, None, :], dtype=tf.float32)
-            projected = ratt_head.query_proj(raw_tensor, training=False)[0, 0].numpy()
-            batch_query_embs_retrieval.append(projected)
-        else:
-            batch_query_embs_retrieval.append(query_emb)  # fallback to raw
-
-        batch_future_embs_np.append(future_emb)
-        # batch_future_embs_np.append(future_emb)
-
-    search_k = config.SEARCH_K_CONTENT
-
-    def _query_subbatch(query_type, start, embs, n_results):
-        tid = threading.get_ident()
-        t0 = time.time()
-        results = query_collection_batch(
-            query_embs=embs,
-            collection=collection,
-            n_results=n_results,
-        )
-        elapsed = time.time() - t0
-        print(f"  [thread {tid}] {query_type} subbatch {start}..{start+len(embs)-1} ({elapsed:.2f}s)")
-        return results
-
-    def _query_parallel(query_type, all_embs, n_results):
-        subbatches = []
-        for start in range(0, len(all_embs), CHROMA_SUBBATCH_SIZE):
-            end = min(start + CHROMA_SUBBATCH_SIZE, len(all_embs))
-            subbatches.append((start, all_embs[start:end]))
-
-        results = [None] * len(all_embs)
-        with ThreadPoolExecutor(max_workers=len(subbatches)) as executor:
-            future_to_start = {
-                executor.submit(_query_subbatch, query_type, start, sub_embs, n_results): start
-                for start, sub_embs in subbatches
-            }
-            for future in as_completed(future_to_start):
-                start = future_to_start[future]
-                sub_results = future.result()
-                for j, res in enumerate(sub_results):
-                    results[start + j] = res
-        return results
-
-    print("[fetch_live_batch] launching content + temporal outer threads")
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        # content_future = executor.submit(_query_parallel, "content", batch_query_embs_np, search_k)
-        # temporal_future = executor.submit(_query_parallel, "temporal", batch_future_embs_np, config.SEARCH_K_TEMPORAL)
-        content_future = executor.submit(
-            _query_parallel, "content",
-            batch_query_embs_retrieval,  # projected embeddings for search
-            search_k
-        )
-        temporal_future = executor.submit(
-            _query_parallel, "temporal",
-            batch_future_embs_np,        # future embeddings still raw
-            config.SEARCH_K_TEMPORAL
-        )
-        content_all = content_future.result()
-        temporal_all = temporal_future.result()
-    print(f"[fetch_live_batch] both outer threads done ({time.time() - t0:.2f}s)")
-
-    query_embs_out = []
-    support_tokens = []
-    contrast_tokens = []
-    temporal_tokens = []
-    sim_metas = []
-    contrast_metas = []
-    temporal_metas = []
-
-    for i in range(batch_size):
-        entry = assemble_live_entry_from_candidates(
-            query_emb=batch_query_embs_np[i],
-            future_emb=batch_future_embs_np[i],
-            query_meta=batch_query_meta[i],
-            future_meta=batch_future_meta[i],
-            unrestricted_candidates=content_all[i],
-            temporal_candidates=temporal_all[i],
-            k_sim=config.K_SIM,
-            k_contrast=config.K_CONTRAST,
-            k_temporal=config.K_TEMPORAL,
-        )
-
-        query_embs_out.append(entry["query_emb"])
-        support_tokens.append(entry["sim_embs"])
-        contrast_tokens.append(entry["contrast_embs"])
-        temporal_tokens.append(entry["temporal_embs"])
-        sim_metas.append(entry["sim_meta"])
-        contrast_metas.append(entry["contrast_meta"])
-        temporal_metas.append(entry["temporal_meta"])
-
-    query_embs_out = tf.convert_to_tensor(np.stack(query_embs_out, axis=0), dtype=tf.float32)
-    support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32)
-    contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32)
-    temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32)
-
-    support_mask = make_padding_mask(support_tokens)
-    contrast_mask = make_padding_mask(contrast_tokens)
-    temporal_mask = make_padding_mask(temporal_tokens)
-
-    return (
-        query_embs_out,
-        support_tokens, contrast_tokens, temporal_tokens,
-        support_mask, contrast_mask, temporal_mask,
-        sim_metas, contrast_metas, temporal_metas
-    )
-
-
-# ─────────────────────────────────────────────
-# Loss functions
-# ─────────────────────────────────────────────
-
-scce_no_reduce = tf_keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction="none")
-
-# grads = tape.gradient(loss, ratt_head.trainable_variables)
-# grads, global_norm = tf.clip_by_global_norm(grads, clip_norm=1.0)
-# optimizer.apply_gradients(zip(grads, ratt_head.trainable_variables))
-# print(f"global_norm={float(global_norm):.4f}")
-
-def weighted_scce_loss(labels, logits, class_weights):
-    per_example_loss = scce_no_reduce(labels, logits)
-    weights = tf.gather(class_weights, tf.cast(labels, tf.int32))
-    return tf.reduce_mean(per_example_loss * weights)
-
-# job 2089 loss but margin = 0.5
-def attention_token_consistency_loss(cls_attn, sim_meta, contrast_meta, query_labels, Ks, Kc, margin=0.2):
-    """
-    Ranking loss on normalized within-branch attention.
-    Support: same-class tokens should get higher attention than different-class tokens.
-    Contrast: different-class tokens should get higher attention than same-class tokens.
-    """
-    # support_attn = cls_attn[:, 2:2+Ks]
-    # contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc]
-    support_attn = cls_attn[:, 1:1+Ks]      # was 2:2+Ks
-    contrast_attn = cls_attn[:, 1+Ks:1+Ks+Kc]  # was 3+Ks:3+Ks+Kc
-
-    # normalize within branch
-    support_attn_norm = support_attn / (tf.reduce_sum(support_attn, axis=1, keepdims=True) + 1e-8)
-    contrast_attn_norm = contrast_attn / (tf.reduce_sum(contrast_attn, axis=1, keepdims=True) + 1e-8)
-
-    support_labels = tf.constant(
-        [[m["status_id"] for m in row] for row in sim_meta], dtype=tf.int32
-    )
-    contrast_labels = tf.constant(
-        [[m["status_id"] for m in row] for row in contrast_meta], dtype=tf.int32
-    )
-
-    query_labels_exp = tf.expand_dims(query_labels, axis=1)
-
-    support_match = tf.cast(tf.equal(support_labels, query_labels_exp), tf.float32)
-    support_valid = tf.cast(tf.not_equal(support_labels, -1), tf.float32)
-    contrast_mismatch = tf.cast(tf.not_equal(contrast_labels, query_labels_exp), tf.float32)
-    contrast_valid = tf.cast(tf.not_equal(contrast_labels, -1), tf.float32)
-
-    n_sup_match    = tf.reduce_sum(support_match * support_valid, axis=1) + 1e-8
-    n_sup_mismatch = tf.reduce_sum((1 - support_match) * support_valid, axis=1) + 1e-8
-    n_con_mismatch = tf.reduce_sum(contrast_mismatch * contrast_valid, axis=1) + 1e-8
-    n_con_match    = tf.reduce_sum((1 - contrast_mismatch) * contrast_valid, axis=1) + 1e-8
-
-    sup_match_attn    = tf.reduce_sum(support_attn_norm * support_match * support_valid, axis=1) / n_sup_match
-    sup_mismatch_attn = tf.reduce_sum(support_attn_norm * (1 - support_match) * support_valid, axis=1) / n_sup_mismatch
-    con_mismatch_attn = tf.reduce_sum(contrast_attn_norm * contrast_mismatch * contrast_valid, axis=1) / n_con_mismatch
-    con_match_attn    = tf.reduce_sum(contrast_attn_norm * (1 - contrast_mismatch) * contrast_valid, axis=1) / n_con_match
-
-    support_loss  = tf.reduce_mean(tf.maximum(0.0, sup_mismatch_attn - sup_match_attn + margin))
-    contrast_loss = tf.reduce_mean(tf.maximum(0.0, con_match_attn - con_mismatch_attn + margin))
-
-    tf.print("sup_match_attn:", sup_match_attn[:5])
-    tf.print("sup_mismatch_attn:", sup_mismatch_attn[:5])
-    tf.print("support_loss per example:", tf.maximum(0.0, sup_mismatch_attn - sup_match_attn + margin)[:5])
     
-    for i in range(min(3, len(sim_meta))):
-        query_label = query_labels[i].numpy()
-        sup_labels_i = [m["status_id"] for m in sim_meta[i]]
-        sup_attn_i = support_attn_norm[i].numpy()
-        
-        # pair labels with attention weights and sort by attention (highest first)
-        pairs = sorted(zip(sup_labels_i, sup_attn_i), key=lambda x: -x[1])
-        
-        print(f"\n[example {i}] query_label={query_label}")
-        print(f"  top 10 support tokens by attention (label, attn):")
-        for lbl, attn in pairs[:10]:
-            match = "✓" if lbl == query_label else "✗" if lbl != -1 else "PAD"
-            print(f"    label={lbl} attn={attn:.4f} {match}")
-    return support_loss + contrast_loss
 
+    # def encode_chunk(chunk):
+    #     """
+    #     Assumes chunk_encoder(chunk) returns a 1D embedding-like object.
+    #     Adjust this wrapper if your chunk_encoder expects a different input format.
+    #     """
 
-# in attention_token_consistency_loss or a separate diagnostic function
-def visualize_full_attention(cls_attn, sim_meta, contrast_meta, temporal_meta, 
-                              query_labels, Ks, Kc, Kt, n_examples=3):
-    # indices — adjust for your sequence layout
-    # [cls, sup_summary, support x Ks, con_summary, contrast x Kc, tmp_summary, temporal x Kt, local]
-    # support_attn = cls_attn[:, 2:2+Ks].numpy()
-    # contrast_attn = cls_attn[:, 3+Ks:3+Ks+Kc].numpy()
-    # temporal_attn = cls_attn[:, 4+Ks+Kc:4+Ks+Kc+Kt].numpy()
+    #     frames = []
+    #     for fp in chunk["frames"]:
+    #         img = tf.keras.utils.load_img(fp, target_size=(224, 224))
+    #         img = tf.keras.utils.img_to_array(img)
+    #         frames.append(img)
 
-    support_attn = cls_attn[:, 1:1+Ks].numpy()
-    contrast_attn = cls_attn[:, 1+Ks:1+Ks+Kc].numpy()
-    temporal_attn = cls_attn[:, 1+Ks+Kc:1+Ks+Kc+Kt].numpy()
+    #     frames = np.stack(frames, axis=0)  # (T, H, W, 3)
 
-    for i in range(min(n_examples, len(sim_meta))):
-        query_label = query_labels[i].numpy()
-        
-        # build unified token list with branch label
-        tokens = []
-        for j, (meta, attn) in enumerate(zip(sim_meta[i], support_attn[i])):
-            tokens.append({
-                "branch": "sup",
-                "label": meta["status_id"],
-                "attn": attn,
-                "match": meta["status_id"] == query_label,
-            })
-        for j, (meta, attn) in enumerate(zip(contrast_meta[i], contrast_attn[i])):
-            tokens.append({
-                "branch": "con",
-                "label": meta["status_id"],
-                "attn": attn,
-                "match": meta["status_id"] == query_label,
-            })
-        for j, (meta, attn) in enumerate(zip(temporal_meta[i], temporal_attn[i])):
-            tokens.append({
-                "branch": "tmp",
-                "label": meta["status_id"],
-                "attn": attn,
-                "match": meta["status_id"] == query_label,
-            })
+    #     frame_embs = hf_vit_embed_batch(frames)  # (T, 768)
+    #     frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)  # (1, T, 768)
 
-        # sort by attention descending
-        tokens = sorted(tokens, key=lambda x: -x["attn"])
+    #     stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)  # (1, 768)
 
-        print(f"\n[example {i}] query_label={query_label}")
-        for t in tokens[:15]:  # top 15 across all branches
-            match_str = "✓" if t["match"] else "✗" if t["label"] != -1 else "PAD"
-            print(f"  branch={t['branch']} label={t['label']} attn={t['attn']:.4f} {match_str}")
+    #     out = stage1_chunk_emb[0].numpy()
 
-# def attention_token_consistency_loss(cls_attn, sim_meta, contrast_meta, query_labels, Ks, Kc):
-#     support_attn = cls_attn[:, 1:1+Ks]
-#     contrast_attn = cls_attn[:, 1+Ks:1+Ks+Kc]
+    #     return out.astype(np.float32)
+    
 
-#     support_labels = tf.constant(
-#         [[m["status_id"] for m in row] for row in sim_meta], dtype=tf.int32
-#     )
-#     contrast_labels = tf.constant(
-#         [[m["status_id"] for m in row] for row in contrast_meta], dtype=tf.int32
-#     )
+    # -----------------------------
+    # precompute query embeddings
+    # -----------------------------
+    print("[CACHE] Encoding all chunk embeddings...")
+    chunk_emb_lookup = {}
+    meta_lookup = {}
+    key_to_chunk = {}
 
-#     query_labels_exp = tf.expand_dims(query_labels, axis=1)
+    for i, chunk in enumerate(all_chunks):
+        # print(chunk)
+        key = make_chunk_key(chunk)
+        chunk_emb_lookup[key] = encode_chunk(chunk, chunk_encoder, frame_emb_mm,path_to_idx)
+        meta_lookup[key] = extract_meta(chunk)
+        key_to_chunk[key] = chunk
 
-#     support_match = tf.cast(tf.equal(support_labels, query_labels_exp), tf.float32)
-#     support_valid = tf.cast(tf.not_equal(support_labels, -1), tf.float32)
-#     contrast_mismatch = tf.cast(tf.not_equal(contrast_labels, query_labels_exp), tf.float32)
-#     contrast_valid = tf.cast(tf.not_equal(contrast_labels, -1), tf.float32)
+        if (i + 1) % 25 == 0 or (i + 1) == len(all_chunks):
+            print(f"[CACHE] encoded {i+1}/{len(all_chunks)}")
+    # save_encoded_embeddings()
+    # infer embedding dim
+    first_key = next(iter(chunk_emb_lookup))
+    emb_dim = chunk_emb_lookup[first_key].shape[0]
 
-#     support_valid_attn = support_attn * support_valid + 1e-9
-#     support_attn_norm = support_valid_attn / (tf.reduce_sum(support_valid_attn, axis=1, keepdims=True))
+    # -----------------------------
+    # build next-chunk lookup within each (vid, clip)
+    # -----------------------------
+    grouped = defaultdict(list)
+    for chunk in all_chunks:
+        grouped[(int(chunk["vid"]), int(chunk["clip"]))].append(chunk)
 
-#     match_prob = tf.reduce_sum(support_attn_norm * support_match, axis=1)
+    # next_key_lookup = {}
+    # for (_, _), group in grouped.items():
+    #     group_sorted = sorted(group, key=lambda c: int(c["start_idx"]))
+    #     for idx, chunk in enumerate(group_sorted):
+    #         cur_key = make_chunk_key(chunk)
+    #         if idx < len(group_sorted) - 1:
+    #             nxt_key = make_chunk_key(group_sorted[idx + 1])
+    #             next_key_lookup[cur_key] = nxt_key
+    #         else:
+    #             next_key_lookup[cur_key] = None
 
-#     has_mismatch = tf.cast(
-#         tf.reduce_sum((1 - support_match) * support_valid, axis=1) > 0, tf.float32
-#     )
+    future_key_lookup = {}
 
-#     support_loss = -tf.reduce_sum(
-#         has_mismatch * tf.math.log(match_prob + 1e-8)
-#     ) / (tf.reduce_sum(has_mismatch) + 1e-8)
+    for (_, _), group in grouped.items():
+        group_sorted = sorted(group, key=lambda c: int(c["start_idx"]))
 
-#     contrast_valid_attn = contrast_attn * contrast_valid + 1e-9
-#     contrast_attn_norm = contrast_valid_attn / (tf.reduce_sum(contrast_valid_attn, axis=1, keepdims=True))
+        for idx, chunk in enumerate(group_sorted):
+            cur_key = make_chunk_key(chunk)
 
-#     mismatch_prob = tf.reduce_sum(contrast_attn_norm * contrast_mismatch, axis=1)
+            future_idx = min(idx + config.FUTURE_CHUNK_STEP, len(group_sorted) - 1)
+            future_key = make_chunk_key(group_sorted[future_idx])
 
-#     has_match_in_contrast = tf.cast(
-#         tf.reduce_sum((1 - contrast_mismatch) * contrast_valid, axis=1) > 0, tf.float32
-#     )
+            future_key_lookup[cur_key] = future_key
 
-#     contrast_loss = -tf.reduce_sum(
-#         has_match_in_contrast * tf.math.log(mismatch_prob + 1e-8)
-#     ) / (tf.reduce_sum(has_match_in_contrast) + 1e-8)
+    # -----------------------------
+    # build cache
+    # -----------------------------
 
-#     tf.print("match_prob:", match_prob[:5])
-#     tf.print("mismatch_prob:", mismatch_prob[:5])
+    # print("[CACHE] Building retrieval cache...")
+    # cache = {}
 
-#     # top attended tokens visualization for first 3 examples
-#     support_attn_norm_np = support_attn_norm.numpy()
+    # pad_meta_template = {
+    #     "label": -1,
+    #     "side": "PAD",
+    #     "vid": -1,
+    #     "clip": -1,
+    #     "t_center": -1.0,
+    #     "t_width": -1.0,
+    #     "start_idx": -1,
+    #     "end_idx": -1,
+    # }
 
-#     # visualize_full_attention()
-#     # for i in range(min(3, len(sim_meta))):
-#     #     query_label = query_labels[i].numpy()
-#     #     sup_labels_i = [m["status_id"] for m in sim_meta[i]]
-#     #     sup_attn_i = support_attn_norm_np[i]
-#     #     pairs = sorted(zip(sup_labels_i, sup_attn_i), key=lambda x: -x[1])
-#     #     print(f"\n[example {i}] query_label={query_label}")
-#     #     for lbl, attn in pairs[:10]:
-#     #         match = "✓" if lbl == query_label else "✗" if lbl != -1 else "PAD"
-#     #         print(f"    label={lbl} attn={attn:.4f} {match}")
+    # QUERY_BATCH_SIZE = 16   # try 64 / 128 / 256
 
-#     return support_loss + contrast_loss
+    # for batch_start in range(0, len(all_chunks), QUERY_BATCH_SIZE):
+    #     batch_chunks = all_chunks[batch_start: batch_start + QUERY_BATCH_SIZE]
 
+    #     batch_keys = []
+    #     batch_query_embs = []
+    #     batch_future_embs = []
+    #     batch_query_meta = []
 
-# def attention_token_consistency_loss(cls_attn, sim_meta, query_labels, Ks):
-#     support_attn = cls_attn[:, 2:2+Ks]  # adjust for your sequence layout
+    #     # -------------------------
+    #     # gather this batch's query/future data
+    #     # -------------------------
+    #     for chunk in batch_chunks:
+    #         key = make_chunk_key(chunk)
+    #         query_emb = chunk_emb_lookup[key]
+    #         query_meta = meta_lookup[key]
 
-#     support_labels = tf.constant(
-#         [[m["status_id"] for m in row] for row in sim_meta], dtype=tf.int32
-#     )
-#     query_labels_exp = tf.expand_dims(query_labels, axis=1)
-#     support_match = tf.cast(tf.equal(support_labels, query_labels_exp), tf.float32)
-#     support_valid = tf.cast(tf.not_equal(support_labels, -1), tf.float32)
+    #         next_key = future_key_lookup[key]
+    #         if next_key is None:
+    #             future_emb = np.zeros_like(query_emb)
+    #         else:
+    #             future_emb = chunk_emb_lookup[next_key]
 
-#     support_valid_attn = support_attn * support_valid + 1e-9
-#     support_attn_norm = support_valid_attn / tf.reduce_sum(
-#         support_valid_attn, axis=1, keepdims=True
-#     )
-#     match_prob = tf.reduce_sum(support_attn_norm * support_match, axis=1)
+    #         batch_keys.append(key)
+    #         batch_query_embs.append(query_emb)
+    #         batch_future_embs.append(future_emb)
+    #         batch_query_meta.append(query_meta)
 
-#     has_mismatch = tf.cast(
-#         tf.reduce_sum((1 - support_match) * support_valid, axis=1) > 0, tf.float32
-#     )
+    #     # -------------------------
+    #     # do batched ANN queries
+    #     # -------------------------
+    #     batch_content_candidates = query_collection_batch(
+    #         batch_query_embs, collection, config.SEARCH_K_CONTENT
+    #     )
 
-#     support_loss = -tf.reduce_sum(
-#         has_mismatch * tf.math.log(match_prob + 1e-8)
-#     ) / (tf.reduce_sum(has_mismatch) + 1e-8)
+    #     batch_temporal_candidates = query_collection_batch(
+    #         batch_future_embs, collection, config.SEARCH_K_TEMPORAL
+    #     )
 
-#     tf.print("match_prob:", match_prob[:5])
+    #     # -------------------------
+    #     # per-item filtering / packing
+    #     # -------------------------
+    #     for j, key in enumerate(batch_keys):
+    #         query_emb = batch_query_embs[j]
+    #         future_emb = batch_future_embs[j]
+    #         query_meta = batch_query_meta[j]
 
-#     return support_loss
+    #         # ----- content: sim + contrast
+    #         content_candidates = batch_content_candidates[j]
 
-# ─────────────────────────────────────────────
-# Encoding helpers
-# ─────────────────────────────────────────────
+    #         sim_items = []
+    #         contrast_items = []
+    #         seen_sim = set()
+    #         seen_contrast = set()
 
-def encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx):
-    idxs = [path_to_idx[p] for p in chunk["frames"]]
-    frame_embs = frame_emb_mm[idxs].astype(np.float32)
-    frame_embs = tf.convert_to_tensor(frame_embs[None, :, :], dtype=tf.float32)
-    stage1_chunk_emb, _ = chunk_encoder(frame_embs, training=False)
-    return stage1_chunk_emb[0].numpy().astype(np.float32)
+    #         for cand in content_candidates:
+    #             cand_meta = cand["meta"]
 
+    #             if same_chunk_meta(query_meta, cand_meta):
+    #                 continue
 
-def compute_class_weights(chunk_samples, power=0.7):
-    labels = np.array([int(c["status_id"]) for c in chunk_samples], dtype=np.int32)
-    counts = np.bincount(labels, minlength=3).astype(np.float32)
-    if np.any(counts == 0):
-        raise ValueError(f"Missing class in training data. Counts: {counts}")
-    max_count = counts.max()
-    weights = (max_count / counts) ** power
-    weights = weights / weights[0]
-    print("train class counts:", counts.astype(int).tolist())
-    print("class weights:", weights.tolist())
-    return tf.constant(weights, dtype=tf.float32)
+    #             if cand_meta["side"] != query_meta["side"]:
+    #                 continue
 
+    #             sig = dedup_signature(cand_meta)
 
-def compute_pos_weight(chunk_samples):
-    labels = np.array([int(c["label"]) for c in chunk_samples], dtype=np.int32)
-    num_pos = np.sum(labels == 1)
-    num_neg = np.sum(labels == 0)
-    if num_pos == 0:
-        raise ValueError("No positive examples found.")
-    if num_neg == 0:
-        raise ValueError("No negative examples found.")
-    return float(np.sqrt(num_neg / num_pos))
+    #             if (
+    #                 cand_meta["label"] == query_meta["label"]
+    #                 and sig not in seen_sim
+    #                 and len(sim_items) < config.K_SIM
+    #             ):
+    #                 sim_items.append(cand)
+    #                 seen_sim.add(sig)
 
+    #             if (
+    #                 cand_meta["label"] != query_meta["label"]
+    #                 and sig not in seen_contrast
+    #                 and len(contrast_items) < config.K_CONTRAST
+    #             ):
+    #                 contrast_items.append(cand)
+    #                 seen_contrast.add(sig)
+
+    #             if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
+    #                 break
+
+    #         sim_embs, sim_meta = pad_or_trim(
+    #             sim_items, config.K_SIM, emb_dim, pad_meta_template
+    #         )
+    #         contrast_embs, contrast_meta = pad_or_trim(
+    #             contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
+    #         )
+
+    #         # ----- temporal
+    #         temporal_candidates = batch_temporal_candidates[j]
+
+    #         temporal_items = []
+    #         seen_temporal = set()
+
+    #         for cand in temporal_candidates:
+    #             cand_meta = cand["meta"]
+
+    #             if same_chunk_meta(query_meta, cand_meta):
+    #                 continue
+
+    #             if cand_meta["side"] != query_meta["side"]:
+    #                 continue
+
+    #             sig = dedup_signature(cand_meta)
+    #             if sig in seen_temporal:
+    #                 continue
+
+    #             temporal_items.append(cand)
+    #             seen_temporal.add(sig)
+
+    #             if len(temporal_items) >= config.K_TEMPORAL:
+    #                 break
+
+    #         temporal_embs, temporal_meta = pad_or_trim(
+    #             temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
+    #         )
+
+    #         # ----- save entry
+    #         cache[key] = {
+    #             "query_emb": query_emb,
+    #             "future_emb": future_emb,
+    #             "query_meta": query_meta,
+
+    #             "sim_embs": sim_embs,
+    #             "sim_meta": sim_meta,
+
+    #             "contrast_embs": contrast_embs,
+    #             "contrast_meta": contrast_meta,
+
+    #             "temporal_embs": temporal_embs,
+    #             "temporal_meta": temporal_meta,
+    #         }
+
+    #     built_so_far = min(batch_start + QUERY_BATCH_SIZE, len(all_chunks))
+    #     print(f"[CACHE] built {built_so_far}/{len(all_chunks)}")
+
+    #     if built_so_far % 1000 == 0 or built_so_far == len(all_chunks):
+    #         print("[CACHE] saving cache checkpoint")
+    #         save_retrieval_cache(cache, config.STAGE2_CACHE_PATH)
+    print("[CACHE] Building retrieval cache...")
+    cache = {}
+
+    pad_meta_template = {
+        "label": -1,
+        "side": "PAD",
+        "vid": -1,
+        "clip": -1,
+        "t_center": -1.0,
+        "t_width": -1.0,
+        "start_idx": -1,
+        "end_idx": -1,
+    }
+
+    for i, chunk in enumerate(all_chunks):
+        key = make_chunk_key(chunk)
+        query_emb = chunk_emb_lookup[key]
+        query_meta = meta_lookup[key]
+
+        # -------------------------
+        # future_emb = literal next chunk in same (vid, clip)
+        # -------------------------
+        next_key = future_key_lookup[key]
+        if next_key is None:
+            future_emb = np.zeros_like(query_emb)
+        else:
+            future_emb = chunk_emb_lookup[next_key]
+
+        # -------------------------
+        # content query: sim + contrast
+        # -------------------------
+        content_candidates = query_collection(query_emb, collection, config.SEARCH_K_CONTENT)
+
+        sim_items = []
+        contrast_items = []
+
+        seen_sim = set()
+        seen_contrast = set()
+
+        for cand in content_candidates:
+            cand_meta = cand["meta"]
+
+            # skip exact self
+            if same_chunk_meta(query_meta, cand_meta):
+                continue
+
+            # same side only
+            if cand_meta["side"] != query_meta["side"]:
+                continue
+            
+            sig = dedup_signature(cand_meta)
+
+            # SIM
+            if (
+                cand_meta['label'] == query_meta['label']
+                and sig not in seen_sim 
+                and len(sim_items) < config.K_SIM
+                ):
+                sim_items.append(cand)
+                seen_sim.add(sig)
+
+            # CONTRAST
+            if (
+                cand_meta["label"] != query_meta["label"]
+                and sig not in seen_contrast
+                and len(contrast_items) < config.K_CONTRAST
+            ):
+                contrast_items.append(cand)
+                seen_contrast.add(sig)
+
+            if len(sim_items) >= config.K_SIM and len(contrast_items) >= config.K_CONTRAST:
+                break
+
+        sim_embs, sim_meta = pad_or_trim(sim_items, config.K_SIM, emb_dim, pad_meta_template)
+        contrast_embs, contrast_meta = pad_or_trim(
+            contrast_items, config.K_CONTRAST, emb_dim, pad_meta_template
+        )
+
+        # -------------------------
+        # temporal query: use future_emb
+        # -------------------------
+        temporal_candidates = query_collection(future_emb, collection, config.SEARCH_K_TEMPORAL)
+
+        temporal_items = []
+        seen_temporal = set()
+
+        for cand in temporal_candidates:
+            cand_meta = cand["meta"]
+
+            # skip exact self
+            if same_chunk_meta(query_meta, cand_meta):
+                continue
+
+            # same side only
+            if cand_meta["side"] != query_meta["side"]:
+                continue
+
+            sig = dedup_signature(cand_meta)
+            if sig in seen_temporal:
+                continue
+
+            temporal_items.append(cand)
+            seen_temporal.add(sig)
+
+            if len(temporal_items) >= config.K_TEMPORAL:
+                break
+
+        temporal_embs, temporal_meta = pad_or_trim(
+            temporal_items, config.K_TEMPORAL, emb_dim, pad_meta_template
+        )
+
+        # -------------------------
+        # save entry
+        # -------------------------
+        cache[key] = {
+            "query_emb": query_emb,
+            "future_emb": future_emb,
+            "query_meta": query_meta,
+
+            "sim_embs": sim_embs,
+            "sim_meta": sim_meta,
+
+            "contrast_embs": contrast_embs,
+            "contrast_meta": contrast_meta,
+
+            "temporal_embs": temporal_embs,
+            "temporal_meta": temporal_meta,
+        }
+
+        if (i + 1) % 10 == 0 or (i + 1) == len(all_chunks):
+            print(f"[CACHE] built {i+1}/{len(all_chunks)}")
+        if (i + 1) % 100 == 0:
+            print(f"[CACHE] saving cache checkpoint")
+            save_retrieval_cache(cache,config.STAGE2_CACHE_PATH)
+    return cache
+
+def save_retrieval_cache(cache, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[CACHE] Saved retrieval cache to {path}")
+
+def load_retrieval_cache(path):
+    with open(path, "rb") as f:
+        cache = pickle.load(f)
+    print(f"[CACHE] Loaded retrieval cache from {path}")
+    return cache    
+
+def print_random_cache_queries():
+    r_inds = [random.randint(1,len(cache.keys())) for i in range(10)]
+    for ind in r_inds: 
+        entry = cache[list(cache.keys())[ind]]
+        print('-----------------')
+        print("QUERY")
+        print(entry["query_meta"])
+
+        print("\nSIM")
+        for m in entry["sim_meta"][:5]:
+            print(m)
+
+        print("\nCONTRAST")
+        for m in entry["contrast_meta"][:5]:
+            print(m)
+
+        print("\nTEMPORAL")
+        for m in entry["temporal_meta"][:5]:
+            print(m)
 
 def _to_py_scalar(x):
     if hasattr(x, "numpy"):
@@ -1051,107 +848,161 @@ def _to_py_scalar(x):
         x = x.decode("utf-8")
     return x
 
-
 def make_chunk_key_from_meta(metadata, i, precision=6):
     vid = _to_py_scalar(metadata["vid"][i])
     side = _to_py_scalar(metadata["side"][i])
     clip = _to_py_scalar(metadata["clip"][i])
+    t_center = _to_py_scalar(metadata["t_center"][i])
     start_idx = _to_py_scalar(metadata["start_idx"][i])
     end_idx = _to_py_scalar(metadata["end_idx"][i])
-    return (int(vid), str(side), int(clip), int(start_idx), int(end_idx))
 
+    return (
+        int(vid),
+        str(side),
+        int(clip),
+        # round(float(t_center), precision),
+        int(start_idx),
+        int(end_idx),
+    )
 
-# def verify_rebuild(train_chunk_samples, ratt_head, chunk_encoder,
-#                    frame_emb_mm, path_to_idx, collection, n_check=5):
-#     """Check a few event chunks to see if retrieval changed after rebuild."""
-    
-#     # find a few event chunks to test
-#     event_chunks = [c for c in train_chunk_samples 
-#                     if int(c["status_id"]) in (1, 2)][:n_check]
-    
-#     for chunk in event_chunks:
-#         raw_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-        
-#         # query with projected embedding
-#         raw_tensor = tf.convert_to_tensor(raw_emb[None, None, :], dtype=tf.float32)
-#         projected = ratt_head.query_proj(raw_tensor, training=False)[0, 0].numpy()
-        
-#         results = collection.query(
-#             query_embeddings=[projected.tolist()],
-#             n_results=10,
-#             include=["metadatas"]
-#         )
-        
-#         labels = [m["status_id"] for m in results["metadatas"][0]]
-#         same_class = sum(1 for l in labels if l == int(chunk["status_id"]))
-        
-#         print(f"chunk label={chunk['status_id']} "
-#               f"top10 retrieved labels={labels} "
-#               f"same_class={same_class}/10")
+def fetch_cache_batch(metadata, cache):
+    batch_size = metadata["vid"].shape[0]
 
+    query_embs = []
+    support_tokens = []
+    contrast_tokens = []
+    temporal_tokens = []
+    labels_from_cache = []
 
-def verify_rebuild(train_chunk_samples, ratt_head, chunk_encoder,
-                   frame_emb_mm, path_to_idx, collection, 
-                   use_projected=False, n_check=10):
-    event_chunks = [c for c in train_chunk_samples 
-                    if int(c["status_id"]) in (1, 2)][:n_check]
-    
-    for chunk in event_chunks:
-        raw_emb = encode_chunk(chunk, chunk_encoder, frame_emb_mm, path_to_idx)
-        
-        if use_projected:
-            raw_tensor = tf.convert_to_tensor(raw_emb[None, None, :], dtype=tf.float32)
-            query_emb = ratt_head.query_proj(raw_tensor, training=False)[0, 0].numpy()
-        else:
-            query_emb = raw_emb  # raw chunk encoder embedding
-        
-        results = collection.query(
-            query_embeddings=[query_emb.tolist()],
-            n_results=10,
-            include=["metadatas"]
-        )
-        
-        labels = [m["status_id"] for m in results["metadatas"][0]]
-        same_class = sum(1 for l in labels if l == int(chunk["status_id"]))
-        print(f"chunk label={chunk['status_id']} "
-              f"top10 retrieved labels={labels} "
-              f"same_class={same_class}/10")
-        
-# ─────────────────────────────────────────────
-# Train / eval steps
-# ─────────────────────────────────────────────
+    for i in range(batch_size):
+        key = make_chunk_key_from_meta(metadata, i)
+        entry = cache[key]
 
-def train_step(
-    batch,
-    ratt_head,
-    train_chunk_lookup,
-    train_future_key_lookup,
+        query_embs.append(entry["query_emb"])
+        support_tokens.append(entry["sim_embs"])
+        contrast_tokens.append(entry["contrast_embs"])
+        temporal_tokens.append(entry["temporal_embs"])
+        labels_from_cache.append(entry["query_meta"]["label"])
+
+    query_embs = tf.convert_to_tensor(np.stack(query_embs, axis=0), dtype=tf.float32)         # (B, D)
+    support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32) # (B, Ks, D)
+    contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32) # (B, Kc, D)
+    temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32) # (B, Kt, D)
+
+    return query_embs, support_tokens, contrast_tokens, temporal_tokens
+
+def fetch_live_batch(
+    metadata,
+    chunk_lookup,
+    future_key_lookup,
     collection,
     chunk_encoder,
     frame_emb_mm,
-    path_to_idx,
-    class_weights,
-    use_projected_retrieval,
-    epoch_idx=None,
+    path_to_idx
 ):
-    metadata = batch[1]
-    labels = tf.cast(metadata["status_id"], tf.int32)
-    labels = tf.reshape(labels, (-1,))
+    batch_size = metadata["vid"].shape[0]
 
-    (query_embs, support_tokens, contrast_tokens, temporal_tokens,
-     support_mask, contrast_mask, temporal_mask,
-     sim_metas, contrast_metas, temporal_metas) = fetch_live_batch(
-        metadata=metadata,
-        chunk_lookup=train_chunk_lookup,
-        future_key_lookup=train_future_key_lookup,
-        collection=collection,
-        chunk_encoder=chunk_encoder,
-        frame_emb_mm=frame_emb_mm,
-        path_to_idx=path_to_idx,
-        ratt_head = ratt_head,
-        use_projected_retrieval = use_projected_retrieval,
-        training=True,
-        epoch_idx=epoch_idx,
+    query_embs = []
+    support_tokens = []
+    contrast_tokens = []
+    temporal_tokens = []
+
+    for i in range(batch_size):
+        key = make_chunk_key_from_meta(metadata, i)
+
+        chunk = chunk_lookup[key]
+        future_key = future_key_lookup[key]
+        future_chunk = chunk_lookup[future_key]
+
+        entry = build_live_entry(
+            chunk=chunk,
+            future_chunk=future_chunk,
+            collection=collection,
+            chunk_encoder=chunk_encoder,
+            frame_emb_mm=frame_emb_mm,
+            path_to_idx=path_to_idx,
+            search_k_content=config.SEARCH_K_CONTENT,
+            search_k_temporal=config.SEARCH_K_TEMPORAL,
+            k_sim=config.K_SIM,
+            k_contrast=config.K_CONTRAST,
+            k_temporal=config.K_TEMPORAL,
+        )
+
+        query_embs.append(entry["query_emb"])
+        support_tokens.append(entry["sim_embs"])
+        contrast_tokens.append(entry["contrast_embs"])
+        temporal_tokens.append(entry["temporal_embs"])
+
+    query_embs = tf.convert_to_tensor(np.stack(query_embs, axis=0), dtype=tf.float32)
+    support_tokens = tf.convert_to_tensor(np.stack(support_tokens, axis=0), dtype=tf.float32)
+    contrast_tokens = tf.convert_to_tensor(np.stack(contrast_tokens, axis=0), dtype=tf.float32)
+    temporal_tokens = tf.convert_to_tensor(np.stack(temporal_tokens, axis=0), dtype=tf.float32)
+
+    return query_embs, support_tokens, contrast_tokens, temporal_tokens
+
+def weighted_bce_with_logits(labels, logits, pos_weight):
+    """
+    labels: (B, 1) float32 in {0,1}
+    logits: (B, 1) raw logits
+    """
+    loss = tf.nn.weighted_cross_entropy_with_logits(
+        labels=labels,
+        logits=logits,
+        pos_weight=pos_weight,
+    )
+    return tf.reduce_mean(loss)
+
+# def train_step(batch, cache, ratt_head, optimizer,pos_weight):
+#     metadata, labels = batch[1], batch[2]   # assuming dataset yields (imgs, metadata, label)
+
+#     labels = tf.cast(labels, tf.float32)
+#     labels = tf.reshape(labels, (-1, 1))    # (B, 1)
+
+#     query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_cache_batch(
+#         metadata, cache
+#     )
+    
+#     with tf.GradientTape() as tape:
+#         class_logits, cls_out, aux = ratt_head(
+#             chunk_embs=query_embs,
+#             support_tokens=support_tokens,
+#             contrast_tokens=contrast_tokens,
+#             temporal_tokens=temporal_tokens,
+#             training=True,
+#         )
+
+#         # loss = bce_loss_fn(labels, class_logits)
+#         loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
+
+#         # optional regularization losses from model layers
+#         if ratt_head.losses:
+#             loss += tf.add_n(ratt_head.losses)
+
+#     grads = tape.gradient(loss, ratt_head.trainable_variables)
+#     optimizer.apply_gradients(zip(grads, ratt_head.trainable_variables))
+
+#     probs = tf.sigmoid(class_logits)
+
+#     train_loss_metric.update_state(loss)
+#     train_acc_metric.update_state(labels, probs)
+
+#     return {
+#         "loss": float(loss.numpy()),
+#         "acc": float(train_acc_metric.result().numpy()),
+#         "logits": class_logits,
+#         "probs": probs,
+#         "cls_out": cls_out,
+#         "aux": aux,
+#     }
+
+def train_step(batch, cache, ratt_head, optimizer, pos_weight):
+    metadata, labels = batch[1], batch[2]
+
+    labels = tf.cast(labels, tf.float32)
+    labels = tf.reshape(labels, (-1, 1))
+
+    query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_cache_batch(
+        metadata, cache
     )
 
     def grad_rms(g):
@@ -1160,60 +1011,38 @@ def train_step(
         g = tf.cast(g, tf.float32)
         return float(tf.sqrt(tf.reduce_mean(tf.square(g))).numpy())
 
+    # q_exp = tf.expand_dims(query_embs, axis=1)   # (B, 1, D)
+
+    # # Make branches explicitly different
+    # support_in = support_tokens
+    # # contrast_in = contrast_tokens - q_exp
+    # contrast_in = contrast_tokens + (contrast_tokens - q_exp)
+    # temporal_in = temporal_tokens
+
     with tf.GradientTape(persistent=True) as tape:
         tape.watch(query_embs)
         tape.watch(support_tokens)
         tape.watch(contrast_tokens)
         tape.watch(temporal_tokens)
 
+
         class_logits, cls_out, aux = ratt_head(
             chunk_embs=query_embs,
             support_tokens=support_tokens,
             contrast_tokens=contrast_tokens,
             temporal_tokens=temporal_tokens,
-            support_mask=support_mask,
-            contrast_mask=contrast_mask,
-            temporal_mask=temporal_mask,
             training=True,
         )
-
-        last_attn = aux["attn_scores"][-1]
-        attn_mean = tf.reduce_mean(last_attn, axis=1)
-        cls_attn = attn_mean[:, 0, :]
-        const_loss = attention_token_consistency_loss(cls_attn,sim_metas,contrast_metas,labels,config.K_SIM,config.K_CONTRAST)
-        # const_loss = attention_token_consistency_loss(
-        #     cls_attn=cls_attn,
-        #     sim_meta=sim_metas,
-        #     # contrast_meta=contrast_metas,
-        #     query_labels=labels,
-        #     Ks=config.K_SIM,
-        #     # Kc=config.K_CONTRAST,
-        # )
         
-        visualize_full_attention(
-            cls_attn=cls_attn,
-            sim_meta=sim_metas,
-            contrast_meta=contrast_metas,
-            temporal_meta=temporal_metas,
-            query_labels=labels,
-            Ks=config.K_SIM,
-            Kc=config.K_CONTRAST,
-            Kt=config.K_TEMPORAL,
-        )
-        class_loss = weighted_scce_loss(labels, class_logits, class_weights)
-        loss = 1*class_loss + 0.0 * const_loss
+        loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
 
         if ratt_head.losses:
             loss += tf.add_n(ratt_head.losses)
 
-    print(f"class_loss={float(class_loss):.4f} const_loss={float(const_loss):.4f} total={float(loss):.4f}")
-
     grads = tape.gradient(loss, ratt_head.trainable_variables)
-    # grads = tape.gradient(loss, ratt_head.trainable_variables)
-    # grads, global_norm = tf.clip_by_global_norm(grads, clip_norm=1.0)
-    # optimizer.apply_gradients(zip(grads, ratt_head.trainable_variables))
-    # print(f"global_norm={float(global_norm):.4f}")
     optimizer.apply_gradients(zip(grads, ratt_head.trainable_variables))
+
+    
 
     g_query = tape.gradient(loss, query_embs)
     g_support = tape.gradient(loss, support_tokens)
@@ -1230,14 +1059,10 @@ def train_step(
 
     del tape
 
-    probs = tf.nn.softmax(class_logits, axis=-1)
-    batch_preds = tf.argmax(class_logits, axis=-1, output_type=tf.int32)
+    probs = tf.sigmoid(class_logits)
 
     train_loss_metric.update_state(loss)
     train_acc_metric.update_state(labels, probs)
-
-    batch_acc = tf.reduce_mean(tf.cast(tf.equal(batch_preds, labels), tf.float32))
-    print(f"batch acc={batch_acc:.6f}")
 
     return {
         "loss": float(loss.numpy()),
@@ -1246,10 +1071,7 @@ def train_step(
         "probs": probs,
         "cls_out": cls_out,
         "aux": aux,
-        "labels": labels,
-        "preds": batch_preds,
     }
-
 
 def eval_step(
     batch,
@@ -1260,16 +1082,14 @@ def eval_step(
     chunk_encoder,
     frame_emb_mm,
     path_to_idx,
-    class_weights,
-    use_projected_retrieval
+    pos_weight
 ):
-    metadata = batch[1]
-    labels = tf.cast(metadata["status_id"], tf.int32)
-    labels = tf.reshape(labels, (-1,))
+    metadata, labels = batch[1], batch[2]
 
-    (query_embs, support_tokens, contrast_tokens, temporal_tokens,
-     support_mask, contrast_mask, temporal_mask,
-     sim_metas, contrast_metas, temporal_metas) = fetch_live_batch(
+    labels = tf.cast(labels, tf.float32)
+    labels = tf.reshape(labels, (-1, 1))
+
+    query_embs, support_tokens, contrast_tokens, temporal_tokens = fetch_live_batch(
         metadata=metadata,
         chunk_lookup=val_chunk_lookup,
         future_key_lookup=val_future_key_lookup,
@@ -1277,29 +1097,29 @@ def eval_step(
         chunk_encoder=chunk_encoder,
         frame_emb_mm=frame_emb_mm,
         path_to_idx=path_to_idx,
-        ratt_head=ratt_head,
-        training=False,
-        use_projected_retrieval=use_projected_retrieval,
     )
+
+    zeros_support = tf.zeros_like(support_tokens)
+    zeros_contrast = tf.zeros_like(contrast_tokens)
+    zeros_temporal = tf.zeros_like(temporal_tokens)
 
     class_logits, cls_out, aux = ratt_head(
         chunk_embs=query_embs,
         support_tokens=support_tokens,
         contrast_tokens=contrast_tokens,
         temporal_tokens=temporal_tokens,
-        support_mask=support_mask,
-        contrast_mask=contrast_mask,
-        temporal_mask=temporal_mask,
+        # support_tokens=zeros_support,
+        # contrast_tokens=zeros_contrast,
+        # temporal_tokens=zeros_temporal,
         training=False,
     )
 
-    loss = weighted_scce_loss(labels, class_logits, class_weights)
-
+    # loss = bce_loss_fn(labels, class_logits)
+    loss = weighted_bce_with_logits(labels, class_logits, pos_weight=pos_weight)
     if ratt_head.losses:
         loss += tf.add_n(ratt_head.losses)
 
-    probs = tf.nn.softmax(class_logits, axis=-1)
-    preds = tf.argmax(class_logits, axis=-1, output_type=tf.int32)
+    probs = tf.sigmoid(class_logits)
 
     val_loss_metric.update_state(loss)
     val_acc_metric.update_state(labels, probs)
@@ -1309,69 +1129,64 @@ def eval_step(
         "acc": float(val_acc_metric.result().numpy()),
         "logits": class_logits,
         "probs": probs,
-        "preds": preds,
-        "labels": labels,
+        'labels':labels
+        # "cls_out": cls_out,
+        # "aux": aux,
     }
 
 
-# ─────────────────────────────────────────────
-# Epoch runners
-# ─────────────────────────────────────────────
-
-def run_train_epoch(
-    train_ds,
-    ratt_head,
-    train_chunk_lookup,
-    train_future_key_lookup,
-    collection,
-    chunk_encoder,
-    frame_emb_mm,
-    path_to_idx,
-    class_weight,
-    use_projected_retrieval,
-    epoch_idx=None,
-):
+def run_train_epoch(train_ds, cache, ratt_head, optimizer, pos_weight):
     train_loss_metric.reset_state()
     train_acc_metric.reset_state()
 
     for step, batch in enumerate(train_ds):
-        out = train_step(
-            batch=batch,
-            ratt_head=ratt_head,
-            train_chunk_lookup=train_chunk_lookup,
-            train_future_key_lookup=train_future_key_lookup,
-            collection=collection,
-            chunk_encoder=chunk_encoder,
-            frame_emb_mm=frame_emb_mm,
-            path_to_idx=path_to_idx,
-            class_weights=class_weight,
-            use_projected_retrieval=use_projected_retrieval,
-            epoch_idx=epoch_idx,
-        )
+        out = train_step(batch, cache, ratt_head, optimizer, pos_weight)
 
-        print(
-            f"[train] step={step} "
-            f"loss={out['loss']:.4f} "
-            f"acc={train_acc_metric.result().numpy():.4f}"
-        )
-
-        temp = pd.DataFrame({
-            "label": out["labels"].numpy(),
-            "pred": out["preds"].numpy(),
-            "logit_0": out["logits"].numpy()[:, 0],
-            "logit_1": out["logits"].numpy()[:, 1],
-            "logit_2": out["logits"].numpy()[:, 2],
-            "prob_0": out["probs"].numpy()[:, 0],
-            "prob_1": out["probs"].numpy()[:, 1],
-            "prob_2": out["probs"].numpy()[:, 2],
-        })
-        print(temp)
+        if step % 1 == 0:
+            print(
+                f"[train] step={step} "
+                f"loss={out['loss']:.4f} "
+                f"acc={train_acc_metric.result().numpy():.4f}"
+            )
 
     return (
         float(train_loss_metric.result().numpy()),
         float(train_acc_metric.result().numpy()),
     )
 
+
+# def run_val_epoch(val_ds, cache, ratt_head):
+#     val_loss_metric.reset_state()
+#     val_acc_metric.reset_state()
+
+#     for step, batch in enumerate(val_ds):
+#         out = eval_step(batch, cache, ratt_head)
+
+#         if step % 10 == 0:
+#             print(
+#                 f"[val] step={step} "
+#                 f"loss={out['loss']:.4f} "
+#                 f"acc={val_acc_metric.result().numpy():.4f}"
+#             )
+
+#     return (
+#         float(val_loss_metric.result().numpy()),
+#         float(val_acc_metric.result().numpy()),
+#     )
+
+def compute_pos_weight(chunk_samples):
+    labels = np.array([int(c["label"]) for c in chunk_samples], dtype=np.int32)
+
+    num_pos = np.sum(labels == 1)
+    num_neg = np.sum(labels == 0)
+
+    if num_pos == 0:
+        raise ValueError("No positive examples found.")
+    if num_neg == 0:
+        raise ValueError("No negative examples found.")
+    # print(float(num_neg / num_pos))
+    print(np.sqrt(num_neg / num_pos))
+    return float(np.sqrt(num_neg / num_pos))
 
 def run_val_epoch(
     val_ds,
@@ -1382,8 +1197,7 @@ def run_val_epoch(
     chunk_encoder,
     frame_emb_mm,
     path_to_idx,
-    class_weight,
-    use_projected_retrieval
+    pos_weight
 ):
     val_loss_metric.reset_state()
     val_acc_metric.reset_state()
@@ -1398,339 +1212,150 @@ def run_val_epoch(
             chunk_encoder=chunk_encoder,
             frame_emb_mm=frame_emb_mm,
             path_to_idx=path_to_idx,
-            class_weights=class_weight,
-            use_projected_retrieval=use_projected_retrieval,
+            pos_weight=pos_weight
         )
 
-        batch_acc = tf.reduce_mean(tf.cast(tf.equal(out["preds"], out["labels"]), tf.float32))
-        print(
-            f"[val] step={step} "
-            f"loss={out['loss']:.4f} "
-            f"running acc={val_acc_metric.result().numpy():.4f} "
-            f"batch acc={batch_acc:.4f}"
-        )
+        batch_preds = tf.cast(out['probs'] >= 0.5, tf.float32)
+        batch_acc = tf.reduce_mean(tf.cast(tf.equal(batch_preds, out['labels']), tf.float32))
+        if step % 1 == 0:
+            print(
+                f"[val] step={step} "
+                f"loss={out['loss']:.4f} "
+                f"running acc={val_acc_metric.result().numpy():.4f} "
+                f"batch acc={batch_acc:.4f} "
+            )
+            temp = pd.DataFrame()
+            
+            temp['labels'] = out['labels'].numpy().flatten()
+            temp['logits'] = out['logits'].numpy().flatten()
+            temp['probs'] = out['probs'].numpy().flatten()
+            print(temp)
+            # pprint.pprint(out)
 
-        temp = pd.DataFrame({
-            "label": out["labels"].numpy(),
-            "pred": out["preds"].numpy(),
-            "logit_0": out["logits"].numpy()[:, 0],
-            "logit_1": out["logits"].numpy()[:, 1],
-            "logit_2": out["logits"].numpy()[:, 2],
-            "prob_0": out["probs"].numpy()[:, 0],
-            "prob_1": out["probs"].numpy()[:, 1],
-            "prob_2": out["probs"].numpy()[:, 2],
-        })
-        print(temp)
 
     return (
         float(val_loss_metric.result().numpy()),
         float(val_acc_metric.result().numpy()),
     )
 
-# at the end of run_train_epoch or in the main training loop after each epoch
-def save_all_weights(ratt_head, config, epoch):
-    os.makedirs("rag_weights", exist_ok=True)
-    
-    # save main weights
-    weights_path = f"rag_weights/{config.RUN_ID}_epoch{epoch}.weights.h5"
-    ratt_head.save_weights(weights_path)
-    
-    # save transformer blocks
-    for i in range(config.NUM_LAYERS):
-        block = getattr(ratt_head, f"transformer_block_{i}")
-        with open(f"rag_weights/{config.RUN_ID}_epoch{epoch}_transformer_block_{i}.pkl", "wb") as f:
-            pickle.dump(block.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
-    
-    # save projection layers
-    for proj_name in ["query_proj", "support_proj", "contrast_proj", "temporal_proj"]:
-        proj = getattr(ratt_head, proj_name)
-        with open(f"rag_weights/{config.RUN_ID}_epoch{epoch}_{proj_name}.pkl", "wb") as f:
-            pickle.dump(proj.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
-    
-    print(f"[SAVE] saved all weights for epoch {epoch}")
-
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
-
 if __name__ == "__main__":
 
-    print("SEARCH_K_CONTENT", config.SEARCH_K_CONTENT)
-    print("SEARCH_K_TEMPORAL", config.SEARCH_K_TEMPORAL)
-    print("K_SIM", config.K_SIM)
-    print("K_CONTRAST", config.K_CONTRAST)
-    print("K_TEMPORAL", config.K_TEMPORAL)
-    print("FUTURE_CHUNK_STEP", config.FUTURE_CHUNK_STEP)
-    print("CHUNK_SIZE", config.CHUNK_SIZE)
-    print("CHROMADB_COLLECTION", config.CHROMADB_COLLECTION)
-    print("STAGE1_WEIGHTS", config.STAGE1_WEIGHTS)
-    print("RATT_WEIGHTS", config.RATT_WEIGHTS)
-
-
-
-
-
-    # # ── 1. Load samples ──────────────────────
-    # train_vids = config.TRAIN_VIDS
-    # train_samples = load_samples(train_vids, stride=1)
-    # train_chunk_samples_full = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
-    # train_chunk_samples_distinct = train_chunk_samples_full  # for rebuild — all distinct chunks
-
-    # test_vids = config.TEST_VIDS
-    # test_samples = load_samples(test_vids, stride=1)
-    # test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE)
-
-    # random.shuffle(train_samples)
-    # random.shuffle(test_samples)
-
-    # print(f"Train chunks (full): {len(train_chunk_samples_full)}")
-    # print(f"Val chunks:          {len(test_chunk_samples)}")
-
-    # pos_weight = compute_pos_weight(train_chunk_samples_full)
-    # class_weight = compute_class_weights(train_chunk_samples_full)
-
-    # # ── 2. Build val dataset (fixed, not resampled) ──
-    # val_dataset = build_tf_dataset_chunks(
-    #     test_chunk_samples,
-    #     batch_size=config.CHUNK_BATCH_SIZE,
-    #     training=False,
-    # )
-
-    # # ── 3. ChromaDB ──────────────────────────
-    # client = PersistentClient(path="./chroma_store")
-    # collection = client.get_or_create_collection(
-    #     name=config.CHROMADB_COLLECTION,
-    #     metadata={"hnsw:space": "cosine"},
-    # )
-
-    # # ── 4. Stage 1 chunk encoder ─────────────
-    # chunk_encoder = ChunkEncoder(
-    #     hidden_size=768, num_layers=1, num_heads=4, max_frames=config.CHUNK_SIZE
-    # )
-    # dummy_frame_embs = tf.zeros((1, config.CHUNK_SIZE, 768), dtype=tf.float32)
-    # _ = chunk_encoder(dummy_frame_embs, training=False)
-    # chunk_encoder.load_weights(config.STAGE1_WEIGHTS)
-
-    # for i in range(chunk_encoder.num_layers):
-    #     block = getattr(chunk_encoder, f"transformer_block_{i}")
-    #     with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
-    #         weights = pickle.load(f)
-    #     block.set_weights(weights)
-
-    # print("[STAGE1] Loaded chunk encoder weights")
-    # chunk_encoder.trainable = False
-    # print("[STAGE1] Chunk encoder frozen")
-
-    # # ── 5. Frame store ───────────────────────
-    # store_name = "train_val_frames_chunk8_stride2"
-    # frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
-
-    # # ── 6. Metrics ───────────────────────────
-    # train_loss_metric = tf.keras.metrics.Mean(name="train_loss")
-    # train_acc_metric  = tf.keras.metrics.SparseCategoricalAccuracy(name="train_acc")
-    # val_loss_metric   = tf.keras.metrics.Mean(name="val_loss")
-    # val_acc_metric    = tf.keras.metrics.SparseCategoricalAccuracy(name="val_acc")
-
-    # # ── 7. Model ─────────────────────────────
-    # ratt_head = RATTHeadV2(
-    #     hidden_size=768,
-    #     num_heads=8,
-    #     num_layers=config.NUM_LAYERS,
-    # )
-
-    # # warm up model weights
-    # query_embs = np.zeros((config.CHUNK_BATCH_SIZE, 768))
-    # support    = np.zeros((config.CHUNK_BATCH_SIZE, config.K_SIM, 768))
-    # contrast   = np.zeros((config.CHUNK_BATCH_SIZE, config.K_CONTRAST, 768))
-    # temporal   = np.zeros((config.CHUNK_BATCH_SIZE, config.K_TEMPORAL, 768))
-
-    # logits, _, _ = ratt_head(
-    #     chunk_embs=query_embs,
-    #     support_tokens=support,
-    #     contrast_tokens=contrast,
-    #     temporal_tokens=temporal,
-    #     training=False,
-    # )
-    # print("logits:", logits.shape)
-
-    # optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
-
-    # val_chunk_lookup        = {make_chunk_key(c): c for c in test_chunk_samples}
-    # val_future_key_lookup   = build_future_key_lookup(test_chunk_samples, future_step=config.FUTURE_CHUNK_STEP)
-
-    # # ── 8. Training loop ─────────────────────
-    # for epoch in range(config.EPOCHS):
-    #     use_projected_retrieval = epoch >= config.REBUILD_EVERY
-
-    #     print(f"\n===== EPOCH {epoch+1}/{config.EPOCHS} =====")
-    #     print(f"use projected retrieval: {use_projected_retrieval}")
-
-    #     # resample every epoch — different nonevent chunks each time
-    #     train_chunk_samples_epoch = undersample_and_oversample(
-    #         train_chunk_samples_full,
-    #         target_ratio=0.5,
-    #     )
-    #     train_dataset = build_tf_dataset_chunks(
-    #         train_chunk_samples_epoch,
-    #         batch_size=config.CHUNK_BATCH_SIZE,
-    #         training=True,
-    #     )
-    #     train_chunk_lookup = {make_chunk_key(c): c for c in train_chunk_samples_epoch}
-    #     train_future_key_lookup = build_future_key_lookup(
-    #         train_chunk_samples_epoch,
-    #         future_step=config.FUTURE_CHUNK_STEP,
-    #     )
-
-    #     print("[verify] retrieval BEFORE rebuild:")
-    #     verify_rebuild(
-    #         train_chunk_samples_distinct, ratt_head, chunk_encoder,
-    #         frame_emb_mm, path_to_idx, collection, use_projected=False,
-    #     )
-
-    #     if epoch > 0 and epoch % config.REBUILD_EVERY == 0:
-    #         rebuild_chromadb(
-    #             train_chunk_samples=train_chunk_samples_distinct,
-    #             ratt_head=ratt_head,
-    #             chunk_encoder=chunk_encoder,
-    #             frame_emb_mm=frame_emb_mm,
-    #             path_to_idx=path_to_idx,
-    #             collection=collection,
-    #         )
-    #         print("[verify] retrieval AFTER rebuild:")
-    #         verify_rebuild(
-    #             train_chunk_samples_distinct, ratt_head, chunk_encoder,
-    #             frame_emb_mm, path_to_idx, collection, use_projected=True,
-    #         )
-
-    #     train_loss, train_acc = run_train_epoch(
-    #         train_ds=train_dataset,
-    #         ratt_head=ratt_head,
-    #         train_chunk_lookup=train_chunk_lookup,
-    #         train_future_key_lookup=train_future_key_lookup,
-    #         collection=collection,
-    #         chunk_encoder=chunk_encoder,
-    #         frame_emb_mm=frame_emb_mm,
-    #         path_to_idx=path_to_idx,
-    #         class_weight=class_weight,
-    #         use_projected_retrieval=use_projected_retrieval,
-    #         epoch_idx=epoch + 1,
-    #     )
-
-    #     val_loss, val_acc = run_val_epoch(
-    #         val_ds=val_dataset,
-    #         ratt_head=ratt_head,
-    #         val_chunk_lookup=val_chunk_lookup,
-    #         val_future_key_lookup=val_future_key_lookup,
-    #         collection=collection,
-    #         chunk_encoder=chunk_encoder,
-    #         frame_emb_mm=frame_emb_mm,
-    #         path_to_idx=path_to_idx,
-    #         class_weight=class_weight,
-    #         use_projected_retrieval=use_projected_retrieval,
-    #     )
-
-    #     save_all_weights(ratt_head, config, epoch + 1)
-        
-    #     print(
-    #         f"[epoch {epoch+1}] "
-    #         f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-    #         f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
-    #     )
-
-    # # ── 9. Save weights ──────────────────────
-    # ratt_head.save_weights(config.RATT_WEIGHTS)
-    # print(f"[MAIN] saved weights to {config.RATT_WEIGHTS}")
-
-    # os.makedirs("rag_weights", exist_ok=True)
-    # for i in range(config.NUM_LAYERS):
-    #     block = getattr(ratt_head, f"transformer_block_{i}")
-    #     with open(f"rag_weights/{config.RUN_ID}_transformer_block_{i}.pkl", "wb") as f:
-    #         pickle.dump(block.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
-    #     print(f"[MAIN] saved transformer block {i} weights")
-
-    # # save projection layers explicitly to avoid weight loading issues
-    # for proj_name in ["query_proj", "support_proj", "contrast_proj", "temporal_proj"]:
-    #     proj = getattr(ratt_head, proj_name)
-    #     with open(f"rag_weights/{config.RUN_ID}_{proj_name}.pkl", "wb") as f:
-    #         pickle.dump(proj.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
-    #     print(f"[MAIN] saved {proj_name} weights")
-
-
-    # ── 1. Load samples ──────────────────────
+    # ---------------------------------------------
+    # 1. Load samples -> chunkify
+    # ---------------------------------------------
     train_vids = config.TRAIN_VIDS
-    train_samples = load_samples(train_vids, stride=1)
+    train_samples = load_samples(train_vids,stride=1)
     train_chunk_samples = build_chunks(train_samples, chunk_size=config.CHUNK_SIZE)
 
-    train_samples_raw = load_samples(train_vids, stride=1)
-    train_chunk_samples_distinct = build_chunks(train_samples_raw, chunk_size=config.CHUNK_SIZE)
-    # equal oversampling: {0: N, 1: N, 2: N}
-    train_chunk_samples = oversample_chunk_samples(train_chunk_samples, 1.0)
+    # label_lookup = {}
+    # for c in train_chunk_samples:
+    #     key = make_key(c["vid"], c["side"], c["t_center"])
+    #     label_lookup[key] = int(c["label"])
 
     test_vids = config.TEST_VIDS
-    test_samples = load_samples(test_vids, stride=1)
+    test_samples = load_samples(test_vids,stride=1)
     test_chunk_samples = build_chunks(test_samples, chunk_size=config.CHUNK_SIZE)
 
     random.shuffle(train_samples)
     random.shuffle(test_samples)
 
+    # split 95/5
+    # n = len(chunk_samples)
+    print(len(train_chunk_samples))
+    print(len(test_chunk_samples))
+
+    pos_weight = compute_pos_weight(train_chunk_samples)
+    # input('stop')
+    # train_chunks = chunk_samples[:int(0.95*n)]
+    # val_chunks = chunk_samples[int(0.95*n):]
+
+    # # train_chunks = chunk_samples[config.START_CHUNK_TRAIN:config.END_CHUNK_TRAIN] #was 2000
+    # # val_chunks = chunk_samples[config.START_CHUNK_VALID:config.END_CHUNK_VALID]
+
+    # # train_chunk_samples = train_chunk_samples[0:100]
+    # # test_chunk_samples = test_chunk_samples[0:32]
     print(f"Train chunks: {len(train_chunk_samples)}")
     print(f"Val chunks:   {len(test_chunk_samples)}")
 
-    pos_weight = compute_pos_weight(train_chunk_samples)
-    class_weight = compute_class_weights(train_chunk_samples)
-
-    # ── 2. Build TF datasets ─────────────────
+    # ---------------------------------------------
+    # 2. Build TF datasets
+    # ---------------------------------------------
     train_dataset = build_tf_dataset_chunks(train_chunk_samples, batch_size=config.CHUNK_BATCH_SIZE, training=True)
-    val_dataset   = build_tf_dataset_chunks(test_chunk_samples,  batch_size=config.CHUNK_BATCH_SIZE, training=False)
+    val_dataset   = build_tf_dataset_chunks(test_chunk_samples,   batch_size=config.CHUNK_BATCH_SIZE, training=False)
 
-    # ── 3. ChromaDB ──────────────────────────
+    print(f"Train dataset: {(train_dataset)}")
+    print(f"Val dataset:   {(val_dataset)}")
+
     client = PersistentClient(path="./chroma_store")
     collection = client.get_or_create_collection(
         name=config.CHROMADB_COLLECTION,
-        metadata={"hnsw:space": "cosine"},
+        metadata={"hnsw:space": "cosine"}
     )
 
-    # ── 4. Stage 1 chunk encoder ─────────────
     chunk_encoder = ChunkEncoder(
-        hidden_size=768, num_layers=1, num_heads=4, max_frames=config.CHUNK_SIZE
+        hidden_size=768,
+        num_layers=4,
+        num_heads=8,
+        max_frames=config.CHUNK_SIZE
     )
+
     dummy_frame_embs = tf.zeros((1, config.CHUNK_SIZE, 768), dtype=tf.float32)
     _ = chunk_encoder(dummy_frame_embs, training=False)
+
     chunk_encoder.load_weights(config.STAGE1_WEIGHTS)
-
-    # for i in range(chunk_encoder.num_layers):
-    #     block = getattr(chunk_encoder, f"transformer_block_{i}")
-    #     with open(f"stage1_block_weights/chunk_encoder_block_{i}.pkl", "rb") as f:
-    #         weights = pickle.load(f)
-    #     block.set_weights(weights)
-
     print("[STAGE1] Loaded chunk encoder weights")
+
     chunk_encoder.trainable = False
     print("[STAGE1] Chunk encoder frozen")
 
-    # ── 5. Frame store ───────────────────────
-    store_name = "train_val_frames_chunk8_stride2"
+    store_name = 'train_val_frames_chunk12_stride4'
     frame_emb_mm, frame_paths, path_to_idx = load_frame_store(store_name)
+    if(os.path.exists(config.STAGE2_CACHE_PATH)):
+        cache = load_retrieval_cache(config.STAGE2_CACHE_PATH)
+        # print(cache)
+        print("[CACHE] loaded cache")
+    else:
+        cache = build_retrieval_cache(
+            all_chunks=train_chunk_samples,
+            collection=collection,
+            chunk_encoder=chunk_encoder,
+            frame_emb_mm=frame_emb_mm,
+            frame_paths=frame_paths,
+            path_to_idx=path_to_idx
+            )
+        save_retrieval_cache(cache,config.STAGE2_CACHE_PATH)
+    
+    bce_loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
-    # ── 6. Metrics ───────────────────────────
-    train_loss_metric = tf_keras.metrics.Mean(name="train_loss")
-    train_acc_metric  = tf_keras.metrics.SparseCategoricalAccuracy(name="train_acc")
-    val_loss_metric   = tf_keras.metrics.Mean(name="val_loss")
-    val_acc_metric    = tf_keras.metrics.SparseCategoricalAccuracy(name="val_acc")
+    train_loss_metric = tf.keras.metrics.Mean(name="train_loss")
+    train_acc_metric = tf.keras.metrics.BinaryAccuracy(threshold=0.5, name="train_acc")
 
-    # ── 7. Model ─────────────────────────────
+    val_loss_metric = tf.keras.metrics.Mean(name="val_loss")
+    val_acc_metric = tf.keras.metrics.BinaryAccuracy(threshold=0.5, name="val_acc")
+
+    batch = next(iter(train_dataset))
+
     ratt_head = RATTHeadV2(
         hidden_size=768,
         num_heads=8,
-        num_layers=config.NUM_LAYERS,
+        num_layers=2,
     )
 
+    for v in ratt_head.trainable_variables[:5]:
+        print(v.name, float(tf.reduce_mean(v).numpy()), float(tf.math.reduce_std(v).numpy()))
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
+
+    query_embs, support, contrast, temporal = fetch_cache_batch(batch[1], cache)
+
+    val_chunk_lookup = {make_chunk_key(c): c for c in test_chunk_samples}
+    val_future_key_lookup = build_future_key_lookup(test_chunk_samples, future_step=5)
+
     
-    # warm up model weights
-    query_embs = np.zeros((config.CHUNK_BATCH_SIZE, 768))
-    support    = np.zeros((config.CHUNK_BATCH_SIZE, config.K_SIM, 768))
-    contrast   = np.zeros((config.CHUNK_BATCH_SIZE, config.K_CONTRAST, 768))
-    temporal   = np.zeros((config.CHUNK_BATCH_SIZE, config.K_TEMPORAL, 768))
+    print(query_embs.shape)
+    print(support.shape)
+    print(contrast.shape)
+    print(temporal.shape)
 
     logits, _, _ = ratt_head(
         chunk_embs=query_embs,
@@ -1739,47 +1364,18 @@ if __name__ == "__main__":
         temporal_tokens=temporal,
         training=False,
     )
+    print(logits)
     print("logits:", logits.shape)
-
-    optimizer = tf_keras.optimizers.Adam(learning_rate=5e-4)
-
-    train_chunk_lookup      = {make_chunk_key(c): c for c in train_chunk_samples}
-    train_future_key_lookup = build_future_key_lookup(train_chunk_samples, future_step=5)
-    val_chunk_lookup        = {make_chunk_key(c): c for c in test_chunk_samples}
-    val_future_key_lookup   = build_future_key_lookup(test_chunk_samples, future_step=5)
-
-    # ── 8. Training loop ─────────────────────
+    print_random_cache_queries()
     for epoch in range(config.EPOCHS):
-        use_projected_retrieval = epoch >= config.REBUILD_EVERY
-
         print(f"\n===== EPOCH {epoch+1}/{config.EPOCHS} =====")
-        print(f'use projected retrieval: {use_projected_retrieval}')
 
-        print("[verify] retrieval BEFORE rebuild:")
-        verify_rebuild(train_chunk_samples_distinct,ratt_head,chunk_encoder,frame_emb_mm,path_to_idx,collection,use_projected = False)
-        if epoch > 0 and epoch % config.REBUILD_EVERY == 0:
-            rebuild_chromadb(
-                train_chunk_samples=train_chunk_samples_distinct,
-                ratt_head=ratt_head,
-                chunk_encoder=chunk_encoder,
-                frame_emb_mm=frame_emb_mm,
-                path_to_idx=path_to_idx,
-                collection=collection,
-            )
-            print("[verify] retrieval BEFORE rebuild:")
-            verify_rebuild(train_chunk_samples_distinct,ratt_head,chunk_encoder,frame_emb_mm,path_to_idx,collection,use_projected = True)
         train_loss, train_acc = run_train_epoch(
             train_ds=train_dataset,
+            cache=cache,
             ratt_head=ratt_head,
-            train_chunk_lookup=train_chunk_lookup,
-            train_future_key_lookup=train_future_key_lookup,
-            collection=collection,
-            chunk_encoder=chunk_encoder,
-            frame_emb_mm=frame_emb_mm,
-            path_to_idx=path_to_idx,
-            class_weight=class_weight,
-            use_projected_retrieval=use_projected_retrieval,
-            epoch_idx=epoch + 1,
+            optimizer=optimizer,
+            pos_weight=pos_weight,
         )
 
         val_loss, val_acc = run_val_epoch(
@@ -1791,11 +1387,8 @@ if __name__ == "__main__":
             chunk_encoder=chunk_encoder,
             frame_emb_mm=frame_emb_mm,
             path_to_idx=path_to_idx,
-            class_weight=class_weight,
-            use_projected_retrieval=use_projected_retrieval,
+            pos_weight=pos_weight
         )
-
-        save_all_weights(ratt_head, config, epoch + 1)
 
         print(
             f"[epoch {epoch+1}] "
@@ -1803,13 +1396,33 @@ if __name__ == "__main__":
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
         )
 
-    # ── 9. Save weights ──────────────────────
+    # -------------------------
+    # save weights
+    # -------------------------
     ratt_head.save_weights(config.RATT_WEIGHTS)
     print(f"[MAIN] saved weights to {config.RATT_WEIGHTS}")
 
-    os.makedirs("rag_weights", exist_ok=True)
-    for i in range(config.NUM_LAYERS):
-        block = getattr(ratt_head, f"transformer_block_{i}")
-        with open(f"rag_weights/{config.RUN_ID}_transformer_block_{i}.pkl", "wb") as f:
-            pickle.dump(block.get_weights(), f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"[MAIN] saved transformer block {i} weights")
+
+    # print(len(cache))
+    # pprint.pprint(list(cache.keys()))
+
+    
+
+
+
+    # print(cache[list(cache.keys())[1438]])
+    # print(cache)
+    # # ---------------------------------------------
+    # # 3. Build models
+    # # ---------------------------------------------
+    
+    
+
+    # # proj_head.load_weights("projection_head.weights.h5")
+    
+    # # Retrieval DB
+    # client = PersistentClient(path="./chroma_store")
+    # collection = client.get_or_create_collection(
+    #     name=config.CHROMADB_COLLECTION,
+    #     metadata={"hnsw:space": "cosine"}
+    # )

@@ -12,11 +12,8 @@ class ChunkEncoder(tf_keras.Model):
         self.transformer_blocks = []
         self.hidden_size = hidden_size
         self.max_tokens = 1 + max_frames   # 1 CLS + T frame tokens
-        self.num_layers = num_layers
 
-        self.transformer_blocks = []
-
-        for i in range(num_layers):
+        for _ in range(num_layers):
             block = nn_blocks.TransformerEncoderBlock(
                 inner_activation=activations.gelu,
                 num_attention_heads=num_heads,
@@ -32,8 +29,7 @@ class ChunkEncoder(tf_keras.Model):
                 transformer_partition_dims=None,
                 return_attention_scores=True,
             )
-            setattr(self, f"transformer_block_{i}", block)
-            # self.transformer_blocks.append(block)
+            self.transformer_blocks.append(block)
 
         self.norm = layers.LayerNormalization(epsilon=1e-6)
 
@@ -73,19 +69,6 @@ class ChunkEncoder(tf_keras.Model):
                 f"Expected frame_embeddings to have shape (B, T, D), got {frame_embeddings.shape}"
             )
 
-        # if training:
-        #     drop_prob = 0.1
-        #     B = tf.shape(frame_embeddings)[0]
-        #     T = tf.shape(frame_embeddings)[1]
-
-        #     keep_mask = tf.cast(
-        #         tf.random.uniform((B, T)) > drop_prob,
-        #         frame_embeddings.dtype
-        #     )
-        #     keep_mask = tf.expand_dims(keep_mask, axis=-1)
-
-        #     frame_embeddings = frame_embeddings * keep_mask
-
         # learned CLS token repeated across the batch
         cls_token = tf.repeat(self.cls_token, repeats=B, axis=0)  # (B, 1, D)
 
@@ -96,8 +79,7 @@ class ChunkEncoder(tf_keras.Model):
         x = x + self.pos_embedding[:, :T + 1, :]
 
         attention_scores_all = []
-        for i in range(self.num_layers):
-            block = getattr(self, f"transformer_block_{i}")
+        for block in self.transformer_blocks:
             x, attn_scores = block(x, training=training)
             attention_scores_all.append(attn_scores)
 
